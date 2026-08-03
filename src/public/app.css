@@ -1,0 +1,143 @@
+/* "Quiet document" — the accepted visual direction. No logo or header chrome,
+   one textarea and one full-width button, system light/dark, and a restrained
+   violet/blue accent that carries Hermes identity without branding the page. */
+
+:root {
+  color-scheme: light dark;
+  --ink: #161616;
+  --muted: #707070;
+  --line: #dedbd5;
+  --paper: #fff;
+  --accent: #6d55d8;
+  --accent2: #3f7edb;
+  --ok: #19704a;
+  --ok-wash: #e1f2e9;
+  --idle-wash: #eee;
+  --idle-ink: #777;
+  --wash: #f4f1ff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: radial-gradient(circle at 50% 0, var(--wash) 0, transparent 34%), var(--paper);
+  font: 16px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button, textarea { font: inherit; }
+
+[hidden] { display: none !important; }
+
+.quiet-document {
+  display: grid;
+  place-items: center;
+  min-height: 100svh;
+  padding: 42px 18px calc(52px + env(safe-area-inset-bottom));
+}
+
+.quiet-document > section { width: min(100%, 620px); }
+
+.copy { max-width: 520px; }
+
+.eyebrow {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .11em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+h1 {
+  font-size: clamp(27px, 6vw, 42px);
+  line-height: 1.08;
+  letter-spacing: -.035em;
+  margin: .35rem 0 .75rem;
+}
+
+p { margin: .35rem 0; color: var(--muted); }
+
+textarea {
+  display: block;
+  width: 100%;
+  min-height: 240px;
+  margin: 28px 0 14px;
+  padding: 12px 0;
+  resize: none;
+  color: var(--ink);
+  background: transparent;
+  border: 0 solid var(--line);
+  border-bottom-width: 1px;
+  border-radius: 0;
+  outline: none;
+}
+
+textarea:focus { border-color: var(--accent); }
+
+/* One column: the status note, then a Send that spans the full width. No file
+   control and nothing else competing with the single action. */
+.actions {
+  display: grid;
+  gap: 14px;
+}
+
+.meta { font-size: 13px; color: var(--muted); }
+
+.privacy-note { display: flex; align-items: center; gap: 6px; }
+.privacy-note::before { content: '\25C7'; color: var(--accent); font-size: 11px; }
+
+.primary {
+  width: 100%;
+  padding: 15px 20px;
+  border: 0;
+  border-radius: 5px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(115deg, var(--accent), var(--accent2));
+  box-shadow: 0 7px 20px #5e63c126;
+  cursor: pointer;
+}
+
+.primary:disabled { opacity: .45; cursor: not-allowed; }
+
+.status { max-width: 480px; text-align: center; }
+
+.status .icon {
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 24px;
+  color: var(--idle-ink);
+  background: var(--idle-wash);
+}
+
+.status .icon.ok { color: var(--ok); background: var(--ok-wash); }
+.status h1 { font-size: 30px; }
+
+@media (max-width: 760px) {
+  .quiet-document { align-items: start; padding-top: 70px; }
+  textarea { min-height: 200px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #f1f0f5;
+    --muted: #9a98a5;
+    --line: #393741;
+    --paper: #121116;
+    --accent: #9b83ff;
+    --accent2: #659bff;
+    --ok: #72d6a4;
+    --ok-wash: #18372a;
+    --idle-wash: #29282e;
+    --idle-ink: #9a98a5;
+    --wash: #211b36;
+  }
+
+  .primary { box-shadow: 0 8px 24px #6e5ac02b; }
+}

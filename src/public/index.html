@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>Hermes Drop</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<main id="app" class="quiet-document" data-state="loading">
+
+<section id="form" hidden>
+<div class="copy">
+<p class="eyebrow">Private drop</p>
+<h1>Send privately to Hermes</h1>
+<p>Paste the private details for your current task. This page closes in <strong id="ttl" role="timer">–:––</strong>, and nothing you enter will be posted to chat.</p>
+</div>
+<textarea id="secret" aria-label="Private details" placeholder="Password, token, credentials, or a small config…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="enter"></textarea>
+<div class="actions">
+<span class="meta privacy-note" id="note">One secure send · no edits</span>
+<button class="primary" id="send" type="button">Send to Hermes</button>
+</div>
+</section>
+
+<section id="success" class="status" hidden>
+<p class="icon ok" aria-hidden="true">&check;</p>
+<p class="eyebrow">Received</p>
+<h1>Hermes has it.</h1>
+<p>You can close this page. The link has already been used and cannot be used again.</p>
+</section>
+
+<section id="unavailable" class="status" hidden>
+<p class="icon" aria-hidden="true">&times;</p>
+<p class="eyebrow">Nothing here</p>
+<h1>This link is unavailable</h1>
+<p>It may have expired or already been used. Ask Hermes for a new link.</p>
+</section>
+
+</main>
+<script type="module" src="/assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# `git format-patch` output is byte-significant. Its context lines begin with a
+# space — so a blank context line *is* trailing whitespace — and the `-- `
+# signature separator and final newline are part of the format. Stripping any of
+# it makes `git am` reject the patch, so whitespace checking and any end-of-line
+# conversion are turned off here. Regenerate these files with format-patch; never
+# hand-edit them.
+patches/** -whitespace -text

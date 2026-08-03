@@ -1,0 +1,211 @@
+"""Hermes Drop — origin-bound private input.
+
+Source of truth is this repo (``secure-secret-handoff``); the installer
+symlinks this directory into ``$HERMES_HOME/plugins/hermes-drop``. A live-only
+plugin is exactly what produced the unversioned, untested
+``hermes-drop-command`` that this replaces.
+
+**Module-scope import discipline.** This file, and every module it reaches at
+import time, must stay free of ``gateway.run``. Plugin discovery happens in
+every CLI process, and the runner handle is a module global rebound during
+``GatewayRunner.__init__`` — see ``drop/__init__.py`` for the full reasoning
+and the test that enforces it.
+
+Implemented so far: S3 (discovery, config gate, control client), S4
+(``SourceRegistry`` and the origin hard gate), S5 (async messenger, sync
+bridge, render matrix), S6 (journal, reconciler), S7 (``DropWaiter``,
+``DropService``), S8 (entry points), S10 (deterministic ``/drop``).
+
+**``/drop`` is deterministic, and this file is where that is visible.** The
+``pre_gateway_dispatch`` callback captures the real ``SessionSource`` and carries
+the reconciler's second trigger — nothing else. The registered async handler is
+the initiator: core dispatches it inside the session context Tier 2 binds
+(``_set_session_env_from_source`` at ``gateway/run.py:14721``, Hermes branch
+``drop/plugin-command-origin``) and it calls ``DropService`` directly. No model
+turn is involved, and no text the user did not type is ever produced.
+
+Without Tier 2 the plugin still loads and still works: the handler finds a real
+source, has no bound context to verify it against, and refuses
+``origin_unverified`` rather than guessing a destination.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Mapping, Optional
+
+from . import drop as drop  # noqa: PLC0414 - re-exported for callers and tests
+from .drop import config as drop_config
+from .drop import schemas
+
+logger = logging.getLogger(__name__)
+
+
+def drop_check_fn() -> bool:
+    """Process-constant configuration gate — see ``drop/config.py``."""
+    return drop_config.control_socket_configured()
+
+
+def _as_tool_result(payload: Mapping[str, Any]) -> str:
+    """Tool results are strings. JSON keeps them machine-readable for the model
+    without inventing prose that could drift from what actually happened."""
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _guarded(impl_name: str, args: Optional[Mapping[str, Any]]) -> str:
+    """Call a handler and turn anything that escapes into an error result.
+
+    Nothing may raise out of these. A raising slash-command handler is swallowed
+    with a ``logger.warning`` at ``gateway/run.py:14701-14702`` and execution
+    **falls through to skill-command resolution** at ``:14705+`` — so an exception
+    would silently become a ``/skill drop`` lookup, resurrecting the exact prose
+    path this design severs (plan §1, link 2).
+    """
+    from .drop import safe_errors, tools
+
+    try:
+        impl = getattr(tools, impl_name)
+        return _as_tool_result(safe_errors.sanitize_tool_result(impl(args or {})))
+    except Exception as exc:  # noqa: BLE001 - deliberate catch-all, see docstring
+        # ``str(exc)`` is exactly the kind of string review L1 is about: an
+        # exception message can carry a socket path, an internal hostname or an
+        # echoed request body, and a tool result enters the model's context and
+        # from there durable ``state.db``. It is logged (where an operator can see
+        # it) and *not* returned.
+        logger.warning("hermes-drop: %s failed: %s", impl_name, exc, exc_info=True)
+        return _as_tool_result(
+            {"error": "internal_error", "detail": safe_errors.safe_detail("internal_error")}
+        )
+
+
+def request_private_input(args: Optional[Mapping[str, Any]] = None, **_kwargs: Any) -> str:
+    return _guarded("request_private_input", args)
+
+
+def claim_private_input(args: Optional[Mapping[str, Any]] = None, **_kwargs: Any) -> str:
+    return _guarded("claim_private_input", args)
+
+
+async def drop_command(user_args: str = "", **kwargs: Any) -> None:
+    """The ``/drop`` handler. Async, so the gateway awaits it on the gateway loop
+    (``gateway/run.py:14726-14728``) and it reaches ``DropService`` directly.
+
+    Core calls this with one positional string and nothing else (``:14726``); the
+    origin comes from the captured real source verified against the session
+    context bound at ``:14721``, never from an argument.
+
+    Always returns ``None``: a returned string is posted as a second message
+    (``return str(result) if result else None``, ``:14729``) and the status
+    message is already the reply. It never raises either — an exception here is
+    swallowed at ``:14731-14732`` and execution *falls through to skill-command
+    resolution* at ``:14735+``, so a raise would silently become a ``/skill
+    drop`` lookup. ``drop.command.handle`` catches everything; this is the second
+    guard, and it exists because the cost of the first one being wrong is the
+    incident.
+    """
+    from .drop import command
+
+    try:
+        return await command.handle(user_args, **kwargs)
+    except Exception:  # noqa: BLE001 - deliberate catch-all, see the docstring
+        logger.warning("hermes-drop: /drop handler failed", exc_info=True)
+        return None
+
+
+def capture_turn_source(**kwargs: Any) -> None:
+    """``pre_gateway_dispatch`` callback: capture the REAL ``SessionSource`` and
+    carry the reconciler's second trigger. Two observations, no verdict.
+
+    **It returns ``None`` unconditionally**, and that is the S10 property. Core
+    acts on ``skip`` / ``rewrite`` / ``allow`` (``gateway/run.py:13648-13668``);
+    returning any of them would put Drop back in the business of deciding what a
+    message means before auth has run. ``skip`` would make Drop an
+    unauthenticated command surface — the hook fires before auth and pairing
+    (``:13633`` vs ``:13670``) — and ``rewrite`` was S8's interim, which turned
+    ``/drop`` into a sentence for the model because a plugin command handler had
+    no bound session context to verify its origin against. Tier 2 (S9) binds one,
+    so the handler initiates directly and this callback observes only. Nothing in
+    the plugin can now produce text the user did not type.
+
+    The reconcile trigger rides here because this is the only ``invoke_hook``
+    site in ``gateway/run.py`` (``:13636``) and there is no gateway-ready hook
+    (``hermes_cli/plugins.py:135-215``). It is latched to one run per process and
+    shares that latch with the startup poller, so a busy gateway does not start a
+    reconcile per message.
+    """
+    from .drop import reconciler
+    from .drop.sources import capture
+
+    capture(**kwargs)
+    try:
+        reconciler.trigger_from_event(kwargs.get("gateway"))
+    except Exception:  # noqa: BLE001 - a hook must never raise; see drop/sources.py
+        logger.warning("hermes-drop: reconcile trigger failed", exc_info=True)
+
+    return None
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point.
+
+    Both tools are registered ``is_async=False``. An ``is_async=True`` handler
+    is bridged onto a *private* loop by ``model_tools._run_async``
+    (``model_tools.py:97-137``) — not the gateway loop — so declaring async
+    would buy a useless loop and still require the explicit bridge in
+    ``drop/bridge.py``.
+    """
+    ctx.register_hook("pre_gateway_dispatch", capture_turn_source)
+
+    # One registration reaches the Discord picker, the Telegram menu, the CLI and
+    # plain typed text on every platform (``hermes_cli/plugins.py:548-600``).
+    # ``args_hint`` is imported rather than repeated: a ``<``-prefixed hint would
+    # drop the command from Telegram's menu entirely
+    # (``_requires_argument``, ``hermes_cli/commands.py:533-535``).
+    from .drop import command as drop_command_module
+
+    ctx.register_command(
+        drop_command_module.COMMAND_NAME,
+        drop_command,
+        description=drop_command_module.DESCRIPTION,
+        args_hint=drop_command_module.ARGS_HINT,
+    )
+
+    # The startup trigger for the reconciler. It polls for a live runner and
+    # gives up quietly if none appears, so a CLI process that merely discovers
+    # plugins neither blocks nor writes anything: the journal is not even
+    # constructed until a gateway and its loop exist (``drop/reconciler.py``).
+    from .drop import reconciler
+
+    reconciler.start_startup_trigger()
+
+    ctx.register_tool(
+        name=schemas.REQUEST_PRIVATE_INPUT["name"],
+        toolset=schemas.TOOLSET,
+        schema=schemas.REQUEST_PRIVATE_INPUT,
+        handler=request_private_input,
+        check_fn=drop_check_fn,
+        is_async=False,
+        description="Ask for a secret through a one-shot encrypted web form.",
+        emoji="🔐",
+    )
+    ctx.register_tool(
+        name=schemas.CLAIM_PRIVATE_INPUT["name"],
+        toolset=schemas.TOOLSET,
+        schema=schemas.CLAIM_PRIVATE_INPUT,
+        handler=claim_private_input,
+        check_fn=drop_check_fn,
+        is_async=False,
+        description="Retrieve the private input for a drop reported as received.",
+        emoji="🔐",
+    )
+
+
+__all__ = [
+    "capture_turn_source",
+    "claim_private_input",
+    "drop_check_fn",
+    "drop_command",
+    "register",
+    "request_private_input",
+]

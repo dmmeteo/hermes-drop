@@ -1,0 +1,90 @@
+{
+  "$comment": "The broker's local control protocol, as a fixture both languages read. Node: src/control-server.js and bin/handoff-admin.mjs, held against this file by test/control-protocol.test.js. Python (Hermes side, later slices): the drop control client. Nothing here is secret and nothing here is a credential.",
+  "version": 1,
+  "transport": {
+    "kind": "unix-stream",
+    "framing": "newline-delimited-json",
+    "exchange": "one request line out, one response line back, then the server closes",
+    "max_request_bytes": 4096,
+    "socket_mode": "0600",
+    "socket_dir_mode": "0700",
+    "default_socket_path": "/run/handoff/control.sock",
+    "socket_path_env": "HANDOFF_CONTROL_SOCKET"
+  },
+  "notice_platforms": ["discord", "telegram", "plain"],
+  "errors": ["invalid_request", "unavailable"],
+  "error_notes": {
+    "invalid_request": "A caller mistake: unknown op, missing or ill-typed field, oversized line, unsupported notice_platform. Never a statement about a handoff.",
+    "unavailable": "One body for missing, malformed, expired, consumed and lapsed. A content invariant, not a timing one: `await` blocks only for a live pending handoff and therefore leaks liveness to its local caller by construction."
+  },
+  "ops": {
+    "create": {
+      "summary": "Mint one handoff and return its one-time URL.",
+      "request": {
+        "op": "create",
+        "ttl_seconds": {
+          "type": "number",
+          "optional": true,
+          "note": "Defaults to the broker's ttlSeconds (1800); must be > 0 and <= maxTtlSeconds (3600)."
+        },
+        "notice_platform": {
+          "type": "string",
+          "optional": true,
+          "enum": ["discord", "telegram", "plain"],
+          "note": "Opt-in. When present, the response also carries notice, notice_received and notice_expired. An unlisted value is refused with invalid_request and mints nothing."
+        }
+      },
+      "response": {
+        "ok": true,
+        "handoff_id": "22 base64url characters; non-secret and safe to log",
+        "url": "<base>/#<capability> — the capability rides in the fragment and appears nowhere else",
+        "expires_at": "epoch milliseconds",
+        "ttl_seconds": "number",
+        "max_plaintext_bytes": "number",
+        "notice": "only when notice_platform was given: the waiting message, rendered for that platform",
+        "notice_received": "only when notice_platform was given: the content the waiting message is edited into on submit; identical on every platform",
+        "notice_expired": "only when notice_platform was given: the content it is edited into on lapse; identical on every platform"
+      }
+    },
+    "await": {
+      "summary": "Block on the submission event. Answers with a status and an id, never with the payload.",
+      "request": {
+        "op": "await",
+        "handoff_id": { "type": "string", "optional": false },
+        "wait_ms": {
+          "type": "number",
+          "optional": true,
+          "note": "Defaults to 0. The broker never waits past the handoff's own expiry."
+        }
+      },
+      "response": { "ok": true, "handoff_id": "string", "status": "submitted" }
+    },
+    "claim": {
+      "summary": "Consume the payload exactly once. The only op that returns plaintext.",
+      "request": {
+        "op": "claim",
+        "handoff_id": { "type": "string", "optional": false },
+        "wait_ms": {
+          "type": "number",
+          "optional": true,
+          "note": "Defaults to 0. When > 0, blocks on the submission event first, so nothing polls."
+        }
+      },
+      "response": {
+        "ok": true,
+        "handoff_id": "string",
+        "plaintext_b64": "base64 of the payload bytes — transport encoding for the JSON line, not a protection measure"
+      }
+    }
+  },
+  "cli": {
+    "entrypoint": "bin/handoff-admin.mjs",
+    "rule": "exit 0 means the payload is waiting: claim it. Any non-zero means do NOT claim.",
+    "exit_codes": {
+      "0": "submitted / the command succeeded",
+      "1": "transport failure — socket unreachable, request timed out, or the answer was malformed; the payload's fate is genuinely unknown",
+      "2": "usage — a caller mistake, never a statement about the handoff",
+      "3": "the broker answered unavailable: expired, consumed, or the wait lapsed"
+    }
+  }
+}

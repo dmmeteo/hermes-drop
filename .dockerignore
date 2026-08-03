@@ -1,0 +1,17 @@
+node_modules
+run
+test
+wayfinder
+patches
+integrations
+.git
+.env
+src/public/assets
+PROTOTYPE.md
+README.md
+SECURITY.md
+CONTRIBUTING.md
+CHANGELOG.md
+LICENSE
+compose.yml
+Dockerfile

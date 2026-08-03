@@ -1,0 +1,38 @@
+node_modules/
+# Generated browser bundle — built by `npm run build`.
+src/public/assets/
+# Default local control socket location.
+run/
+# Python bytecode from the hermes-drop plugin's test runs. The installer's
+# --copy path excludes these too; a profile should never receive them.
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Deployment values: the public hostname and the host control-socket directory.
+# Machine-specific rather than secret — see .env.example, which is committed.
+.env
+
+# ── not published ──────────────────────────────────────────────────────────
+#
+# Kept in the working tree, deliberately out of the public repository. None of
+# it is needed to build, test, install or deploy Hermes Drop, and all of it
+# describes one operator's environment rather than the product.
+
+# Internal planning, tickets, research, per-slice implementation reports and
+# code reviews. Records live-profile detail — absolute paths, a real config's
+# line count and checksum, live branch state, session-by-session process — and
+# would read as documentation while being process history. The public
+# architecture, threat model and limitations live in README.md and SECURITY.md.
+wayfinder/
+
+# The superseded prototype decision brief. Its framing ("throwaway prototype",
+# "not production") and acceptance criteria describe a slice that shipped; the
+# README documents what exists now.
+PROTOTYPE.md
+
+# The retired v1 integration: an unversioned plugin and the model-driven skill
+# prose it ran. Kept for provenance, not published — the prose names a platform
+# and picks a destination, which is the exact failure mode the current design
+# exists to prevent, and it carries checkout-specific paths.
+integrations/legacy/

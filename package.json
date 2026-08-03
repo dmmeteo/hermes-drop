@@ -1,0 +1,50 @@
+{
+  "name": "hermes-drop",
+  "version": "0.4.0",
+  "description": "Self-hosted broker and Hermes plugin that asks a user for a secret through a one-shot, origin-bound, browser-encrypted web form (RFC 9180 HPKE) instead of the chat",
+  "keywords": [
+    "hermes",
+    "hermes-agent",
+    "ai-agent",
+    "secrets",
+    "security",
+    "hpke",
+    "rfc9180",
+    "self-hosted",
+    "discord",
+    "telegram"
+  ],
+  "homepage": "https://github.com/dmmeteo/hermes-drop#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmmeteo/hermes-drop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dmmeteo/hermes-drop/issues"
+  },
+  "license": "MIT",
+  "author": "dmmeteo",
+  "scripts": {
+    "test": "node --test --test-reporter=spec test/*.test.js",
+    "test:seams": "node --test --test-reporter=spec test/seam*.test.js",
+    "build": "node scripts/build-client.mjs",
+    "start": "npm run build && node src/main.js",
+    "smoke": "npm run build && node scripts/smoke.mjs",
+    "verify": "npm run build && npm test && npm run smoke",
+    "admin": "node bin/handoff-admin.mjs"
+  },
+  "dependencies": {
+    "@hpke/core": "1.9.0"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "overrides": {
+    "@hpke/common": "1.10.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}

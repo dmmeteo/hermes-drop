@@ -1,0 +1,26 @@
+name: hermes-drop
+version: 0.4.0
+description: >-
+  Origin-bound private input. Asks the user for a secret through a one-shot
+  encrypted web form posted into the conversation the request came from, never
+  a configured home channel. Needs a Hermes Drop broker reachable on a local
+  control socket; see the repository README.
+author: dmmeteo
+kind: standalone
+
+# Only name/version/description/author/kind/requires_env/provides_tools/
+# provides_hooks are read by core's manifest parser (hermes_cli/plugins.py:1588+).
+# Nothing else here is invented: `provides_commands` is ignored by the parser and
+# kept purely so `hermes plugins list` output and a human reading this file agree
+# with what register() actually registers.
+provides_tools:
+  - request_private_input
+  - claim_private_input
+provides_commands:
+  - drop
+provides_hooks:
+  - pre_gateway_dispatch
+
+# NOTE: `plugins.entries.hermes-drop.allow_tool_override` is deliberately absent
+# and must stay absent. Drop registers new tool names; it must never replace a
+# built-in (hermes_cli/plugins.py:439-445, 469-491).

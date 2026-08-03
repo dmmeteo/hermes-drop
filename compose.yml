@@ -1,0 +1,72 @@
+name: secure-secret-handoff
+
+# Attaches to an existing external Docker network named `proxy` and an existing
+# Traefik certificate resolver named `letsencrypt`, neither of which this stack
+# defines or modifies. No port is published: the proxy is the only ingress. Adapt
+# the labels below if your ingress is not Traefik.
+#
+# Set HANDOFF_PUBLIC_HOST and HANDOFF_SOCKET_DIR in a `.env` beside this file —
+# see .env.example. Both are required; compose fails with a readable message
+# rather than resolving either to an empty string.
+#
+# Everything internal — service, container, router, middleware and environment
+# names — says `handoff`. Hermes Drop is the product name; renaming the internals
+# would break every live deployment for no functional gain.
+
+services:
+  handoff:
+    build: .
+    image: hermes-drop:0.4.0
+    container_name: handoff-broker
+    restart: unless-stopped
+    environment:
+      HANDOFF_BASE_URL: https://${HANDOFF_PUBLIC_HOST:?set HANDOFF_PUBLIC_HOST to the public hostname this broker is served at}
+      HANDOFF_TTL_SECONDS: "1800"
+      HANDOFF_MAX_PLAINTEXT_BYTES: "65536"
+      HANDOFF_MAX_BODY_BYTES: "131072"
+      HANDOFF_ENABLE_HSTS: "1"
+    # The uid/gid the broker runs as is *declared*, not inferred from the image,
+    # because reachability of the bind-mounted control socket below depends on it
+    # matching the host operator (uid 1000). The image's own `USER node` is the
+    # same uid today; pinning it here means an image change cannot silently make
+    # the socket unreachable.
+    user: "1000:1000"
+    # In-memory state only: a restart intentionally destroys every pending
+    # handoff, because the per-handoff private keys are never persisted.
+    read_only: true
+    # The control socket lives on a host directory instead of a container-private
+    # tmpfs, so the Hermes gateway can reach it directly. This does not narrow the
+    # trust boundary — the host operator already reached `claim` through
+    # `docker compose exec` — it keeps plaintext out of process argv, out of
+    # `docker` logs, and out of the terminal tool's truncation path.
+    #
+    # The host directory must exist as mode 0700 owned by 1000:1000 *before* this
+    # comes up: Docker would otherwise create it as root:root, and the broker
+    # refuses to serve out of a directory it cannot secure. `:?` fails the compose
+    # command with a readable message instead of resolving to an empty source.
+    # Validate with: bin/install-hermes-drop.sh --preflight
+    volumes:
+      - ${HANDOFF_SOCKET_DIR:?set HANDOFF_SOCKET_DIR to the host control-socket directory}:/run/handoff
+    tmpfs:
+      - /tmp:mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.handoff.rule=Host(`${HANDOFF_PUBLIC_HOST}`)
+      - traefik.http.routers.handoff.entrypoints=websecure
+      - traefik.http.routers.handoff.tls.certresolver=letsencrypt
+      - traefik.http.services.handoff.loadbalancer.server.port=8787
+      # Bound the payload at the proxy as well as in the broker.
+      - traefik.http.middlewares.handoff-body.buffering.maxRequestBodyBytes=131072
+      - traefik.http.middlewares.handoff-body.buffering.memRequestBodyBytes=131072
+      - traefik.http.routers.handoff.middlewares=handoff-body@docker
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
