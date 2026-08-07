@@ -197,6 +197,7 @@ of those principals.
 | A link landing in the wrong conversation | No destination is expressible by the model; the origin is resolved and then verified, or refused. |
 | Replay into another drop | The capability hash, drop id, version and suite are bound into the HPKE `info`. |
 | A second reader | One claim, then a payload-free receipt. |
+| A payload consumed on behalf of a reader that could not receive it | The claiming client states how large a response line it can read; the broker sizes the answer against that *before* retiring anything, and refuses instead. |
 | Guessing a link | 128 bits of CSPRNG entropy, a 30-minute default lifetime, a uniform unavailable answer for every wrong guess, and nothing persisted to attack offline. |
 | A stolen bot token editing history | The status message carries no capability once it leaves the waiting state. |
 | The claimed secret in `state.db` | The tool result Hermes persists carries a placeholder, not the plaintext. The plaintext is held in gateway memory and substituted into the provider request only. See [Durable sanitization](#durable-sanitization). |
@@ -228,10 +229,44 @@ of those principals.
   expired.
 - **The claim response has a size ceiling.** The plugin reads a claim response up
   to 1 MiB, which is ~783 KB of plaintext after base64. The shipped broker default
-  is 64 KiB, an order of magnitude clear of it, and a test pins that — but if you
-  raise `HANDOFF_MAX_PLAINTEXT_BYTES` past the ceiling, a payload above it is
-  destroyed on claim and reported unavailable. The plugin warns in `agent.log` at
-  create time when a broker advertises a cap it cannot read back.
+  is 64 KiB, an order of magnitude clear of it, and a test pins that. If you raise
+  `HANDOFF_MAX_PLAINTEXT_BYTES` past the ceiling, a payload above it is *refused*
+  rather than delivered — `response_too_large`, with the drop still intact and
+  still claimable by `handoff-admin claim`, which reads an unbounded line. The
+  plugin warns in `agent.log` at create time when a broker advertises a cap it
+  cannot read back, because a refusal still costs the user a round trip. The
+  remedy is to bring `HANDOFF_MAX_PLAINTEXT_BYTES` back under ~783 KB; the
+  plugin's own reader ceiling is a constant and cannot be raised to meet it.
+- **An old broker cannot refuse before consuming.** The pre-consumption size check
+  arrived with control protocol 2 (broker 0.5.0). A protocol 1 broker accepts the
+  `max_response_bytes` field, ignores it, and destroys an oversized payload as it
+  answers, exactly as 0.4.0 did. The plugin does not assume otherwise: every
+  `create` response carries `protocol_version` (absent means 1), and the plugin
+  reads it rather than its own version. What it does with the answer:
+
+  | broker | `HANDOFF_MAX_PLAINTEXT_BYTES` | plugin |
+  |---|---|---|
+  | protocol ≥ 2 | ≤ ~783 KB (default 64 KiB) | proceeds, silent |
+  | protocol ≥ 2 | above ~783 KB | proceeds, warns — an oversized claim is refused, never destroyed |
+  | protocol 1 | ≤ ~783 KB (default 64 KiB) | **proceeds**, warns once about the version gap; nothing this broker accepts is too large to read back, so it is exactly as safe as 0.4.0 was |
+  | protocol 1 | above ~783 KB | **refuses the drop** with `broker_too_old` |
+
+  Only the last row is refused, and it is refused *before* the link is posted: no
+  message, no journal entry, no waiter, and nobody is asked for a secret. The
+  minted handoff is never submitted to and simply lapses at its TTL — there is
+  nothing to recover with `handoff-admin claim`. Operator remedy: upgrade the
+  broker to 0.5.0 or newer, **or** lower `HANDOFF_MAX_PLAINTEXT_BYTES` under
+  ~783 KB. Either one clears it; the `agent.log` line names both with the numbers.
+- **A delivered claim can go unrecorded.** The broker destroys its copy as it
+  answers, so `claimed_at` is written after the plugin already holds the only
+  copy. If that write fails the secret is still returned, with a note, and the
+  failure is an `ERROR` in `agent.log`; the journal understates what happened
+  until the entry lapses. The alternative — failing the claim — would destroy a
+  secret the system had already successfully delivered. The visible consequence is
+  bounded: an entry that stays `received` with no `claimed_at` is re-announced by
+  the reconciler after the 15-minute grace, up to `MAX_ANNOUNCE_ATTEMPTS` (5)
+  in total, so the model may be told again to claim a drop it already claimed —
+  and each of those claims is answered `unavailable` by the broker's receipt.
 - **Durable sanitization does not confine the model or the wire.** Three
   exposures survive it, all verified rather than assumed:
   - anything the model *does* with the secret — echoing it into a reply, passing

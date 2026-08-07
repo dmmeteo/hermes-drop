@@ -6,9 +6,64 @@ is `0`, minor versions may carry breaking changes.
 
 ## [Unreleased]
 
-Plugin `0.5.0`. The broker is unchanged at `0.4.0`.
+Plugin `0.5.0`, broker `0.5.0`. The control protocol moves to `version: 2` — an
+additive revision: one optional `claim` request field, one new error, and a
+`protocol_version` on the `create` response. A version 1 client sends none of them
+and reads none of them, and behaves exactly as it did before.
 
 ### Added
+
+- **Lossless claim boundary.** The broker no longer consumes a payload it cannot
+  hand over. A claiming client states the largest response line it can read
+  (`max_response_bytes` on `claim`), the broker sizes the whole answer against it
+  *before* the record is retired, and an answer that would not fit comes back as
+  `response_too_large` with `required_bytes` and the ceiling — payload untouched,
+  still one-shot, still claimable until the TTL. The check lives inside
+  `broker.claim`'s synchronous single-use gate, next to the retirement it guards,
+  and the size is arithmetic on the real line (`claimResponseBytes`), not an
+  estimate; a seam-4 test pins it against an actual response.
+
+  This closes the last window in which a successful submission could be destroyed
+  by the act of reading it. The plugin's control client reads at most 1 MiB and
+  now advertises that same constant on every claim, so the one line it could fail
+  to buffer is a line it is never sent. Omitting the field still means "unbounded
+  reader", which is what `bin/handoff-admin.mjs` is — and is why the admin CLI
+  remains the recovery path for a payload some other reader is too small for.
+
+  An advertised ceiling has a floor: `transport.min_response_bytes` (1024), below
+  which the claim is refused as `invalid_request`. Every answer `claim` can give
+  other than a payload fits inside it — `unavailable` 35 bytes, `invalid_request`
+  39, `response_too_large` 114 at its widest — so a client small enough to be
+  refused can still read the refusal. Sizes are of the whole line *including its
+  newline* (`transport.size_convention`), which is the unit `StreamReader` applies
+  its own limit to; a test reads a line of exactly the limit to pin that the two
+  conventions are one.
+
+  `contract/control-protocol.json` carries all of it: `transport.max_response_bytes`
+  and `min_response_bytes`, the new request field, and the third error body with a
+  note on why it is deliberately distinguishable from `unavailable`.
+
+- **`protocol_version` on the `create` response,** so a plugin can tell what it is
+  talking to. The broker and the plugin ship from one repo but install and upgrade
+  separately, and a protocol 1 broker accepts `max_response_bytes`, ignores it and
+  destroys an oversized payload exactly as 0.4.0 did — so "I sent a ceiling" is not
+  evidence the boundary is lossless. Absence of the field means version 1.
+
+  The plugin reads it at create time and refuses the drop with the new
+  `broker_too_old` error in **one** case: a protocol 1 broker whose advertised
+  `max_plaintext_bytes` exceeds what this client can read back (~783 KB). That is
+  the only combination in which a claim can still destroy a secret with no refusal
+  available anywhere. The refusal lands before the link is posted — no message, no
+  journal entry, no waiter, nobody asked for a secret — and the minted handoff
+  lapses unused, so there is nothing to recover from it. Operator remedy, named
+  with both numbers in `agent.log`: upgrade the broker to 0.5.0 or newer, or lower
+  `HANDOFF_MAX_PLAINTEXT_BYTES` under the client ceiling.
+
+  Every other combination proceeds. A protocol 1 broker at or under the readable
+  range — including the shipped 64 KiB default — works as it always did, with one
+  `agent.log` warning per drop naming the version gap. A protocol 2 broker with an
+  oversized cap warns, because an oversized claim is now refused rather than
+  destroyed and the cost is a round trip rather than a secret.
 
 - **Durable secret sanitization.** A claimed secret no longer reaches Hermes'
   durable session state. The tool result the plugin hands core carries an opaque
@@ -47,6 +102,23 @@ Plugin `0.5.0`. The broker is unchanged at `0.4.0`.
   Uses only supported plugin API (`ctx.register_middleware`); no new Hermes core
   patch. Residual exposures — post-middleware request observers, the model's own
   output, memory residency — are documented in `SECURITY.md`.
+
+### Changed
+
+- **A claim that could not be recorded no longer discards the secret.** The broker
+  destroys its copy as it answers, so `claimed_at` is necessarily written after
+  the plugin holds the only remaining copy. An `OSError` from that write — a full
+  or read-only `$HERMES_HOME` — used to propagate into the tool guard and return
+  `internal_error`, losing a secret the system had already delivered. The write is
+  now contained: the payload is returned with a note telling the model not to
+  retry, and the failure is an `ERROR` line for the operator. One-shot semantics
+  are unchanged and unchanged in mechanism — the retry the unmarked entry appears
+  to permit is refused by the broker's payload-free receipt, which is why this
+  needs no distributed transaction. What remains true is that the journal
+  understates the claim until the entry lapses, and the reconciler acts on that:
+  `received` with no `claimed_at` past the 15-minute grace is re-announced, capped
+  by `MAX_ANNOUNCE_ATTEMPTS` (5), so the model can be told again to claim a drop it
+  already holds — bounded, answered `unavailable`, and named in `SECURITY.md`.
 
 ## [0.4.0] — 2026-08-03
 

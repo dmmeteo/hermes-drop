@@ -443,6 +443,252 @@ def test_the_claimable_ceiling_follows_from_the_response_limit(control_client) -
     assert 4 * ((ceiling + 3 + 2) // 3) + 4096 > control_client.MAX_RESPONSE_BYTES
 
 
+# ── the response-size capability: refuse before consuming ──────────────────
+#
+# Everything above this line is damage control: the reader's limit is real, the
+# overrun is caught, and ``create`` warns when the broker's cap is out of reach.
+# None of it saves a payload that is *already* too big — ``broker.claim`` retires
+# the record before writing the line, so by the time ``readline`` gives up the
+# secret is gone. The only fix is for the broker to know the ceiling before it
+# consumes anything, which means the ceiling has to be on the wire.
+
+
+def test_the_reader_ceiling_is_a_shared_constant(control_client) -> None:
+    """One number, in the fixture, on both sides. Not two that happen to agree."""
+    assert control_client.MAX_RESPONSE_BYTES == CONTRACT["transport"]["max_response_bytes"]
+    assert control_client.MIN_RESPONSE_BYTES == CONTRACT["transport"]["min_response_bytes"]
+    assert control_client.MIN_RESPONSE_BYTES <= control_client.MAX_RESPONSE_BYTES
+    assert control_client.RESPONSE_TOO_LARGE in CONTRACT["errors"]
+    assert control_client.RESPONSE_TOO_LARGE in control_client.ERRORS
+
+
+def test_the_protocol_version_this_client_implements_is_the_fixtures(control_client) -> None:
+    assert control_client.PROTOCOL_VERSION == CONTRACT["version"]
+
+
+def test_lossless_claim_is_decided_from_the_wire_not_assumed(control_client) -> None:
+    """A plugin is installed once and upgraded on its own schedule, so the broker
+    it talks to may predate the response-size capability. Absence is the pre-2
+    answer — a v1 broker sends no version field at all — and it must read as "no",
+    never as "probably fine"."""
+    assert control_client.supports_lossless_claim({"ok": True, "protocol_version": 2}) is True
+    assert control_client.supports_lossless_claim({"ok": True, "protocol_version": 99}) is True
+    assert control_client.supports_lossless_claim({"ok": True, "protocol_version": 1}) is False
+    assert control_client.supports_lossless_claim({"ok": True}) is False
+    assert control_client.supports_lossless_claim({"protocol_version": "2"}) is False
+    assert control_client.supports_lossless_claim(None) is False
+
+
+@pytest.mark.asyncio
+async def test_the_real_broker_states_its_protocol_version_at_create(
+    control_client, real_broker
+) -> None:
+    created = await control_client.create(ttl_seconds=60, socket_path=real_broker.socket_path)
+
+    assert created["ok"] is True, created
+    assert created["protocol_version"] == control_client.PROTOCOL_VERSION
+    assert control_client.supports_lossless_claim(created) is True
+
+
+@pytest.mark.asyncio
+async def test_a_line_of_exactly_the_limit_including_its_newline_is_readable(
+    control_client, tmp_path: Path
+) -> None:
+    """The convention behind ``required_bytes``, pinned against asyncio itself.
+
+    The broker counts the terminating newline in the size it compares against the
+    advertised ceiling. That is only sound if a ``StreamReader`` with ``limit=N``
+    can actually read a line of exactly ``N`` bytes *including* the newline —
+    asyncio raises ``LimitOverrunError`` on ``line + separator`` exceeding the
+    limit, not on the line alone, so an off-by-one here would refuse claims that
+    fit or, worse, permit one that does not.
+    """
+    socket_dir = tmp_path / "run"
+    socket_dir.mkdir(mode=0o700)
+    socket_path = socket_dir / "exact.sock"
+
+    limit = 512
+    body = json.dumps({"ok": True, "pad": ""}, separators=(",", ":")).encode("utf-8")
+    pad = limit - len(body) - 1  # -1 for the newline that has to fit as well
+    line = json.dumps({"ok": True, "pad": "z" * pad}, separators=(",", ":")).encode("utf-8") + b"\n"
+    assert len(line) == limit
+
+    async def answer(reader, writer):
+        await reader.readline()
+        writer.write(line)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(answer, path=str(socket_path))
+    try:
+        connection = await asyncio.open_unix_connection(str(socket_path), limit=limit)
+        rd, wr = connection
+        wr.write(b'{"op":"create"}\n')
+        await wr.drain()
+        raw = await rd.readline()
+        wr.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert len(raw) == limit, "a line of exactly the limit, newline included, must come back whole"
+
+
+@pytest.mark.asyncio
+async def test_the_size_oracle_agrees_across_both_languages(
+    control_client, real_public_broker
+) -> None:
+    """``required_bytes`` computed here must be the number the broker computes.
+
+    Same arithmetic, written independently on the Python side: the JSON envelope
+    around an empty payload, plus four base64 characters per three payload bytes,
+    plus the newline. If the two ever disagree, one of them is refusing claims
+    that fit or admitting ones that do not — and the second half of this test is
+    the boundary itself, one byte either side of the number.
+    """
+    plaintext = "size-oracle-" + ("k" * 1500)  # past the minimum ceiling, so both sides bind
+    payload_bytes = len(plaintext.encode("utf-8"))
+
+    created = await control_client.create(
+        ttl_seconds=60, socket_path=real_public_broker.socket_path
+    )
+    handoff_id = created["handoff_id"]
+    envelope = len(
+        json.dumps(
+            {"ok": True, "handoff_id": handoff_id, "plaintext_b64": ""}, separators=(",", ":")
+        ).encode("utf-8")
+    ) + 1
+    required = envelope + 4 * -(-payload_bytes // 3)
+
+    assert real_public_broker.submit(created["url"], plaintext) == "SUBMITTED sent"
+
+    refused = await control_client.control_request(
+        {"op": "claim", "handoff_id": handoff_id, "max_response_bytes": required - 1},
+        socket_path=real_public_broker.socket_path,
+    )
+    assert refused["error"] == control_client.RESPONSE_TOO_LARGE, refused
+    assert refused["required_bytes"] == required, "the two languages disagree on the line size"
+
+    claimed = await control_client.control_request(
+        {"op": "claim", "handoff_id": handoff_id, "max_response_bytes": required},
+        socket_path=real_public_broker.socket_path,
+    )
+    assert claimed.get("ok") is True, claimed
+    assert (
+        len(json.dumps(claimed, separators=(",", ":")).encode("utf-8")) + 1 == required
+    ), "and the real line is exactly what both of them predicted"
+
+
+@pytest.mark.asyncio
+async def test_a_ceiling_below_the_minimum_is_a_caller_mistake(
+    control_client, real_broker
+) -> None:
+    """Below the minimum the broker could not answer *anything* the caller could
+    read, refusals included, so the request is refused as the configuration
+    mistake it is rather than honoured into a guaranteed transport fault."""
+    response = await control_client.control_request(
+        {
+            "op": "claim",
+            "handoff_id": "A" * 22,
+            "max_response_bytes": control_client.MIN_RESPONSE_BYTES - 1,
+        },
+        socket_path=real_broker.socket_path,
+    )
+    assert response == {"ok": False, "error": "invalid_request"}
+
+
+@pytest.mark.asyncio
+async def test_claim_advertises_the_ceiling_it_can_actually_read(
+    control_client, tmp_path: Path
+) -> None:
+    """The client's limit is only useful to the broker if the broker is told.
+
+    Asserted against a stub that records the request line rather than against the
+    real broker, because what is under test is the *request* — that ``claim``
+    states the same bound ``_exchange`` passes to ``open_unix_connection``, so the
+    broker's pre-consumption check is calibrated to the reader that will actually
+    have to buffer the answer.
+    """
+    socket_dir = tmp_path / "run"
+    socket_dir.mkdir(mode=0o700)
+    socket_path = socket_dir / "echo.sock"
+    seen: list = []
+
+    async def record(reader, writer):
+        seen.append(json.loads(await reader.readline()))
+        writer.write(b'{"ok":false,"error":"unavailable"}\n')
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(record, path=str(socket_path))
+    try:
+        await control_client.claim("A" * 22, socket_path=socket_path)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert seen == [
+        {
+            "op": "claim",
+            "handoff_id": "A" * 22,
+            "wait_ms": 0,
+            "max_response_bytes": control_client.MAX_RESPONSE_BYTES,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_claim_past_the_advertised_ceiling_is_refused_not_destroyed(
+    control_client, real_public_broker
+) -> None:
+    """The window itself, closed, proved across both languages.
+
+    A ceiling below the response size used to be an unreadable line *after* the
+    record was retired. Now the broker sizes the answer first and refuses, so the
+    same payload is still there for a reader that can hold it — which the second
+    half of this test performs, byte for byte, against the same handoff.
+    """
+    # Comfortably past what the minimum ceiling can carry (~723 bytes of
+    # plaintext), so the refusal comes from the size check rather than from the
+    # floor under an advertised ceiling.
+    plaintext = "reader-ceiling-marker-" + ("q" * 2048)
+
+    created = await control_client.create(
+        ttl_seconds=60, socket_path=real_public_broker.socket_path
+    )
+    assert created["ok"] is True, created
+    assert real_public_broker.submit(created["url"], plaintext) == "SUBMITTED sent"
+
+    refused = await control_client.control_request(
+        {
+            "op": "claim",
+            "handoff_id": created["handoff_id"],
+            "max_response_bytes": control_client.MIN_RESPONSE_BYTES,
+        },
+        socket_path=real_public_broker.socket_path,
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == control_client.RESPONSE_TOO_LARGE, refused
+    assert (
+        refused["required_bytes"]
+        > refused["max_response_bytes"]
+        == control_client.MIN_RESPONSE_BYTES
+    )
+    assert (
+        len(json.dumps(refused, separators=(",", ":")).encode("utf-8")) + 1
+        <= control_client.MIN_RESPONSE_BYTES
+    ), "the refusal itself has to fit in the ceiling that produced it"
+    assert plaintext not in json.dumps(refused), "a refusal is not a delivery"
+
+    claimed = await control_client.claim(
+        created["handoff_id"], socket_path=real_public_broker.socket_path
+    )
+    assert claimed.get("ok") is True, claimed
+    import base64
+
+    assert base64.b64decode(claimed["plaintext_b64"]).decode("utf-8") == plaintext
+
+
 def test_the_broker_default_cap_is_claimable(control_client) -> None:
     """The live configuration is inside the bound, and stays inside it.
 

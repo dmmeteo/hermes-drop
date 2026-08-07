@@ -16,7 +16,10 @@
 //     the 0600 admin socket, by a caller already trusted with the plaintext,
 //     and because handoff ids are public by design;
 //   - nothing here logs, returns or serializes plaintext except `claim()`, whose
-//     bytes go straight to the local admin CLI's stdout.
+//     bytes go straight to the local admin CLI's stdout;
+//   - `claim()` never consumes a payload it cannot hand over: a caller that
+//     declares how much it can receive is refused *before* the retirement, so a
+//     reader too small for the answer costs a refusal rather than the secret.
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { base64UrlToBytes, bytesToBase64Url, isBase64Url } from './base64url.js';
@@ -345,10 +348,28 @@ export function createBroker(config, logger = console) {
      * Seam 4: hand the plaintext to the local admin caller exactly once, then
      * retire the handoff to a payload-free receipt. Fully synchronous after the
      * lookup, so a second concurrent claim cannot observe `submitted`.
+     *
+     * `maxPayloadBytes` is the caller's own capacity, translated from the
+     * response-line ceiling it advertised (`src/control-server.js`). It is
+     * checked here, inside the same synchronous gate as the retirement, rather
+     * than by a peek-then-claim pair at that seam: both are correct today, and
+     * only this one is still correct the day an `await` appears between them.
+     * A payload over the ceiling is refused with the record untouched — still
+     * `submitted`, still one-shot, still there for a reader that can hold it.
      */
-    claim(handoffId) {
+    claim(handoffId, { maxPayloadBytes = Infinity } = {}) {
       const record = live(byHandoffId.get(handoffId), Date.now());
       if (!record || record.state !== 'submitted' || !record.plaintext) return UNAVAILABLE;
+
+      if (record.plaintext.length > maxPayloadBytes) {
+        logger.info?.(
+          `handoff claim refused hid=${handoffId} reason=response_too_large ` +
+            `bytes=${record.plaintext.length} caller_capacity=${maxPayloadBytes}`,
+        );
+        // The size and nothing else. The caller needs it to say what went wrong;
+        // it is the same number already logged at submit.
+        return { ok: false, error: 'response_too_large', payload_bytes: record.plaintext.length };
+      }
 
       const plaintext = record.plaintext;
       record.plaintext = null; // detached before retiring, so it is not zeroized

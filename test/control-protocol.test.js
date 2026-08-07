@@ -92,13 +92,77 @@ describe('the control protocol contract', () => {
       assert.ok(!contract.notice_platforms.includes('slack'));
     });
 
-    it('publishes the same two error bodies the broker actually uses', async () => {
-      assert.deepEqual([...contract.errors].sort(), ['invalid_request', 'unavailable']);
+    it('publishes the same three error bodies the broker actually uses', async () => {
+      assert.deepEqual(
+        [...contract.errors].sort(),
+        ['invalid_request', 'response_too_large', 'unavailable'],
+      );
 
       const invalid = await broker.control({ op: 'await' });
       assert.equal(invalid.error, 'invalid_request');
       const unavailable = await broker.control({ op: 'claim', handoff_id: 'nope' });
       assert.equal(unavailable.error, 'unavailable');
+      // `response_too_large` needs a live payload to be about, so it is proved
+      // against the broker in test/seam4-claim.test.js. What is pinned here is
+      // that the fixture names it and that every published error has a note.
+      for (const error of contract.errors) {
+        assert.equal(typeof contract.error_notes[error], 'string', `${error} needs a note`);
+      }
+    });
+
+    // The response-size capability. A claim response is the one line that can be
+    // arbitrarily large, and the broker retires the record before writing it — so
+    // a reader that cannot buffer the line is a destroyed secret. The contract is
+    // what lets a foreign client say how much it can read *before* anything is
+    // consumed.
+    it('publishes a response-size ceiling a bounded reader can hold itself to', () => {
+      assert.equal(typeof contract.transport.max_response_bytes, 'number');
+      assert.ok(
+        contract.transport.max_response_bytes > contract.transport.max_request_bytes,
+        'a response carries a payload; a request never does',
+      );
+
+      const field = contract.ops.claim.request.max_response_bytes;
+      assert.equal(field.type, 'number');
+      assert.equal(field.optional, true, 'a caller that reads an unbounded line sends nothing');
+      assert.match(field.note, /before/i, 'the point is that the refusal precedes consumption');
+      assert.match(field.note, /newline/i, 'the unit has to be unambiguous to be checkable');
+    });
+
+    // A ceiling below the refusal itself would be self-defeating: the caller
+    // would be answered with a line it cannot read either, and would report a
+    // transport fault for what is really a configuration mistake.
+    it('pins a minimum ceiling every conforming client can receive a refusal in', async () => {
+      const source = await read('src/control-server.js');
+      const serverMin = Number(source.match(/MIN_RESPONSE_BYTES = (\d+)/)[1]);
+
+      assert.equal(contract.transport.min_response_bytes, serverMin);
+      assert.ok(
+        contract.transport.min_response_bytes < contract.transport.max_response_bytes,
+        'the floor is below the ceiling',
+      );
+
+      const below = await broker.control({
+        op: 'claim',
+        handoff_id: 'abcdefghijklmnopqrstuv',
+        max_response_bytes: serverMin - 1,
+      });
+      assert.deepEqual(below, { ok: false, error: 'invalid_request' });
+    });
+
+    // Both halves of this repo ship together, but a Hermes-side plugin does not:
+    // it is installed once and upgraded on its own schedule. So the one thing a
+    // foreign client cannot be asked to infer is which protocol it is talking to.
+    it('states its protocol version on the wire, in the response every drop starts with', async () => {
+      const created = await broker.control({ op: 'create', ttl_seconds: 60 });
+      assert.equal(created.ok, true);
+      assert.equal(created.protocol_version, contract.version);
+      assert.equal(contract.ops.create.response.protocol_version, 'number: the protocol this broker speaks; absent means 1');
+      assert.match(
+        contract.version_notes.lossless_claim,
+        /2/,
+        'the note has to say which version made the claim boundary lossless',
+      );
     });
   });
 

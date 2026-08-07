@@ -1,6 +1,6 @@
 {
   "name": "hermes-drop",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Self-hosted broker and Hermes plugin that asks a user for a secret through a one-shot, origin-bound, browser-encrypted web form (RFC 9180 HPKE) instead of the chat",
   "keywords": [
     "hermes",

@@ -116,12 +116,54 @@ a schedule, and please give a reasonable window before disclosing publicly.
     deletion: the existing swap / core-dump / snapshot caveat applies here too.
 - **Claim response ceiling.** The plugin reads a claim response up to 1 MiB, which
   is ~783 KB of plaintext after base64. The shipped broker default is 64 KiB and a
-  test pins that it stays below the ceiling, but an operator who raises
-  `HANDOFF_MAX_PLAINTEXT_BYTES` past it will have oversized payloads destroyed on
-  claim and reported unavailable — the broker retires the record before the
-  response is written. The plugin warns at create time when a broker advertises a
-  cap it cannot read back; it does not refuse, because that would break every
-  small drop for a ceiling only a large one can reach.
+  test pins that it stays below the ceiling. Past it the claim is **refused, not
+  consumed**: the ceiling travels with the request (`max_response_bytes`,
+  `contract/control-protocol.json`), the broker sizes the whole response line
+  before it retires anything, and an answer that would not fit comes back as
+  `response_too_large` with the payload untouched and still claimable — by the
+  admin CLI, which reads an unbounded line, until the link expires. It used to be
+  destroyed: the record was retired before the response was written, so a line the
+  reader could not buffer was a secret nobody got. What remains is a drop the user
+  has already filled in and the plugin cannot read, which is why the create-time
+  warning stays; it does not refuse the drop, because that would break every small
+  drop for a ceiling only a large one can reach. The floor under an advertised
+  ceiling is `transport.min_response_bytes` (1024): every answer `claim` can give
+  other than a payload fits inside it — `unavailable` 35 bytes,
+  `invalid_request` 39, `response_too_large` 114 at its widest — so a conforming
+  client can always read the refusal it gets, and a ceiling below the floor is
+  rejected as `invalid_request` rather than honoured into a guaranteed transport
+  fault. It bounds `claim` only; a `create` response carrying a rendered notice is
+  around 570 bytes and is governed by `transport.max_response_bytes` instead.
+- **A broker older than the pre-consumption check.** The check arrived with control
+  protocol 2 (broker 0.5.0); protocol 1 accepts `max_response_bytes`, ignores it,
+  and destroys an oversized payload as it answers. The plugin and the broker are
+  installed and upgraded separately, so the plugin reads `protocol_version` off
+  every `create` response — absent means 1 — instead of assuming the capability
+  from its own version. It refuses the drop (`broker_too_old`, before the link is
+  posted, so no message, no journal entry, no waiter and nothing submitted) in
+  exactly one case: protocol 1 **and** an advertised `max_plaintext_bytes` above
+  what this client can read back (~783 KB). A protocol 1 broker at or under that
+  cap — including the shipped 64 KiB default — still works, with one warning in
+  `agent.log` per drop, because nothing it accepts can overrun the reader and the
+  exposure is exactly 0.4.0's. Operator remedy for the refusal: upgrade the broker
+  to 0.5.0 or newer, or lower `HANDOFF_MAX_PLAINTEXT_BYTES` under ~783 KB. The
+  refused handoff was never submitted to, so there is nothing to recover from it;
+  it lapses at its TTL.
+- **A claim the plugin received but could not record.** Marking the drop spent
+  happens after the broker has destroyed its copy, so it cannot be made atomic
+  with the delivery without a protocol this design deliberately does not have. The
+  ordering is therefore ask → receive → record, and a `claimed_at` write that
+  fails (full or read-only `$HERMES_HOME`) is logged as an `ERROR`, reported in
+  the tool result, and **does not** withhold the secret — withholding it would
+  destroy the only remaining copy. The durable record then understates what
+  happened until the entry lapses. One-shot is unaffected: the retry the unmarked
+  entry appears to permit is refused by the broker's payload-free receipt. The
+  bounded side effect is a re-announce: the reconciler treats `received` with no
+  `claimed_at` past the 15-minute grace as a drop the model never collected, clears
+  `announced_at` and wakes it again — capped by `MAX_ANNOUNCE_ATTEMPTS` (5) like
+  every other announce, so it cannot loop. The model can therefore be told to
+  claim a drop whose secret it already has; those claims answer `unavailable`, and
+  the note on the original result is what tells it not to try.
 - **Adapter `send` and `edit_message` are not covered by automated tests.** Both
   need live platform credentials. The formatting boundary either side of them is
   tested with real adapter code; the calls themselves are exercised only by manual

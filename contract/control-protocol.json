@@ -1,21 +1,31 @@
 {
   "$comment": "The broker's local control protocol, as a fixture both languages read. Node: src/control-server.js and bin/handoff-admin.mjs, held against this file by test/control-protocol.test.js. Python (Hermes side, later slices): the drop control client. Nothing here is secret and nothing here is a credential.",
-  "version": 1,
+  "version": 2,
   "transport": {
     "kind": "unix-stream",
     "framing": "newline-delimited-json",
     "exchange": "one request line out, one response line back, then the server closes",
     "max_request_bytes": 4096,
+    "max_response_bytes": 1048576,
+    "max_response_bytes_note": "The response line every conforming client must be able to buffer. Only `claim` can approach it — base64 of the broker's maxPlaintextBytes (65536 by default) is 87,384 bytes — so it is stated once here rather than derived twice. A client whose reader is smaller does not get to be silent about it: it advertises its real ceiling on `claim` and is refused before anything is consumed.",
+    "min_response_bytes": 1024,
+    "min_response_bytes_note": "The floor under an advertised max_response_bytes; anything smaller is refused with invalid_request. It bounds the `claim` op only, because that is the only op the ceiling applies to: every answer `claim` can give other than a payload — `unavailable` (35 bytes), `invalid_request` (39) and `response_too_large` (114 at its widest, with both counts spelled out in full) — fits inside it, so a conforming client can always read the answer it gets, refusals included. It says nothing about the other ops: a `create` response carrying a rendered notice is ~570 bytes and could grow, which is why transport.max_response_bytes, not this, is the line every client must be able to buffer. A ceiling below this floor could only produce a line the caller cannot read, which would surface as a transport fault for what is really a configuration mistake.",
+    "size_convention": "Every byte count here is of the whole line as written to the socket, including the terminating newline. That is the unit a reader has to budget for: asyncio's StreamReader, for one, applies its limit to the line plus its separator.",
     "socket_mode": "0600",
     "socket_dir_mode": "0700",
     "default_socket_path": "/run/handoff/control.sock",
     "socket_path_env": "HANDOFF_CONTROL_SOCKET"
   },
+  "version_notes": {
+    "lossless_claim": "Version 2 added `max_response_bytes` on `claim`, the `response_too_large` error and `protocol_version` on the `create` response. Only a version 2 broker refuses an oversized claim *before* consuming it; a version 1 broker accepts the field, ignores it, and destroys the payload as it answers. A client therefore reads `protocol_version` rather than assuming the capability from its own age — the field is absent on version 1, and absence means 1.",
+    "compatibility": "Additive. A version 1 client sends no new field and reads no new field, and behaves against a version 2 broker exactly as it did against a version 1 one."
+  },
   "notice_platforms": ["discord", "telegram", "plain"],
-  "errors": ["invalid_request", "unavailable"],
+  "errors": ["invalid_request", "response_too_large", "unavailable"],
   "error_notes": {
-    "invalid_request": "A caller mistake: unknown op, missing or ill-typed field, oversized line, unsupported notice_platform. Never a statement about a handoff.",
-    "unavailable": "One body for missing, malformed, expired, consumed and lapsed. A content invariant, not a timing one: `await` blocks only for a live pending handoff and therefore leaks liveness to its local caller by construction."
+    "invalid_request": "A caller mistake: unknown op, missing or ill-typed field, oversized line, unsupported notice_platform, unusable max_response_bytes. Never a statement about a handoff.",
+    "unavailable": "One body for missing, malformed, expired, consumed and lapsed. A content invariant, not a timing one: `await` blocks only for a live pending handoff and therefore leaks liveness to its local caller by construction.",
+    "response_too_large": "`claim` only, and only when the caller advertised a max_response_bytes the answer would not fit in. Nothing is consumed: the payload is untouched, still one-shot, and still claimable by a reader that can hold it until the TTL lapses. Carries required_bytes and max_response_bytes so an operator can act on the mismatch. It is deliberately distinguishable from `unavailable` — it is a statement about the caller's own reader, not about the handoff — and it does tell that caller a payload of that size is waiting. Acceptable for the same reason `await`'s timing leak is: `claim` is reachable only through the 0600 socket, by a caller already trusted with the plaintext."
   },
   "ops": {
     "create": {
@@ -36,6 +46,7 @@
       },
       "response": {
         "ok": true,
+        "protocol_version": "number: the protocol this broker speaks; absent means 1",
         "handoff_id": "22 base64url characters; non-secret and safe to log",
         "url": "<base>/#<capability> — the capability rides in the fragment and appears nowhere else",
         "expires_at": "epoch milliseconds",
@@ -68,6 +79,11 @@
           "type": "number",
           "optional": true,
           "note": "Defaults to 0. When > 0, blocks on the submission event first, so nothing polls."
+        },
+        "max_response_bytes": {
+          "type": "number",
+          "optional": true,
+          "note": "The caller's own reader ceiling for one response line in bytes, newline included (see transport.size_convention); must be an integer between transport.min_response_bytes and whatever the caller can really hold. When present the broker sizes the whole response *before* consuming anything and answers response_too_large rather than retire a payload the caller could not have received. Absent means the caller reads an unbounded line and wants no such check — which is what bin/handoff-admin.mjs does, and is why it stays the recovery path for a payload some other reader is too small for. Only honoured by protocol_version 2 and above: a version 1 broker ignores it silently, which is what the version field on `create` is for."
         }
       },
       "response": {

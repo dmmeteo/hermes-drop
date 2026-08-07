@@ -34,6 +34,30 @@ from typing import Any, Dict, Mapping
 #: replacement ``detail`` beside the machine-readable code.
 SAFE_REASONS: Dict[str, str] = {
     "broker_unavailable": "the private-input service is not reachable right now",
+    # Deliberately says the payload survived: this is the one refusal after which
+    # retrying identically is pointless but the drop is *not* spent, and a model
+    # told only "it could not be completed" would either give up on a live secret
+    # or ask the user to send it again in the chat.
+    #
+    # The remediation is the model's, not the operator's: the reader's ceiling is
+    # a constant of this plugin, so nothing the model can do makes this value
+    # arrive — a shorter one through a new link is the whole of its options. The
+    # operator's half (lower the broker cap, or recover this drop with the admin
+    # CLI) is in `agent.log`, phrased once in `service.SIZE_REMEDIATION`.
+    "response_too_large": (
+        "the value is too large for this client to receive; it is still held by "
+        "the private-input service until the link expires, so nothing was lost — "
+        "ask for a shorter value through a new link, and tell the operator the "
+        "broker's size limit is set higher than the plugin can read back"
+    ),
+    # Also a refusal the model can act on, and the only action is to stop: a
+    # retry mints another link against the same broker with the same gap.
+    "broker_too_old": (
+        "the private-input service is running a version too old to guarantee the "
+        "secret survives being read, and it is configured to accept values larger "
+        "than this plugin can read back; no link was posted — the operator has to "
+        "upgrade the service or lower its size limit before this can be used"
+    ),
     "post_failed": "the link could not be posted into this conversation",
     "journal_failed": "the durable record could not be written, so the link was retired",
     "edit_failed": "the status message could not be updated",

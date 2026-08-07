@@ -88,6 +88,9 @@ class FakeControl:
             "expires_at": expires,
             "ttl_seconds": ttl_seconds or 1800,
             "max_plaintext_bytes": 8192,
+            # A real broker states the protocol it speaks; the plugin decides
+            # whether the claim boundary is lossless from *this*, not from hope.
+            "protocol_version": 2,
             "notice": "🔐 open the secure form http://127.0.0.1:8080/#Q2FwYWJpbGl0eVN0cmluZ0FB",
             "notice_received": "✓ **Private input received**",
             "notice_expired": "✕ **Private input link expired**",
@@ -100,6 +103,32 @@ class FakeControl:
     async def claim(self, handoff_id, *, wait_ms=0, socket_path=None, timeout=None):
         self.calls.append({"op": "claim", "handoff_id": handoff_id})
         return self.claim_answer or {"ok": False, "error": "unavailable"}
+
+
+def _created(**overrides):
+    """A broker ``create`` response, with the fields a test wants overridden.
+
+    Written out rather than mutated in place so a test that drops
+    ``protocol_version`` is *saying* "a pre-2 broker", which is the case half of
+    these tests exist for.
+    """
+    created = {
+        "ok": True,
+        "handoff_id": "H" * 22,
+        "url": "http://127.0.0.1:8080/#Q2FwYWJpbGl0eVN0cmluZ0FB",
+        "expires_at": int(time.time() * 1000) + 600_000,
+        "ttl_seconds": 600,
+        "max_plaintext_bytes": 8192,
+        "protocol_version": 2,
+        "notice": "🔐 open the secure form",
+        "notice_received": "✓ **Private input received**",
+        "notice_expired": "✕ **Private input link expired**",
+    }
+    created.update(overrides)
+    for key, value in list(created.items()):
+        if value is None:
+            del created[key]
+    return created
 
 
 class NullWaiters:
@@ -537,19 +566,7 @@ async def test_create_warns_when_the_broker_accepts_more_than_a_claim_can_carry(
 
     ceiling = plugin.drop.control_client.MAX_CLAIMABLE_PLAINTEXT_BYTES
     origin, _adapter = lane()
-    control = FakeControl(
-        created={
-            "ok": True,
-            "handoff_id": "H" * 22,
-            "url": "http://127.0.0.1:8080/#Q2FwYWJpbGl0eVN0cmluZ0FB",
-            "expires_at": int(time.time() * 1000) + 600_000,
-            "ttl_seconds": 600,
-            "max_plaintext_bytes": ceiling + 1,
-            "notice": "🔐 open the secure form",
-            "notice_received": "✓ **Private input received**",
-            "notice_expired": "✕ **Private input link expired**",
-        }
-    )
+    control = FakeControl(created=_created(max_plaintext_bytes=ceiling + 1))
 
     with caplog.at_level(logging.WARNING):
         receipt = await _service(plugin, journal, control).create(origin, ttl_seconds=600)
@@ -558,6 +575,19 @@ async def test_create_warns_when_the_broker_accepts_more_than_a_claim_can_carry(
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert str(ceiling) in logged and str(ceiling + 1) in logged, logged
     assert "HANDOFF_MAX_PLAINTEXT_BYTES" in logged, logged
+
+    # The warning has to describe what actually happens now. It said "destroyed
+    # on claim and reported unavailable" long after the broker started refusing
+    # before it consumes anything — a stale warning is worse than none, because an
+    # operator acts on it.
+    assert "destroy" not in logged.lower(), logged
+    assert "unavailable" not in logged.lower(), logged
+    assert "refus" in logged.lower(), "say what the broker will really do"
+    # And it has to be actionable in the same words the claim-time refusal uses.
+    # This drop *is* about to be posted, so a payload can end up stuck behind the
+    # ceiling and the CLI really can fetch it — unlike the broker_too_old abort.
+    assert "handoff-admin claim" in logged, "name the recovery an operator can run"
+    assert plugin.drop.service.SIZE_REMEDIATION % ceiling in logged, "one wording, everywhere"
 
 
 async def test_create_says_nothing_when_the_broker_cap_fits(
@@ -576,3 +606,253 @@ async def test_create_says_nothing_when_the_broker_cap_fits(
     assert "HANDOFF_MAX_PLAINTEXT_BYTES" not in "\n".join(
         record.getMessage() for record in caplog.records
     )
+
+
+# ── the lossless claim boundary ────────────────────────────────────────────
+#
+# Two ways a claim that the broker answered could still end in a lost secret:
+# the answer is bigger than this client can read (the broker retires the record
+# before writing it), and the local bookkeeping after a *successful* read fails.
+# The first is now refused on the wire before anything is consumed; the second
+# must never discard a payload that is already in hand.
+
+
+class OneShotControl(FakeControl):
+    """A claim answers once and is a payload-free receipt thereafter.
+
+    ``FakeControl`` re-delivers on every call, which no real broker does
+    (``src/broker.js`` retires to a receipt). Anything asserting "and a retry gets
+    nothing" has to model the receipt, or it is asserting against the fake.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._spent = False
+
+    async def claim(self, handoff_id, *, wait_ms=0, socket_path=None, timeout=None):
+        self.calls.append({"op": "claim", "handoff_id": handoff_id})
+        if self._spent:
+            return {"ok": False, "error": "unavailable"}
+        self._spent = True
+        return self.claim_answer or {"ok": False, "error": "unavailable"}
+
+
+async def test_a_response_too_large_refusal_leaves_the_drop_claimable(
+    plugin, journal, lane
+) -> None:
+    """The broker refused before consuming, so this is not a spent drop.
+
+    It is also not ``broker_unavailable``: the broker answered, and it answered
+    about *this reader*, not about the handoff. Marking the drop spent here would
+    convert a refusal that cost nothing into the loss it exists to prevent.
+    """
+    origin, _ = lane()
+    control = FakeControl(
+        claim_answer={
+            "ok": False,
+            "error": "response_too_large",
+            "required_bytes": 2_000_000,
+            "max_response_bytes": 1_048_576,
+        }
+    )
+    await _received_entry(plugin, journal, origin, control)
+
+    result = await _service(plugin, journal, control).claim(origin, "H" * 22)
+
+    assert result["error"] == "response_too_large", result
+    assert "private_input" not in result
+    assert journal.get("H" * 22)["claimed_at"] is None, "a refused claim is not a claim"
+    assert journal.get("H" * 22)["state"] == plugin.drop.journal.STATE_RECEIVED
+
+    # Still claimable — by a reader that can hold it, or by the admin CLI, until
+    # the handoff's own TTL lapses.
+    import base64
+
+    working = FakeControl(
+        claim_answer={
+            "ok": True,
+            "handoff_id": "H" * 22,
+            "plaintext_b64": base64.b64encode(b"still-here-4f21").decode("ascii"),
+        }
+    )
+    retried = await _service(plugin, journal, working).claim(origin, "H" * 22)
+    assert retried["ok"] is True
+    assert retried["private_input"] == "still-here-4f21"
+
+
+async def test_a_refusal_reaching_the_model_names_no_broker_internals(plugin) -> None:
+    """``response_too_large`` is a tool result, so it goes through the same gate
+    every other refusal does. A code the vocabulary has never heard of gets the
+    generic sentence, which would tell the model nothing about what to do."""
+    sanitized = plugin.drop.safe_errors.sanitize_tool_result(
+        {
+            "error": "response_too_large",
+            "detail": "required 2000000 bytes, this client reads 1048576",
+        }
+    )
+    assert sanitized["error"] == "response_too_large"
+    assert sanitized["detail"] != plugin.drop.safe_errors.DEFAULT_REASON
+    assert "2000000" not in sanitized["detail"], "byte counts are for agent.log, not the model"
+
+
+async def test_a_journal_failure_after_a_read_does_not_discard_the_secret(
+    plugin, journal, lane, caplog
+) -> None:
+    """The payload is already in hand and the broker has already destroyed its
+    copy. A failed ``claimed_at`` write is a bookkeeping problem; letting it raise
+    turned it into ``internal_error`` and lost the only remaining copy."""
+    import base64
+    import logging
+
+    origin, _ = lane()
+    control = OneShotControl(
+        claim_answer={
+            "ok": True,
+            "handoff_id": "H" * 22,
+            "plaintext_b64": base64.b64encode(b"survives-bookkeeping-9c").decode("ascii"),
+        }
+    )
+    await _received_entry(plugin, journal, origin, control)
+
+    class UnwritableJournal:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def update(self, drop_id, **changes):
+            if "claimed_at" in changes:
+                raise OSError("[Errno 30] Read-only file system")
+            return self._inner.update(drop_id, **changes)
+
+    service = _service(plugin, UnwritableJournal(journal), control)
+
+    with caplog.at_level(logging.ERROR):
+        result = await service.claim(origin, "H" * 22)
+
+    assert result["ok"] is True, result
+    assert result["private_input"] == "survives-bookkeeping-9c"
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "H" * 22 in logged, logged
+    assert "survives-bookkeeping-9c" not in logged, "the secret must not reach agent.log"
+
+    # Honest about what it could not do: the entry is genuinely unmarked, so the
+    # model is told rather than left to infer it from a silent success.
+    assert journal.get("H" * 22)["claimed_at"] is None
+    assert result.get("note"), "a claim that could not be recorded says so"
+
+    # And the unmarked entry cannot become a second delivery: authorisation lets
+    # the retry through, and the broker's receipt is what stops it.
+    retry = await service.claim(origin, "H" * 22)
+    assert retry["error"] == "unavailable"
+    assert "private_input" not in retry
+
+
+# ── mixed versions: a 0.5 plugin against a 0.4 broker ──────────────────────
+#
+# The two halves of this repo ship together; an installed plugin and a deployed
+# broker do not. A broker that predates the response-size capability ignores
+# ``max_response_bytes`` and destroys an oversized payload exactly as it always
+# did — so the plugin must not treat "I sent a ceiling" as "the boundary is
+# lossless". It reads the answer instead: ``protocol_version``, in the response
+# every drop already starts with.
+
+
+async def test_a_pre_2_broker_that_can_overrun_the_reader_is_refused_before_posting(
+    plugin, journal, lane, caplog
+) -> None:
+    """The one genuinely unsafe combination, refused while nothing is at stake.
+
+    Old broker *and* a cap above what this client can read: the payload would be
+    destroyed on claim with no refusal available, and the user would have typed it
+    in by then. So the drop dies before the link is posted — no message, no
+    journal entry, no waiter — which is the same argument §7.2 makes for a failed
+    post, applied one step earlier.
+    """
+    import logging
+
+    ceiling = plugin.drop.control_client.MAX_CLAIMABLE_PLAINTEXT_BYTES
+    origin, adapter = lane()
+    waiters = NullWaiters()
+    control = FakeControl(
+        created=_created(protocol_version=None, max_plaintext_bytes=ceiling + 1)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await _service(plugin, journal, control, waiters).create(origin, ttl_seconds=600)
+
+    assert result["error"] == plugin.drop.service.ERROR_BROKER_TOO_OLD, result
+    assert adapter.sent == [], "nothing may be posted for a drop that cannot be claimed back"
+    assert journal.entries() == []
+    assert waiters.armed == []
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(ceiling) in logged and str(ceiling + 1) in logged, logged
+    assert "HANDOFF_MAX_PLAINTEXT_BYTES" in logged, logged
+    assert "upgrade" in logged.lower(), "name the fix, which is the broker's version"
+
+    # And it must not send the operator after a payload that cannot exist. This
+    # drop was refused before its link was posted: nothing was shown to anyone and
+    # nothing was submitted, so the handoff is empty and simply lapses.
+    assert "handoff-admin claim" not in logged, logged
+    assert "lapse" in logged.lower(), "say what becomes of the handoff that was minted"
+
+
+async def test_a_pre_2_broker_within_the_readable_range_still_works(
+    plugin, journal, lane, caplog
+) -> None:
+    """Refusing every drop against an old broker would be an upgrade held hostage
+    to a ceiling only a large payload can reach. Within the range this client can
+    read, a 0.4 broker is exactly as safe as it was under 0.4 — so the drop
+    proceeds and the version gap is said once, in ``agent.log``."""
+    import logging
+
+    origin, adapter = lane()
+    control = FakeControl(created=_created(protocol_version=None))
+
+    with caplog.at_level(logging.WARNING):
+        receipt = await _service(plugin, journal, control).create(origin, ttl_seconds=600)
+
+    assert receipt["ok"] is True, receipt
+    assert len(adapter.sent) == 1
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "protocol" in logged.lower(), logged
+    assert "HANDOFF_MAX_PLAINTEXT_BYTES" not in logged, "not the cap warning; the version one"
+
+
+async def test_a_version_2_broker_says_nothing_at_all(plugin, journal, lane, caplog) -> None:
+    """The supported path is silent. A warning on every drop is noise, and noise
+    is how the one that matters gets missed."""
+    import logging
+
+    origin, _ = lane()
+
+    with caplog.at_level(logging.WARNING):
+        receipt = await _service(plugin, journal, FakeControl()).create(origin, ttl_seconds=600)
+
+    assert receipt["ok"] is True
+    assert [r.getMessage() for r in caplog.records] == []
+
+
+async def test_every_refusal_this_task_adds_reaches_the_model_with_a_reason(plugin) -> None:
+    """A code with no entry gets ``DEFAULT_REASON``, which tells a model nothing
+    it can act on. Both new codes have to name the remediation, and neither may
+    contradict the operator-facing log line."""
+    safe_errors = plugin.drop.safe_errors
+    service = plugin.drop.service
+
+    for code in (service.ERROR_RESPONSE_TOO_LARGE, service.ERROR_BROKER_TOO_OLD):
+        reason = safe_errors.SAFE_REASONS.get(code)
+        assert reason, f"{code} has no fixed sentence"
+        assert reason != safe_errors.DEFAULT_REASON
+        sanitized = safe_errors.sanitize_tool_result({"error": code, "detail": "1048576 bytes"})
+        assert sanitized["detail"] == reason, "the broker's numbers never reach the model"
+
+    # The single remediation that is actually true for an oversized payload: the
+    # value cannot come back through the plugin at all, so a shorter one is the
+    # only thing the model can do. "Raise the limit" would be wrong twice — the
+    # reader's ceiling is a constant, and the broker's cap has to come *down*.
+    too_large = safe_errors.SAFE_REASONS[service.ERROR_RESPONSE_TOO_LARGE]
+    assert "shorter" in too_large
+    assert "raise" not in too_large.lower(), too_large

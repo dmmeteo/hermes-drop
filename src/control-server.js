@@ -10,6 +10,22 @@ import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
 
 const MAX_CONTROL_LINE_BYTES = 4096;
 
+// The protocol this broker speaks, published on every `create` so a client that
+// upgrades on its own schedule can tell what it is talking to instead of
+// inferring it. Version 2 is the one that refuses an oversized claim before
+// consuming it; version 1 accepts `max_response_bytes`, ignores it, and destroys
+// the payload as it answers. Held against `contract/control-protocol.json`'s
+// `version` by test/control-protocol.test.js.
+const PROTOCOL_VERSION = 2;
+
+// The floor under an advertised `max_response_bytes`. Every non-payload response
+// line — the `response_too_large` refusal above all, and it is under 200 bytes
+// with both counts spelled out — fits inside this, so a conforming client can
+// always read the answer it gets. Below it the only possible outcome is a line
+// the caller cannot buffer, which would surface as a transport fault rather than
+// as the configuration mistake it is, so it is refused as a caller mistake.
+const MIN_RESPONSE_BYTES = 1024;
+
 // The platforms `create` will render a notice for. Kept here rather than imported
 // from notice.js, whose export surface is pinned to the three states, and held
 // against `contract/control-protocol.json` — the fixture both languages read — by
@@ -124,6 +140,29 @@ export async function startControlServer({ socketPath, broker, logger, dirOps })
   };
 }
 
+/**
+ * The exact size of the line a successful `claim` puts on the wire.
+ *
+ * Arithmetic, not an estimate: base64 is four characters per three payload bytes
+ * rounded up, and neither the base64 alphabet nor a base64url handoff id contains
+ * a character `JSON.stringify` escapes — so the envelope measured with an empty
+ * payload plus the encoded length is the whole line, and the trailing newline
+ * `socket.end` writes is the `+ 1`. test/seam4-claim.test.js holds it against a
+ * real response, because an estimate here would be a destroyed payload there.
+ */
+function claimResponseBytes(handoffId, payloadBytes) {
+  const envelope =
+    Buffer.byteLength(JSON.stringify({ ok: true, handoff_id: handoffId, plaintext_b64: '' })) + 1;
+  return envelope + 4 * Math.ceil(payloadBytes / 3);
+}
+
+/** The inverse: the largest payload whose response still fits in `maxResponseBytes`. */
+function claimPayloadBudget(handoffId, maxResponseBytes) {
+  const forBase64 = maxResponseBytes - claimResponseBytes(handoffId, 0);
+  if (forBase64 <= 0) return 0;
+  return Math.floor(forBase64 / 4) * 3;
+}
+
 async function handleControlRequest(request, broker) {
   if (!request || typeof request !== 'object') return { ok: false, error: 'invalid_request' };
 
@@ -146,10 +185,17 @@ async function handleControlRequest(request, broker) {
       const created = await broker.create(
         request.ttl_seconds === undefined ? {} : { ttlSeconds: Number(request.ttl_seconds) },
       );
-      if (!wantsNotice || !created.ok) return created;
+      if (!created.ok) return created;
+
+      // Stated here rather than in broker.js: the version is a fact about the
+      // protocol this seam speaks, not about the handoff it just minted. Every
+      // drop starts with this response, so a client learns what it is talking to
+      // before there is a payload to lose — no probe op, no extra round trip.
+      const answer = { ...created, protocol_version: PROTOCOL_VERSION };
+      if (!wantsNotice) return answer;
 
       return {
-        ...created,
+        ...answer,
         notice: waitingNotice({
           handoffId: created.handoff_id,
           url: created.url,
@@ -187,9 +233,33 @@ async function handleControlRequest(request, broker) {
       // Optionally block until the browser submits, so an operator does not poll.
       const waitMs = Number(request.wait_ms ?? 0);
       if (!Number.isFinite(waitMs) || waitMs < 0) return { ok: false, error: 'invalid_request' };
+
+      // The caller's reader ceiling, if it has one. Validated here — before the
+      // wait and long before the claim — because an ill-typed ceiling is a caller
+      // mistake, and a caller mistake must never be paid for with a payload.
+      const ceiling = request.max_response_bytes;
+      let maxPayloadBytes = Infinity;
+      if (ceiling !== undefined) {
+        if (!Number.isInteger(ceiling) || ceiling < MIN_RESPONSE_BYTES) {
+          return { ok: false, error: 'invalid_request' };
+        }
+        maxPayloadBytes = claimPayloadBudget(request.handoff_id, ceiling);
+      }
+
       if (waitMs > 0) await broker.waitForSubmission(request.handoff_id, waitMs);
 
-      const result = broker.claim(request.handoff_id);
+      const result = broker.claim(request.handoff_id, { maxPayloadBytes });
+      if (result.error === 'response_too_large') {
+        // Translated back into the units the caller advertised in. `required_bytes`
+        // is the real length of the line a successful claim would have written, so
+        // an operator can compare it against the reader and act on the difference.
+        return {
+          ok: false,
+          error: 'response_too_large',
+          required_bytes: claimResponseBytes(request.handoff_id, result.payload_bytes),
+          max_response_bytes: ceiling,
+        };
+      }
       if (!result.ok) return result;
       // Base64 is transport encoding for the JSON line, not a protection measure.
       const encoded = Buffer.from(result.plaintext).toString('base64');

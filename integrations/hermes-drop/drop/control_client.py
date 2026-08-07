@@ -35,8 +35,19 @@ MAX_REQUEST_BYTES = 4096
 #: contract/control-protocol.json -> notice_platforms
 NOTICE_PLATFORMS: Sequence[str] = ("discord", "telegram", "plain")
 
+#: contract/control-protocol.json -> version. The protocol *this client*
+#: implements, not the one it is talking to — see :func:`supports_lossless_claim`.
+PROTOCOL_VERSION = 2
+
 #: contract/control-protocol.json -> errors
-ERRORS: Sequence[str] = ("invalid_request", "unavailable")
+ERRORS: Sequence[str] = ("invalid_request", "response_too_large", "unavailable")
+
+#: The broker refused *before consuming* because the answer would not fit in the
+#: ``max_response_bytes`` this client advertised. Named because it is the one
+#: broker error a caller must not treat like ``unavailable``: the payload is
+#: untouched and still claimable, so marking the drop spent would manufacture the
+#: loss the refusal just prevented.
+RESPONSE_TOO_LARGE = "response_too_large"
 
 #: Local-only error kinds. These are *transport* verdicts the client itself
 #: produces; the broker never sends them. Kept distinct from ERRORS so a caller
@@ -45,9 +56,15 @@ BROKER_UNAVAILABLE = "broker_unavailable"
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
+#: contract/control-protocol.json -> transport.max_response_bytes
+#:
 #: A response line is bounded too, and this constant is the bound that is
 #: **actually applied** — it is passed to ``open_unix_connection`` as the
-#: ``StreamReader`` limit, so ``readline`` refuses to buffer past it.
+#: ``StreamReader`` limit, so ``readline`` refuses to buffer past it — *and* the
+#: bound this client declares on every ``claim``, so the broker sizes its answer
+#: against it before consuming anything. One number doing both jobs is the point:
+#: a limit the reader enforces but never states is a limit the broker can only
+#: discover by destroying a payload.
 #:
 #: It has to be set deliberately, because asyncio's default is 65536 and a
 #: ``claim`` response is base64 of the broker's ``maxPlaintextBytes``
@@ -59,9 +76,27 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 #: refuses to buffer an unbounded stream from a compromised socket.
 #:
 #: Pinned from both sides by ``tests/test_control_client.py``: a real
-#: ``maxPlaintextBytes``-sized claim must round-trip byte for byte, and a line
-#: past *this* limit must still come back as a dict.
+#: ``maxPlaintextBytes``-sized claim must round-trip byte for byte, a line past
+#: *this* limit must still come back as a dict, and a claim the broker sizes past
+#: it must come back as ``response_too_large`` with the payload still there.
 MAX_RESPONSE_BYTES = 1024 * 1024
+
+#: contract/control-protocol.json -> transport.min_response_bytes
+#:
+#: The floor the broker puts under an advertised ceiling. Nothing here goes
+#: anywhere near it — this client advertises a megabyte — but it is the number
+#: that makes the refusal *readable*: every non-payload line, ``response_too_large``
+#: included, fits inside it, so no conforming client is ever answered with a
+#: refusal it cannot buffer. Pinned against the fixture by the tests.
+MIN_RESPONSE_BYTES = 1024
+
+#: Every size in this module is of the whole line as written to the socket,
+#: **newline included** (contract ``transport.size_convention``). That is not a
+#: detail: ``StreamReader`` applies its limit to the line plus its separator, so a
+#: broker that counted the newline out would size a claim as fitting when the
+#: reader would refuse it by one byte. ``src/control-server.js``'s
+#: ``claimResponseBytes`` counts it in, and a test reads a line of exactly the
+#: limit to prove the two conventions are the same one.
 
 #: Room for the JSON around the payload: ``{"ok":true,"plaintext_b64":"…"}`` and a
 #: newline, with generous slack for any field the protocol grows.
@@ -69,13 +104,16 @@ _CLAIM_ENVELOPE_SLACK_BYTES = 4096
 
 #: The largest broker ``maxPlaintextBytes`` whose base64 claim response still fits
 #: inside :data:`MAX_RESPONSE_BYTES` — the read limit is a constant, so this is the
-#: bound it implies (review N2). base64 is ×4/3.
+#: bound it implies (review N2). base64 is ×4/3, with slack for the JSON envelope,
+#: so it is deliberately a little under what the broker's own exact arithmetic
+#: (``claimPayloadBudget``, ``src/control-server.js``) will allow.
 #:
-#: Above this the *payload is destroyed*: ``broker.claim`` retires the record
-#: before the response is written, so a response the client cannot read is a
-#: secret nobody gets. Nothing here can raise the ceiling — it is a property of
-#: the constant above — so the plugin's job is to notice at *create* time, while a
-#: drop is still only a drop, rather than at claim time when it is a loss.
+#: Above this a claim is *refused* rather than delivered: the broker sizes the
+#: answer against the advertised ceiling and answers ``response_too_large`` with
+#: the record untouched. That is no longer a destroyed secret — it used to be,
+#: before the ceiling was on the wire — but it is still an undeliverable one, and
+#: the user has already typed it into the form by then. So the plugin's job is
+#: unchanged: notice at *create* time, while a drop is still only a drop.
 #: ``compose.yml`` pins 65536, an order of magnitude clear of it.
 MAX_CLAIMABLE_PLAINTEXT_BYTES = ((MAX_RESPONSE_BYTES - _CLAIM_ENVELOPE_SLACK_BYTES) // 4) * 3
 
@@ -84,6 +122,29 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 def _err(error: str, detail: str) -> Dict[str, Any]:
     return {"ok": False, "error": error, "detail": detail}
+
+
+def supports_lossless_claim(created: Optional[Mapping[str, Any]]) -> bool:
+    """Does the broker that answered *created* refuse an oversized claim?
+
+    Only protocol 2 and above sizes a claim response before consuming it. A
+    version 1 broker accepts ``max_response_bytes``, ignores it, and destroys the
+    payload as it answers — so sending the field proves nothing, and the answer
+    has to be read rather than assumed. This repo ships both halves together but
+    a Hermes-side plugin does not: it is installed once and upgraded on its own
+    schedule, against whatever broker is deployed.
+
+    Absence is the version 1 answer, because version 1 published no version at
+    all. Anything that is not an ``int`` (a ``bool`` included, which ``int``
+    otherwise admits) is treated the same way: unknown is not "probably fine"
+    when the thing being decided is whether a secret can be destroyed.
+    """
+    if not isinstance(created, Mapping):
+        return False
+    version = created.get("protocol_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return False
+    return version >= PROTOCOL_VERSION
 
 
 async def control_request(
@@ -214,9 +275,20 @@ async def claim(
     socket_path: Optional[PathLike] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
-    """Consume the payload exactly once. The only op that returns plaintext."""
+    """Consume the payload exactly once. The only op that returns plaintext.
+
+    Always advertises :data:`MAX_RESPONSE_BYTES`, which is the same limit
+    ``_exchange`` hands ``open_unix_connection``. A broker that cannot fit its
+    answer inside it answers ``response_too_large`` and consumes nothing, so the
+    one line this client could fail to read is a line it is never sent.
+    """
     return await control_request(
-        {"op": "claim", "handoff_id": handoff_id, "wait_ms": int(wait_ms)},
+        {
+            "op": "claim",
+            "handoff_id": handoff_id,
+            "wait_ms": int(wait_ms),
+            "max_response_bytes": MAX_RESPONSE_BYTES,
+        },
         socket_path=socket_path,
         timeout=timeout,
     )
@@ -230,9 +302,13 @@ __all__ = [
     "MAX_CLAIMABLE_PLAINTEXT_BYTES",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
+    "MIN_RESPONSE_BYTES",
     "NOTICE_PLATFORMS",
+    "PROTOCOL_VERSION",
+    "RESPONSE_TOO_LARGE",
     "await_submission",
     "claim",
     "control_request",
     "create",
+    "supports_lossless_claim",
 ]
