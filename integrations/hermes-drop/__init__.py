@@ -53,7 +53,7 @@ def _as_tool_result(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
-def _guarded(impl_name: str, args: Optional[Mapping[str, Any]]) -> str:
+def _guarded(impl_name: str, args: Optional[Mapping[str, Any]], session_id: str = "") -> str:
     """Call a handler and turn anything that escapes into an error result.
 
     Nothing may raise out of these. A raising slash-command handler is swallowed
@@ -61,12 +61,26 @@ def _guarded(impl_name: str, args: Optional[Mapping[str, Any]]) -> str:
     **falls through to skill-command resolution** at ``:14705+`` — so an exception
     would silently become a ``/skill drop`` lookup, resurrecting the exact prose
     path this design severs (plan §1, link 2).
+
+    ``vault.redact_tool_result`` runs **inside** this try, on the dict, before
+    ``_as_tool_result`` makes it a string. That string is what core appends to
+    ``messages`` and flushes straight into ``state.db``
+    (``agent/tool_executor.py:1894-1901``), so this is the last moment at which
+    the two copies can be separated — see ``drop/vault.py`` for why no core hook
+    is early enough or late enough to do it instead. Being inside the try is the
+    fail-closed half: a vault that cannot stash lands in ``internal_error``
+    rather than returning the plaintext.
     """
-    from .drop import safe_errors, tools
+    from .drop import safe_errors, tools, vault
 
     try:
         impl = getattr(tools, impl_name)
-        return _as_tool_result(safe_errors.sanitize_tool_result(impl(args or {})))
+        return _as_tool_result(
+            vault.redact_tool_result(
+                safe_errors.sanitize_tool_result(impl(args or {})),
+                session_id=session_id,
+            )
+        )
     except Exception as exc:  # noqa: BLE001 - deliberate catch-all, see docstring
         # ``str(exc)`` is exactly the kind of string review L1 is about: an
         # exception message can carry a socket path, an internal hostname or an
@@ -79,12 +93,24 @@ def _guarded(impl_name: str, args: Optional[Mapping[str, Any]]) -> str:
         )
 
 
-def request_private_input(args: Optional[Mapping[str, Any]] = None, **_kwargs: Any) -> str:
-    return _guarded("request_private_input", args)
+def request_private_input(args: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> str:
+    return _guarded("request_private_input", args, _session_id(kwargs))
 
 
-def claim_private_input(args: Optional[Mapping[str, Any]] = None, **_kwargs: Any) -> str:
-    return _guarded("claim_private_input", args)
+def claim_private_input(args: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> str:
+    return _guarded("claim_private_input", args, _session_id(kwargs))
+
+
+def _session_id(kwargs: Mapping[str, Any]) -> str:
+    """The session a tool result belongs to, as core hands it to the handler.
+
+    ``registry.dispatch`` forwards its kwargs straight to the handler
+    (``tools/registry.py:694``) and the caller passes ``session_id=agent.session_id``
+    (``agent/tool_executor.py:1678``, ``:1748``) — the *same* value that reaches
+    ``llm_request`` middleware (``agent/conversation_loop.py:2103``). That is what
+    makes the vault's session binding meaningful rather than decorative.
+    """
+    return str(kwargs.get("session_id") or "")
 
 
 async def drop_command(user_args: str = "", **kwargs: Any) -> None:
@@ -156,6 +182,24 @@ def register(ctx: Any) -> None:
     ``drop/bridge.py``.
     """
     ctx.register_hook("pre_gateway_dispatch", capture_turn_source)
+
+    # The other half of durable sanitization. The tool handlers hand core a
+    # placeholder; this puts the plaintext back into the provider payload only
+    # (``drop/vault.py``). Guarded with ``getattr`` because ``register()``
+    # raising takes the tools and ``/drop`` down with it — a core without
+    # middleware support must degrade to "the model cannot read the secret",
+    # never to "the plugin failed to load" and never to a durable plaintext.
+    from .drop import vault
+
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if callable(register_middleware):
+        register_middleware(vault.MIDDLEWARE_KIND, vault.llm_request_middleware)
+    else:
+        logger.warning(
+            "hermes-drop: this Hermes has no ctx.register_middleware, so a claimed "
+            "secret cannot be substituted into the model request. Claims will return "
+            "a placeholder. Nothing is written to durable state either way."
+        )
 
     # One registration reaches the Discord picker, the Telegram menu, the CLI and
     # plain typed text on every platform (``hermes_cli/plugins.py:548-600``).

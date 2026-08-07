@@ -1,5 +1,5 @@
 name: hermes-drop
-version: 0.4.0
+version: 0.5.0
 description: >-
   Origin-bound private input. Asks the user for a secret through a one-shot
   encrypted web form posted into the conversation the request came from, never
@@ -20,6 +20,11 @@ provides_commands:
   - drop
 provides_hooks:
   - pre_gateway_dispatch
+
+# Also registered, and not expressible in this manifest: `llm_request` middleware
+# (`ctx.register_middleware`, hermes_cli/plugins.py:1196). The parser has no
+# `provides_middleware` key, so inventing one here would be noise. It is the wire
+# half of durable secret sanitization — see integrations/hermes-drop/drop/vault.py.
 
 # NOTE: `plugins.entries.hermes-drop.allow_tool_override` is deliberately absent
 # and must stay absent. Drop registers new tool names; it must never replace a

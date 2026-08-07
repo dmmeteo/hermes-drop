@@ -4,6 +4,50 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the major version
 is `0`, minor versions may carry breaking changes.
 
+## [Unreleased]
+
+Plugin `0.5.0`. The broker is unchanged at `0.4.0`.
+
+### Added
+
+- **Durable secret sanitization.** A claimed secret no longer reaches Hermes'
+  durable session state. The tool result the plugin hands core carries an opaque
+  ASCII placeholder (`[hermes-drop:secret:<32 hex>]`), so nothing downstream of
+  the plugin — `state.db`, the `messages_fts*` index, the JSON session log, or a
+  backup of any of them — ever holds the plaintext. New
+  `integrations/hermes-drop/drop/vault.py` holds it in gateway memory instead and
+  registers `llm_request` middleware, which substitutes it into the provider
+  request payload (a deep copy core makes for middleware) so the active model turn
+  still gets the real secret.
+
+  The split exists because Hermes persists a tool result *before* the model sees
+  it, and `transform_tool_result` sees only one string that is both the durable
+  row and the wire. Redaction is therefore done in the plugin, upstream of core,
+  and depends on no Hermes hook: `transform_tool_result` fails open, which is not
+  a property to hang a password on. Both halves fail closed — a middleware error
+  leaves the placeholder on the wire, and a vault that cannot hold the secret
+  turns the claim into `internal_error`.
+
+  Substitution walks the payload structurally rather than by key, because by the
+  time middleware runs Hermes has already translated the tool result into the
+  active `api_mode`'s shape and the placeholder lands somewhere different in each
+  — `messages[].content` (`chat_completions`), a `tool_result` part's `content`
+  (`anthropic_messages`), a `function_call_output`'s `output` under `input`
+  (`codex_responses`), `toolResult.content[].text` (`bedrock_converse`). Tests
+  build all four with Hermes' own converters.
+
+  Entries are bound to the claiming `session_id`, so the placeholder that *does*
+  persist is not a bearer capability; a claim that arrives with no session id is
+  refused rather than stashed under `""`. Entries lapse after 15 minutes, enforced
+  by a per-entry timer so a session that claims once and goes quiet does not leave
+  the plaintext resident. At most 4 live secrets per session and 32 per process.
+  A non-string or empty `private_input` is refused rather than serialised. Origin
+  authorization and one-shot claim behaviour are untouched.
+
+  Uses only supported plugin API (`ctx.register_middleware`); no new Hermes core
+  patch. Residual exposures — post-middleware request observers, the model's own
+  output, memory residency — are documented in `SECURITY.md`.
+
 ## [0.4.0] — 2026-08-03
 
 First public release.

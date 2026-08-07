@@ -34,6 +34,7 @@ from . import (  # noqa: F401
     service,
     sources,
     tools,
+    vault,
     waiter,
 )
 
@@ -51,5 +52,6 @@ __all__ = [
     "service",
     "sources",
     "tools",
+    "vault",
     "waiter",
 ]

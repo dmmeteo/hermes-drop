@@ -71,6 +71,9 @@ Without patch `0001`, the plugin still loads and refuses safely — `/drop` retu
   `HKDF-SHA256` / `AES-256-GCM`) sealed in the browser with `crypto.subtle`.
 - **One claim.** The payload is destroyed as it is read; a second claim gets the
   same generic unavailable answer as a wrong capability.
+- **Not written to `state.db`.** The claimed plaintext never enters Hermes'
+  durable session store, FTS index, session log or backups — only a placeholder
+  does. See [Durable sanitization](#durable-sanitization).
 - **Durable journal and reconciler.** A gateway restart mid-drop does not orphan a
   live link or a waiting status message.
 - **One chat message, edited in place**, through three fixed states — waiting,
@@ -132,6 +135,51 @@ idempotent by envelope digest: re-POSTing the *same* envelope returns the same
 receipt for the rest of the lifetime and never delivers twice, while a *different*
 envelope against a consumed drop gets the unavailable answer.
 
+### Durable sanitization
+
+A claimed secret arrives as a tool result, and Hermes persists a tool result
+*before* the model ever sees it: `agent/tool_executor.py` appends the result
+string to the message list and flushes it straight into `state.db`, the
+`messages_fts*` index and the JSON session log, and only then builds the API
+request. There is one string at that moment and it is both the durable row and
+the wire, so no single seam can keep the plaintext out of one and in the other.
+
+Hermes Drop splits them:
+
+- the plugin substitutes an opaque ASCII placeholder —
+  `[hermes-drop:secret:<32 hex>]` — into the tool result **before** it becomes a
+  string, so nothing downstream of the plugin ever holds the plaintext. This
+  depends on no Hermes hook, deliberately: `transform_tool_result` is
+  `has_hook`-gated and fails open, which is not a property to hang a password on.
+- `llm_request` middleware puts the plaintext back into the *provider payload*,
+  which Hermes hands to middleware as a deep copy. The persisted message dicts
+  are never touched.
+
+By the time middleware runs, Hermes has already translated the tool result into
+whatever the active `api_mode` speaks, and the placeholder sits in a different
+key in each — `messages[].content` for `chat_completions`, a `tool_result` part's
+`content` for `anthropic_messages`, a `function_call_output`'s `output` under
+`input` for `codex_responses`, and `toolResult.content[].text` for
+`bedrock_converse`. Rather than enumerate those, the substitution walks the
+payload structurally, so a transport added later is covered too. Tests build all
+four shapes with Hermes' own converters, so a change to any of them fails the
+suite instead of quietly stranding a secret on the durable side.
+
+Both halves fail closed. A middleware error is isolated and logged by Hermes,
+leaving the placeholder on the wire; a vault that cannot hold the secret turns
+the claim into `internal_error`. The failure mode is a model that cannot read
+the secret — never a secret in `state.db`.
+
+The placeholder outlives the plaintext in the transcript, so it is bound to the
+session that claimed it and resolved for no other, and the plaintext lapses from
+memory after **15 minutes**. Past that the model reads the placeholder and is
+told to ask for a new drop.
+
+`llm_request` middleware is a supported plugin API
+(`ctx.register_middleware`); no Hermes core patch is involved. A Hermes without
+it still loads the plugin — the claim then returns a placeholder the model
+cannot resolve, and the plugin says so in `agent.log`.
+
 ## Threat model
 
 **Trusted with the plaintext, by design:** the host running the broker, its root
@@ -151,6 +199,7 @@ of those principals.
 | A second reader | One claim, then a payload-free receipt. |
 | Guessing a link | 128 bits of CSPRNG entropy, a 30-minute default lifetime, a uniform unavailable answer for every wrong guess, and nothing persisted to attack offline. |
 | A stolen bot token editing history | The status message carries no capability once it leaves the waiting state. |
+| The claimed secret in `state.db` | The tool result Hermes persists carries a placeholder, not the plaintext. The plaintext is held in gateway memory and substituted into the provider request only. See [Durable sanitization](#durable-sanitization). |
 
 **Accepted residual risks:**
 
@@ -158,8 +207,11 @@ of those principals.
   and one-shot consumption. The link is delivered through your chat platform, so
   anyone who can read that conversation can use it — which is the intended
   audience, and the reason the drop is origin-bound.
-- **The claimed plaintext reaches the model's context** and therefore Hermes'
-  durable state, like any other tool result. Nothing here scrubs it.
+- **The claimed plaintext reaches the model's context.** The model is a trusted
+  principal, and what it does next is not confined: if it echoes the secret into
+  a reply or passes it as an argument to another tool, *that* is persisted like
+  any other model output. What is no longer persisted is the claim itself — see
+  below.
 - **Authenticated HTTPS is load-bearing.** It authenticates the JavaScript that
   performs the encryption; `crypto.subtle` only exists in a secure context.
 
@@ -180,6 +232,25 @@ of those principals.
   raise `HANDOFF_MAX_PLAINTEXT_BYTES` past the ceiling, a payload above it is
   destroyed on claim and reported unavailable. The plugin warns in `agent.log` at
   create time when a broker advertises a cap it cannot read back.
+- **Durable sanitization does not confine the model or the wire.** Three
+  exposures survive it, all verified rather than assumed:
+  - anything the model *does* with the secret — echoing it into a reply, passing
+    it as a tool argument — is persisted normally. The model is trusted.
+  - the plaintext is on the wire to your model provider. That is the point of the
+    feature.
+  - anything that reads the request *after* middleware sees the plaintext:
+    Hermes' `pre_api_request` hook (so an observability plugin such as langfuse
+    would ship it), **NeMo Relay** (which wraps the provider call itself, so every
+    Relay interceptor and exporter in that profile sees the post-substitution
+    body), and `HERMES_DUMP_REQUESTS=1` (which writes it to disk). None is on by
+    default; do not enable any of them on a gateway that handles drops.
+- **A claimed secret lapses after 15 minutes**, enforced by a timer rather than
+  checked on the next call in. Past that the transcript keeps the placeholder and
+  the model must ask for a new drop. Claim then use; do not claim and sit on it.
+- **The memory cap is process-global.** At most 4 live secrets per session and 32
+  across the gateway. The per-session cap means a busy conversation evicts its own
+  oldest first, but the global one is shared: past it another session's secret can
+  be evicted early, leaving its model with an unresolvable placeholder.
 - **No file transfer**, no reverse/outbound delivery, no multi-recipient drops.
 - **A drop cannot be opened during a wake turn** if the conversation's lane was
   rewritten in between: the plugin refuses rather than guessing, and the user types
