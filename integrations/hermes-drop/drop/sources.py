@@ -223,6 +223,29 @@ class SourceRegistry:
         with self._lock:
             return self._get(self._by_tuple, key)
 
+    def peek_routing_tuple(self, key: Optional[RoutingTuple]) -> Optional[SourceEntry]:
+        """Read a lane **without touching the store**. For observers, not resolvers.
+
+        ``by_routing_tuple`` is a *use*: ``_get`` refreshes LRU order and evicts
+        an entry it finds expired. The reconciler's retry gate asks about lanes it
+        is not about to use, on every inbound dispatch, so answering it through
+        ``by_routing_tuple`` would let a background check reorder the store —
+        promoting whichever deferred lane was polled last over the lanes that are
+        actually speaking, and doing it under the ``maxlen`` trim that decides
+        which lane gets evicted next.
+
+        Expiry is still honoured, because a stale entry is not an answer. It is
+        simply left in place for the next real write to purge, rather than
+        deleted by a reader.
+        """
+        if key is None:
+            return None
+        with self._lock:
+            entry = self._by_tuple.get(key)
+            if entry is None or self._expired(entry, self._clock()):
+                return None
+            return entry
+
     def by_session_key(self, key: Optional[str]) -> Optional[SourceEntry]:
         if not key:
             return None

@@ -69,6 +69,129 @@ a schedule, and please give a reasonable window before disclosing publicly.
   — it authenticates the JavaScript that performs the encryption, and
   `crypto.subtle` only exists in a secure context.
 
+## Handoff lifecycle and deletion guarantees
+
+This is the authoritative statement of the broker's state machine and of what
+"destroyed" is worth. Everything in it is pinned by `test/lifecycle-fsm.test.js`,
+which drives the machine through its real seams — the browser client for
+`/api/metadata` and `/api/submit`, the `0600` control socket for `await` and
+`claim` — and re-checks the invariants after every transition, including under
+randomised operation sequences.
+
+### The four states
+
+A handoff is minted `pending` and leaves the machine exactly once. There are no
+other states, and no state carries a payload it is not named for.
+
+| State | Holds the P-256 private key | Holds the payload | Entered by |
+| --- | --- | --- | --- |
+| `pending` | yes | no | `create` |
+| `submitted` | no | yes | the one envelope that decrypted |
+| `claimed` | no | no | the one `claim` that was handed over |
+| destroyed | no | no | TTL lapse, AEAD-failure budget, shutdown |
+
+Key material exists **exactly** in `pending`, and the payload exists **exactly**
+in `submitted`. Those are checked invariants rather than descriptions: every step
+of every lifecycle test asserts `hasPrivateKey === (state is pending)` and
+`hasPlaintext === (state is submitted)`, so "the key is gone" and "the payload is
+gone" are observable facts, not intentions.
+
+Destruction removes the record from both indexes, so `destroyed` has no
+observable form beyond the record's absence — a destroyed handoff and one that
+never existed are the same thing to every seam.
+
+### The transitions, and there are no others
+
+```
+pending ──one envelope decrypts──► submitted ──one claim──► claimed
+   │                                   │                      │
+   │  AEAD-failure budget spent        │                      │
+   └───────────────┬───────────────────┴──────────────────────┘
+                   ▼
+              destroyed   (also: TTL lapse from any state, shutdown)
+```
+
+- **`pending → submitted`** — one envelope opens under this handoff's own `info`
+  binding. The check and the mutation are synchronous with no `await` between
+  them, so exactly one submit wins however many arrive at once.
+- **`submitted → claimed`** — one `claim` hands the bytes to the local caller.
+  Also synchronous, so a second concurrent claim can never observe `submitted`.
+- **`pending → destroyed`** — the AEAD-failure budget (`HANDOFF_MAX_AEAD_FAILURES`,
+  3 by default) is spent, so the submit endpoint cannot become a retry oracle.
+  Only a `pending` handoff can reach the AEAD at all, so only a `pending` handoff
+  can be destroyed this way. A malformed envelope is rejected on shape and costs
+  nothing against the budget.
+- **`pending | submitted | claimed → destroyed`** — the TTL lapses. Enforced both
+  by the sweeper and lazily, on the next touch of the record, so a parked sweeper
+  cannot extend a lifetime.
+- **shutdown** destroys everything in every state.
+
+There is no edge back. Nothing returns a handoff to `pending`, nothing re-arms a
+`claimed` one, and nothing revives a destroyed one.
+
+### What each seam answers, in each state
+
+| | `pending` | `submitted` | `claimed` | destroyed / unknown |
+| --- | --- | --- | --- | --- |
+| `POST /api/metadata` | the form's metadata | unavailable | unavailable | unavailable |
+| `POST /api/submit`, same envelope | received | received | received | unavailable |
+| `POST /api/submit`, different envelope | received¹ | unavailable | unavailable | unavailable |
+| `await` | blocks, then unavailable | submitted | unavailable | unavailable |
+| `claim` | unavailable | **the payload, once** | unavailable | unavailable |
+
+¹ Against a `pending` handoff a "different" envelope is simply the first submit,
+and wins like any other. Only after one has won does a second, different envelope
+become the refusal that row is about.
+
+Three properties hold across that whole table:
+
+- **Retries are idempotent by envelope digest, never a second delivery.**
+  Re-POSTing the *same* envelope returns the same receipt for the rest of the
+  lifetime — before the claim and after it — because a claimed handoff keeps a
+  payload-free receipt until its TTL. A mobile retry or a lost response therefore
+  never looks like a failure, and never produces a second payload.
+- **A claim refused for size is not a transition.** When a caller advertises a
+  `max_response_bytes` the answer would not fit in, the refusal happens *before*
+  the retirement: the handoff is still `submitted`, still holding the same bytes,
+  still one-shot, and still claimable by a reader that can hold it. It is
+  repeatable and costs nothing each time.
+- **A malformed call is never a transition.** Ill-typed handoff ids, unknown ops,
+  unusable ceilings, garbage envelopes, capabilities that are not capabilities:
+  all are refused with the contract's own vocabulary (`unavailable`,
+  `invalid_request`, `response_too_large`) and leave the machine where it was.
+
+### What deletion guarantees
+
+- The payload is handed over **at most once**, to exactly one caller, over the
+  `0600` control socket. Under randomised and fully concurrent operation
+  sequences alike, no second delivery is reachable.
+- The per-handoff private key is non-extractable, never leaves the broker
+  process, and is dropped the instant the AEAD succeeds — before there is a
+  payload to claim.
+- What survives a claim until the TTL is a **payload-free receipt**: an envelope
+  digest, the capability hash, and timestamps. No plaintext, no key material, and
+  the record serialises without either.
+- Every state is bounded by the handoff's own TTL (`HANDOFF_TTL_SECONDS`, 1800s
+  by default; at most `HANDOFF_MAX_TTL_SECONDS`, 3600s). Claiming does not extend
+  it, and neither does a refused claim.
+- Buffers the broker owns are zero-filled before the reference is dropped.
+
+### What it does not guarantee
+
+- **Nothing about swap, core dumps or host snapshots.** "Destroyed" means dropped
+  from an in-memory map and best-effort zero-filled, as stated in Scope above.
+- **The claim path makes copies that cannot be zeroed.** Answering a claim encodes
+  the bytes into a base64 JavaScript string and serialises them into the JSON line
+  written to the socket. The broker zero-fills its own buffer immediately
+  afterwards, but strings are immutable in V8: those copies persist until garbage
+  collection, on the broker's heap and the caller's. Same class of caveat as swap,
+  and it applies to the one seam that is *supposed* to emit plaintext.
+- **Nothing survives a restart, deliberately.** The keys were never persisted, so
+  a restart destroys every live handoff rather than resurrecting one. What the
+  Hermes side then shows the user is the reconciler's business, not the broker's.
+- **Nothing about what the claimant does next.** Once the bytes are on the socket
+  they are the local caller's, and the limitations below govern where they go.
+
 ## Known limitations tracked rather than fixed
 
 - **Durable sanitization is bounded at the wire, not at the model.** The claimed

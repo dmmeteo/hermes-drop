@@ -258,6 +258,21 @@ class BrokerHandle:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
 
+    def crash(self) -> None:
+        """SIGKILL. Not ``stop()``.
+
+        ``stop()`` sends SIGTERM, the harness runs its shutdown hook, the control
+        server closes and unlinks its socket. A restart-recovery test must not
+        rely on any of that having happened: a broker that dies for real runs no
+        hook and leaves the socket file behind. ``startControlServer`` removes a
+        stale one before it listens (``src/control-server.js:85``), which is what
+        makes booting again on the same path the *production* behaviour rather
+        than a test convenience.
+        """
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+
 
 def _boot_broker(tmp_path: Path, *, public: bool):
     """Boot the repo's actual Node broker on a temp socket.
@@ -273,7 +288,19 @@ def _boot_broker(tmp_path: Path, *, public: bool):
         pytest.skip("node is not installed; cannot boot the real broker")
 
     socket_dir = tmp_path / ("run-public" if public else "run")
-    socket_dir.mkdir(mode=0o700)
+    # ``exist_ok`` because a restart reuses the directory *and* the socket path:
+    # the plugin has one configured path and a broker that comes back has to come
+    # back on it. See ``restartable_public_broker``.
+    #
+    # The chmod is not belt and braces. ``mkdir(mode=…)`` is subject to umask on
+    # creation and is ignored entirely when the directory already exists, so a
+    # restarted broker's socket directory would keep whatever mode the first
+    # ``mkdir`` happened to land on. 0700 before the socket exists is the same
+    # ordering ``prepareSocketDir`` argues for (``src/control-server.js:35-54``):
+    # the socket is created by ``listen()`` with the process umask and can only be
+    # tightened afterwards, so the directory has to be closed first.
+    socket_dir.mkdir(mode=0o700, exist_ok=True)
+    socket_dir.chmod(0o700)
     socket_path = socket_dir / "control.sock"
     harness = TESTS_DIR / "broker_harness.mjs"
 
@@ -335,6 +362,30 @@ def real_public_broker(tmp_path: Path):
         yield handle
     finally:
         handle.stop()
+
+
+@pytest.fixture
+def restartable_public_broker(tmp_path: Path):
+    """Boot public brokers on demand, all on the **same** control socket path.
+
+    The one fixture that can express a restart. ``real_public_broker`` yields a
+    single handle and stops it, which is right for every test that treats the
+    broker as a fixed part of the world; this one hands back a callable so a test
+    can kill a broker and boot its replacement where the plugin will still look
+    for it. Each handle is stopped at teardown, including one already killed.
+    """
+    handles: list = []
+
+    def boot() -> BrokerHandle:
+        handle = _boot_broker(tmp_path, public=True)
+        handles.append(handle)
+        return handle
+
+    try:
+        yield boot
+    finally:
+        for handle in handles:
+            handle.stop()
 
 
 @pytest.fixture

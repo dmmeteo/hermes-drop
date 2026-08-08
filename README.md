@@ -127,13 +127,21 @@ version or suite — it fails at decryption.
 ```
 pending ──submit(AEAD ok)──► submitted ──claim──► claimed (receipt only, no payload)
    │                             │                         │
-   └── expiry / 3 AEAD failures / broker restart ──────────┴──► destroyed
+   │   3 AEAD failures           │                         │
+   └── expiry / broker restart ──┴─────────────────────────┴──► destroyed
 ```
 
-An AEAD failure does not consume a drop; three of them destroy it. Retries are
-idempotent by envelope digest: re-POSTing the *same* envelope returns the same
-receipt for the rest of the lifetime and never delivers twice, while a *different*
-envelope against a consumed drop gets the unavailable answer.
+An AEAD failure does not consume a drop; three of them destroy it. Only a
+`pending` drop can reach the AEAD, so that is the only state the failure budget
+can destroy — expiry and restart apply to all three. Retries are idempotent by
+envelope digest: re-POSTing the *same* envelope returns the same receipt for the
+rest of the lifetime and never delivers twice, while a *different* envelope
+against a consumed drop gets the unavailable answer.
+
+The full machine — every state, every edge, what each seam answers in each state,
+and what deletion is and is not worth — is stated in
+[SECURITY.md](SECURITY.md#handoff-lifecycle-and-deletion-guarantees) and pinned by
+`test/lifecycle-fsm.test.js`.
 
 ### Durable sanitization
 

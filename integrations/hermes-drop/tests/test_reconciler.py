@@ -897,3 +897,394 @@ async def test_a_raise_inside_the_pass_still_releases_the_latch(reconciler, plug
     assert reconciler.trigger_from_event(runner, reconcile_coro=boom) is True
     await asyncio.sleep(0.2)
     assert len(calls) == 2
+
+
+# ── the latch's three outcomes, and the two that used to be one ────────────
+#
+# A finished pass can mean three different things, and before this they collapsed
+# into "failed or not". ``_account_for_pass`` is the single place that decides,
+# and these are its cases.
+
+
+async def test_an_undecided_probe_retries_and_is_bounded(
+    reconciler, journal, plugin, lane
+) -> None:
+    """A broker that is down for the whole pass must not end reconciliation.
+
+    ``broker_unavailable`` is ``VERDICT_UNKNOWN``: the entry is retained, nothing
+    is written and nothing is claimed on a guess. That part was always right. What
+    was missing is what happens *next* — the pass reported no ``failed`` entries,
+    so the one-shot latch stayed consumed and no later dispatch could try again,
+    for the life of the gateway process. A broker being down for the duration of
+    one pass is the ordinary restart window, so the drop kept a live-looking
+    status message forever.
+
+    Retry is bounded exactly like a failed pass: an undecided probe costs a round
+    trip, so a permanently unreachable broker must not become one pass per
+    inbound message.
+    """
+    runner, adapter, source = lane()
+    entry = _waiting(journal, plugin, source, adapter, runner, drop_id="U" * 22)
+    control = FakeControl(answer={"ok": False, "error": "broker_unavailable", "detail": "no socket"})
+
+    async def undecided(_runner):
+        return await _reconcile(reconciler, journal, plugin, runner, control=control)
+
+    granted = 0
+    for _ in range(reconciler.MAX_FAILED_PASSES + 4):
+        if reconciler.trigger_from_event(runner, reconcile_coro=undecided):
+            granted += 1
+        await asyncio.sleep(0.05)
+
+    assert granted == reconciler.MAX_FAILED_PASSES, (
+        f"an undecided pass granted {granted} attempts, not {reconciler.MAX_FAILED_PASSES}"
+    )
+    # Never a verdict, at any point: unknown stays unknown.
+    assert journal.get(entry["drop_id"])["state"] == plugin.drop.journal.STATE_WAITING
+    assert adapter.edited == []
+
+
+async def test_a_registered_lane_that_cannot_resolve_an_adapter_is_not_a_pass_per_message(
+    reconciler, journal, plugin, lane
+) -> None:
+    """The gate asks ``origin_for_entry``, not "is the lane in the registry?".
+
+    A lane can be registered and still unresolvable — here the runner driving the
+    pass owns no adapter for it, which is what a half-started gateway looks like.
+    Gating on registration alone would answer "yes, retry" to every inbound
+    message for as long as that lasted: a reconcile pass per message, which is
+    the failure ``MAX_FAILED_PASSES`` exists to prevent, reached by another door.
+    """
+    _runner, _adapter, source = lane()
+    adapterless = StubRunner({}, gateway_loop=asyncio.get_running_loop())
+    entry = _waiting(journal, plugin, source, _adapter, _runner, drop_id="V" * 22)
+    lane_key = plugin.drop.sources.routing_tuple_for_source(source)
+
+    async def cannot_resolve(_runner):
+        return await _reconcile(reconciler, journal, plugin, adapterless)
+
+    assert reconciler.trigger_from_event(adapterless, reconcile_coro=cannot_resolve) is True
+    await asyncio.sleep(0.2)
+
+    assert reconciler.deferred_lanes() == frozenset({lane_key}), (
+        "the pass did not record the lane it deferred on"
+    )
+    assert plugin.drop.sources.REGISTRY.by_routing_tuple(lane_key) is not None, (
+        "precondition: the lane IS registered; only the adapter is missing"
+    )
+    for _ in range(10):
+        assert reconciler.trigger_from_event(adapterless, reconcile_coro=cannot_resolve) is False, (
+            "a registered lane with no adapter re-ran the pass on every dispatch"
+        )
+    assert journal.get(entry["drop_id"])["state"] == plugin.drop.journal.STATE_WAITING
+
+    # And the moment the adapter is there, the same lane opens the gate again.
+    assert reconciler.trigger_from_event(_runner, reconcile_coro=cannot_resolve) is True
+
+
+async def test_the_deferred_gate_does_not_reorder_the_source_registry(
+    reconciler, journal, plugin, lane
+) -> None:
+    """The gate is an observer. It must not decide which lane is evicted next.
+
+    ``by_routing_tuple`` refreshes LRU order; the gate runs on every dispatch
+    about lanes it is not going to use, so it reads through ``peek_routing_tuple``
+    instead.
+    """
+    _runner, _adapter, source = lane(chat_id="tg-first")
+    adapterless = StubRunner({}, gateway_loop=asyncio.get_running_loop())
+    _waiting(journal, plugin, source, _adapter, _runner, drop_id="W" * 22)
+
+    other = StubAdapter(Platform.TELEGRAM)
+    newer = other.build_source(chat_id="tg-second", chat_type="dm", user_id="u-2")
+    plugin.drop.sources.REGISTRY.put(newer, gateway=_runner, session_key="s2")
+
+    async def cannot_resolve(_r):
+        return await _reconcile(reconciler, journal, plugin, adapterless)
+
+    assert reconciler.trigger_from_event(adapterless, reconcile_coro=cannot_resolve) is True
+    await asyncio.sleep(0.2)
+
+    # Put the *other* lane at the tail before the snapshot. Without this the
+    # deferred lane is already last — the pass itself touched it through the
+    # resolving lookup — and a gate that moved it to the end again would be
+    # undetectable. The eviction ``_trim`` performs is decided by exactly this
+    # order, so "undetectable here" is not "harmless there".
+    plugin.drop.sources.REGISTRY.put(newer, gateway=_runner, session_key="s2")
+    before = plugin.drop.sources.REGISTRY.keys()
+    for _ in range(5):
+        reconciler.trigger_from_event(adapterless, reconcile_coro=cannot_resolve)
+    assert plugin.drop.sources.REGISTRY.keys() == before, (
+        "the retry gate reordered or evicted entries in the source registry"
+    )
+
+
+async def test_a_pass_that_both_fails_and_defers_keeps_both_accounts(
+    reconciler, journal, plugin, lane
+) -> None:
+    """Neither outcome may erase the other.
+
+    Entry A's write fails (bounded retry). Entry B is in a lane the runner cannot
+    resolve (gated retry). Accounting them as one meant the failure branch cleared
+    B's lane, so when the failure budget ran out B had nothing left to re-open the
+    latch — even though B's conversation coming back was exactly the event that
+    would have let the pass finish.
+    """
+    runner, adapter, source = lane(chat_id="tg-a")
+    _waiting(journal, plugin, source, adapter, runner, drop_id="X" * 22, expires_in_ms=-1000)
+
+    quiet_adapter = StubAdapter(Platform.DISCORD)
+    quiet_runner = StubRunner({Platform.DISCORD: quiet_adapter})
+    quiet_source = quiet_adapter.build_source(chat_id="dc-quiet", chat_type="dm", user_id="u-9")
+    quiet_lane = plugin.drop.sources.routing_tuple_for_source(quiet_source)
+    _waiting(journal, plugin, quiet_source, quiet_adapter, quiet_runner, drop_id="Y" * 22)
+    # Only A's lane is registered: B is the restart case, and it must survive A.
+    plugin.drop.sources.REGISTRY.forget_routing_tuple(quiet_lane)
+
+    exploding = ExplodingJournal(journal, fail_for={"X" * 22})  # never recovers
+
+    async def fails_and_defers(_runner):
+        return await _reconcile(reconciler, exploding, plugin, runner)
+
+    granted = 0
+    for _ in range(reconciler.MAX_FAILED_PASSES + 2):
+        if reconciler.trigger_from_event(runner, reconcile_coro=fails_and_defers):
+            granted += 1
+        await asyncio.sleep(0.05)
+
+    assert granted == reconciler.MAX_FAILED_PASSES, granted
+    assert reconciler.deferred_lanes() == frozenset({quiet_lane}), (
+        "the failure budget erased the lane the same pass deferred on"
+    )
+    # The spent failure budget is not the end of reconciliation: B's lane coming
+    # back still opens the gate.
+    assert reconciler.trigger_from_event(runner, reconcile_coro=fails_and_defers) is False
+    plugin.drop.sources.REGISTRY.put(quiet_source, gateway=quiet_runner, session_key="s9")
+    assert reconciler.trigger_from_event(quiet_runner, reconcile_coro=fails_and_defers) is True, (
+        "a deferred lane could not revive a pass whose failure budget was spent"
+    )
+
+
+async def test_deferred_re_opens_are_bounded_and_then_cost_nothing(
+    reconciler, journal, plugin, lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop under the gate, and what the gate must stop doing after it.
+
+    The gate normally makes the bound unreachable: a retry either drives the lane
+    it was opened for — progress, which resets the count — or the gate shuts
+    again. What is bounded here is the case the gate cannot see: a lane that
+    resolves when the gate asks and does not when the pass asks a moment later.
+
+    Once the budget is spent the answer is settled, and re-deriving it is pure
+    cost: the walk is O(N deferred lanes) of registry peeks and adapter
+    resolutions, and it would run on *every inbound message* for the life of the
+    process. So "spent" is its own state, answered in O(1), while the lanes stay
+    readable — which conversations were given up on is exactly what an operator
+    would want to know.
+    """
+    runner, adapter, source = lane()
+    _waiting(journal, plugin, source, adapter, runner, drop_id="Z" * 22)
+    lane_key = plugin.drop.sources.routing_tuple_for_source(source)
+
+    async def always_defers(_runner):
+        # Resolvable to the gate (the lane is registered and the runner owns the
+        # adapter), unresolvable to the pass.
+        return await _reconcile(reconciler, journal, plugin, StubRunner({}))
+
+    granted = 0
+    for _ in range(reconciler.MAX_DEFERRED_PASSES + 5):
+        if reconciler.trigger_from_event(runner, reconcile_coro=always_defers):
+            granted += 1
+        await asyncio.sleep(0.02)
+
+    assert granted == reconciler.MAX_DEFERRED_PASSES, (
+        f"deferred re-opens are unbounded: {granted} granted"
+    )
+    assert reconciler.deferred_retries_spent() is True
+    assert reconciler.deferred_lanes() == frozenset({lane_key}), (
+        "the lanes stopped being readable once the budget was spent"
+    )
+
+    # The part that is not just bookkeeping: no work per dispatch, forever after.
+    peeks: list = []
+    registry = plugin.drop.sources.REGISTRY
+    real_peek = registry.peek_routing_tuple
+    monkeypatch.setattr(
+        registry,
+        "peek_routing_tuple",
+        lambda key: peeks.append(key) or real_peek(key),
+    )
+    for _ in range(25):
+        assert reconciler.trigger_from_event(runner, reconcile_coro=always_defers) is False
+    assert peeks == [], (
+        f"the gate kept walking {len(peeks)} lanes per dispatch after giving up"
+    )
+
+
+class UnreadableJournal:
+    """A journal whose ``entries()`` raises — a read-only or vanished state dir.
+
+    The failure that matters about it: ``reconcile`` returns *immediately* with
+    ``failed: ["journal:entries"]`` and no lanes at all, because it never got far
+    enough to enumerate one.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def entries(self):
+        raise OSError(13, "Permission denied")
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def test_a_failed_pass_that_enumerates_nothing_keeps_the_lanes_it_never_saw(
+    reconciler, journal, plugin, lane
+) -> None:
+    """A failure must not erase a deferral it had no opportunity to observe.
+
+    An unreadable journal reports ``failed`` and *no* ``unresolved_lanes`` — not
+    because there are none, but because it never enumerated. Taking that empty
+    list as the truth discarded lanes an earlier pass had legitimately recorded,
+    and once the failure budget ran out those drops had nothing left that could
+    re-open the latch. The lanes are unioned instead, so the fallback at the end
+    of the budget still has something to gate on.
+    """
+    runner, adapter, source = lane()
+    _waiting(journal, plugin, source, adapter, runner, drop_id="J" * 22)
+    lane_key = plugin.drop.sources.routing_tuple_for_source(source)
+
+    async def defers(_r):
+        return await _reconcile(reconciler, journal, plugin, runner)
+
+    unreadable = UnreadableJournal(journal)
+
+    async def fails_blind(_r):
+        return await _reconcile(reconciler, unreadable, plugin, runner)
+
+    # One pass that genuinely defers, so there is a lane on record.
+    plugin.drop.sources.REGISTRY.clear()
+    assert reconciler.trigger_from_event(runner, reconcile_coro=defers) is True
+    await asyncio.sleep(0.2)
+    assert reconciler.deferred_lanes() == frozenset({lane_key})
+
+    # Then nothing but blind failures, right through the budget.
+    plugin.drop.sources.REGISTRY.put(source, gateway=runner, session_key="s")
+    for _ in range(reconciler.MAX_FAILED_PASSES):
+        reconciler.trigger_from_event(runner, reconcile_coro=fails_blind)
+        await asyncio.sleep(0.05)
+
+    assert reconciler.deferred_lanes() == frozenset({lane_key}), (
+        "a failure that enumerated nothing erased the lane a previous pass deferred on"
+    )
+    # The failure budget is spent, so the carried lane is now the only thing that
+    # can revive reconciliation — and it can.
+    plugin.drop.sources.REGISTRY.clear()
+    assert reconciler.trigger_from_event(runner, reconcile_coro=defers) is False
+    plugin.drop.sources.REGISTRY.put(source, gateway=runner, session_key="s")
+    assert reconciler.trigger_from_event(runner, reconcile_coro=defers) is True, (
+        "the carried lane could not revive a pass whose failure budget was spent"
+    )
+
+
+# ── a status edit that failed is work, not a flag ──────────────────────────
+
+
+def _expired_with_a_refused_edit(journal, plugin, lane, **kw):
+    """One drop past its deadline in a lane whose adapter refuses edits."""
+    runner, adapter, source = lane(edit_ok=False, **kw)
+    entry = _waiting(
+        journal, plugin, source, adapter, runner, drop_id="E" * 21 + "1", expires_in_ms=-1000
+    )
+    return runner, adapter, source, entry
+
+
+async def test_a_refused_status_edit_is_retried_until_it_lands(
+    reconciler, journal, plugin, lane
+) -> None:
+    """The stale-URL bug: a refused edit left the *waiting* notice up for good.
+
+    ``finalize_terminal`` writes the journal and announces even when the edit is
+    refused, which is right — the outcome has to become durable whether or not
+    chat cooperates. But nothing ever tried the edit again, so the message the
+    user could see kept advertising a live-looking capability URL for a drop the
+    journal had already closed. The pass reported no failures, so the latch stayed
+    consumed and no later pass could have fixed it either.
+
+    The retry must not duplicate anything: the wake is announced once, the state
+    is written once, and no claim is involved at any point.
+    """
+    runner, adapter, source, entry = _expired_with_a_refused_edit(journal, plugin, lane)
+    lane_key = plugin.drop.sources.routing_tuple_for_source(source)
+    deliver = FakeDeliver()
+
+    async def a_pass(_r):
+        return await _reconcile(reconciler, journal, plugin, runner, deliver=deliver)
+
+    assert reconciler.trigger_from_event(runner, reconcile_coro=a_pass) is True
+    await asyncio.sleep(0.2)
+
+    stored = journal.get(entry["drop_id"])
+    assert stored["state"] == plugin.drop.journal.STATE_EXPIRED
+    assert stored["edit_failed"] is True
+    assert len(adapter.edited) == 1, "the first attempt is the transition's own edit"
+    assert len(deliver.calls) == 1
+    assert reconciler.deferred_lanes() == frozenset({lane_key}), (
+        "a refused edit left the pass looking clean, so nothing would retry it"
+    )
+
+    # The adapter recovers — a rate limit lifting, a permission restored.
+    adapter._edit_ok = True
+    assert reconciler.trigger_from_event(runner, reconcile_coro=a_pass) is True
+    await asyncio.sleep(0.2)
+
+    repaired = journal.get(entry["drop_id"])
+    assert repaired["edit_failed"] is False, "the retry did not clear the flag"
+    assert len(adapter.edited) == 2, "the status message was never re-edited"
+    assert adapter.edited[-1].content == entry["notice_expired"]
+    assert adapter.edited[-1].message_id == entry["message_id"]
+
+    # Nothing was duplicated by the repair.
+    assert len(deliver.calls) == 1, "the retry announced the drop a second time"
+    assert repaired["state"] == plugin.drop.journal.STATE_EXPIRED
+    assert repaired["claimed_at"] is None
+    assert repaired["announced_at"] == stored["announced_at"]
+    assert repaired["announce_attempts"] == stored["announce_attempts"]
+
+    # And with nothing left outstanding the latch goes back to one-shot.
+    assert reconciler.deferred_lanes() == frozenset()
+    assert reconciler.trigger_from_event(runner, reconcile_coro=a_pass) is False
+
+
+async def test_status_edit_retries_are_bounded(reconciler, journal, plugin, lane) -> None:
+    """An adapter that refuses forever must not be retried forever.
+
+    Per drop, not per pass: one message that cannot be edited is no reason to stop
+    reconciling everything else, so the budget is ``MAX_EDIT_RETRIES`` attempts on
+    that drop and the pass stays clean once they are used up.
+    """
+    runner, adapter, source, entry = _expired_with_a_refused_edit(journal, plugin, lane)
+    deliver = FakeDeliver()
+
+    async def a_pass(_r):
+        return await _reconcile(reconciler, journal, plugin, runner, deliver=deliver)
+
+    for _ in range(reconciler.MAX_EDIT_RETRIES + 3):
+        await a_pass(runner)
+
+    assert len(adapter.edited) == 1 + reconciler.MAX_EDIT_RETRIES, (
+        f"unbounded edit retries: {len(adapter.edited)} attempts"
+    )
+    # The drop is untouched apart from the flag, and nothing was re-announced.
+    stored = journal.get(entry["drop_id"])
+    assert stored["state"] == plugin.drop.journal.STATE_EXPIRED
+    assert stored["edit_failed"] is True
+    assert stored["claimed_at"] is None
+    assert len(deliver.calls) == 1
+
+    # A pass with the budget used up is clean: it leaves the latch alone.
+    summary = await a_pass(runner)
+    assert summary["edit_retry_pending"] == []
+    assert summary["retry_lanes"] == []
+    assert summary["failed"] == []

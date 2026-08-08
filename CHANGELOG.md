@@ -13,6 +13,21 @@ and reads none of them, and behaves exactly as it did before.
 
 ### Added
 
+- **Lifecycle/FSM verification.** A dedicated state-sequence suite now pins the
+  broker's `pending → submitted → claimed/destroyed` machine, including concurrent
+  and duplicate operations, expiry from every state, malformed calls, lossless
+  oversized-claim refusal, shutdown, and randomized operation sequences. The
+  verified lifecycle and the limits of best-effort deletion are documented in
+  `SECURITY.md`.
+
+- **Restart-recovery E2E.** A cross-language integration test now creates a real
+  drop, crashes and restarts the real Node broker on the same control socket, and
+  drives the Hermes journal/reconciler path to the quiet expired state. It proves
+  the old secret is unavailable, the waiting message loses its URL, and journal
+  temp-file debris cannot become a live entry. Reconciliation now retries transient
+  broker-unavailable and unresolved-lane outcomes with bounded accounting instead
+  of consuming its process latch forever.
+
 - **Lossless claim boundary.** The broker no longer consumes a payload it cannot
   hand over. A claiming client states the largest response line it can read
   (`max_response_bytes` on `claim`), the broker sizes the whole answer against it
