@@ -11,8 +11,8 @@ This extends the existing Hermes Drop lifecycle; it does not create a generic fi
 ## MVP limits
 
 - Up to **5 files** per drop.
-- Up to **10 MiB total plaintext** per drop.
-- Up to **10 MiB per file** (the total cap remains authoritative).
+- Up to **42 MiB total plaintext** per drop.
+- Up to **42 MiB per file** (the total cap remains authoritative).
 - Empty files are allowed; empty submissions are not.
 - Existing TTL rules remain unchanged (30 minutes by default, 60 maximum).
 - One encrypted submission, one local claim, then destruction under the existing lifecycle.
@@ -53,8 +53,8 @@ The metadata response gains a non-secret request mode and limits:
 {
   "payload_kind": "files",
   "max_files": 5,
-  "max_total_bytes": 10485760,
-  "max_file_bytes": 10485760
+  "max_total_bytes": 44040192,
+  "max_file_bytes": 44040192
 }
 ```
 
@@ -111,12 +111,12 @@ A custom minimal container is preferred over ZIP in the MVP: no archive parser/d
 
 A handoff record gains `payloadKind` (`text` or `files`) and kind-specific limits. Text defaults remain unchanged.
 
-For file payloads, the broker holds the decrypted validated container in memory until claim or expiry. The 10 MiB default is intentionally bounded; additionally add:
+For file payloads, the broker holds the decrypted validated container in memory until claim or expiry. The 42 MiB default is intentionally bounded; additionally add:
 
 - `HANDOFF_MAX_FILES` (default 5);
-- `HANDOFF_MAX_FILE_BYTES` (default 10 MiB);
-- `HANDOFF_MAX_FILE_TOTAL_BYTES` (default 10 MiB);
-- `HANDOFF_MAX_LIVE_FILE_BYTES` (default 50 MiB process-wide).
+- `HANDOFF_MAX_FILE_BYTES` (default 42 MiB);
+- `HANDOFF_MAX_FILE_TOTAL_BYTES` (default 42 MiB);
+- `HANDOFF_MAX_LIVE_FILE_BYTES` (default 168 MiB process-wide, enough for four fully reserved file drops).
 
 Creation must refuse a new file drop when reserving its advertised maximum would exceed the process-wide live-file budget. This prevents many pending/submitted drops from turning the broker into an unbounded memory sink.
 
@@ -155,7 +155,7 @@ Suggested result:
 
 The generated local path is the agent attachment boundary: Hermes tools can read or attach the file without binary bytes entering the transcript. Original names are labels only and are never joined into filesystem paths.
 
-The control protocol should stream or length-frame file claims to a private Unix-socket client; it must not base64 a 10 MiB payload into one newline-delimited JSON response. Metadata may remain JSON, followed by exact-length binary frames. A failed/truncated transfer must leave the broker payload claimable until the client acknowledges a fully verified receive; this requires a two-phase `begin_file_claim` → transfer → `commit_file_claim` contract (or equivalent single connection with final ACK).
+The control protocol should stream or length-frame file claims to a private Unix-socket client; it must not base64 a 42 MiB payload into one newline-delimited JSON response. Metadata may remain JSON, followed by exact-length binary frames. A failed/truncated transfer must leave the broker payload claimable until the client acknowledges a fully verified receive; this requires a two-phase `begin_file_claim` → transfer → `commit_file_claim` contract (or equivalent single connection with final ACK).
 
 ## Lifecycle changes
 
@@ -204,7 +204,7 @@ submitted -> transferring -> claimed
 
 ## Acceptance criteria
 
-- One to five files totaling at most 10 MiB can be selected, encrypted in-browser, submitted, claimed once, and materialized under a private spool directory.
+- One to five files totaling at most 42 MiB can be selected, encrypted in-browser, submitted, claimed once, and materialized under a private spool directory.
 - A second claim cannot recover bytes.
 - Binary contents never enter chat messages, Hermes `state.db`, FTS, JSON session logs, or model-provider payloads.
 - Filenames never control filesystem paths and never appear in broker logs or public status messages.
@@ -213,4 +213,4 @@ submitted -> transferring -> claimed
 
 ## Deliberately deferred
 
-- Files larger than 10 MiB, resumable/chunked browser uploads, object storage, multi-recipient links, folders, compression, previews, malware scanning, outbound sharing, and permanent file storage.
+- Files larger than 42 MiB, resumable/chunked browser uploads, object storage, multi-recipient links, folders, compression, previews, malware scanning, outbound sharing, and permanent file storage.
