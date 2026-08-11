@@ -18,7 +18,7 @@ This extends the existing Hermes Drop lifecycle; it does not create a generic fi
 - One encrypted submission, one local claim, then destruction under the existing lifecycle.
 - No folders, directory trees, resumable/chunked upload, preview, antivirus guarantee, or 5 GiB-class transfer.
 
-Limits must be broker-advertised metadata and server-enforced, not trusted from the browser. Operators may lower them.
+Limits must be broker-advertised metadata and server-enforced, not trusted from the browser. Operators may lower them and may not raise them: the manifest ceiling, the browser's advertised limits and the broker's live-memory budget are all derived from the defaults above, so a higher cap is a change to those defaults, reviewed with them, not a deployment setting.
 
 ## Why the current text path is insufficient
 
@@ -74,10 +74,20 @@ Introduce envelope version 2 with an encrypted binary container:
 
 ```text
 magic: "HDROP2" (6 bytes)
-manifest_length: uint32 big-endian
-manifest: UTF-8 JSON
+manifest_length: uint32 big-endian, at most 6437 (see below)
+manifest: UTF-8 JSON, strict — no BOM, no trailing bytes
 file bytes: concatenated in manifest order
 ```
+
+`manifest_length` is checked against a fixed ceiling *before* any manifest byte
+is read. The ceiling is derived from the file count rather than chosen: worst
+case per entry is a 255-byte name and a 255-byte type, each doubled because JSON
+escapes quotes, plus a 64-character digest, two 16-digit integers and the keys —
+1280 bytes, so five files fit in 6437. Raising `max_files` therefore has to raise
+this ceiling in the same change, or maximal drops fail late and only for users
+whose filenames happen to be long. Transports (the control protocol's framing,
+the browser's assembly buffer) size themselves from
+`10 + manifest_ceiling + max_total_bytes`.
 
 Encrypted manifest shape:
 
@@ -98,12 +108,25 @@ Encrypted manifest shape:
 
 Rules:
 
-- `name` is the browser-provided basename only; directory components are stripped.
-- `type` is an untrusted display hint and may be empty.
+- `name` is the browser-provided basename only; directory components are stripped,
+  and it is capped at 255 UTF-8 bytes.
+- `name` must already be canonical: the decoder re-runs sanitization and refuses
+  any name it would have changed, so the label that is displayed and the bytes
+  that were hashed can never disagree. Sanitization is therefore a fixed point.
+- `type` is an untrusted display hint and may be empty. It is printable ASCII,
+  capped at 255 bytes; anything else becomes empty rather than being repaired.
+- `sha256` is exactly 64 lowercase hex characters — one spelling, no other.
 - offsets must be contiguous, ordered, non-overlapping, and exactly consume the payload.
 - SHA-256 is verified after decryption before a claim can succeed.
+- Unknown keys, at either level of the manifest, are a refusal rather than
+  something to ignore.
 - The whole container is sealed once with the existing HPKE suite and handoff binding.
 - The broker validates the container after AEAD success and before transitioning to `submitted`.
+
+Envelope v2 is a **required integration**, not something the container delivers
+on its own: `buildInfo` must carry the version on both sides and the broker's
+`envelope.v` equality check must widen to an allowlist. Until that lands, the
+codec's `FILE_ENVELOPE_VERSION` is a declared constant with nothing bound to it.
 
 A custom minimal container is preferred over ZIP in the MVP: no archive parser/decompression attack surface, no compression bombs, deterministic validation, and no new browser dependency. ZIP can be an export convenience later, not the security boundary.
 
@@ -194,8 +217,8 @@ submitted -> transferring -> claimed
 
 ## Implementation slices
 
-1. **Contract and binary container** — v2 codec, manifest/path validation, test vectors, malformed-container tests.
-2. **Broker file mode** — create metadata, limits, live-memory reservation, file envelope acceptance, lifecycle tests.
+1. **Contract and binary container** — v2 codec, manifest/path validation, test vectors, malformed-container tests. *Delivered as `src/file-container.js`: encode/decode, sanitization, limits and ceilings only. It is imported by nothing yet, and the decoded file views alias the container buffer, so whoever holds them owns zeroization and must re-verify digests before writing bytes out.*
+2. **Broker file mode** — create metadata, limits, live-memory reservation, file envelope acceptance, lifecycle tests. *Includes the envelope-v2 binding above: `buildInfo` version threading on both sides and the broker's `envelope.v` allowlist.*
 3. **Lossless local transfer protocol** — framed streaming, transfer lease/ACK, disconnect and size-boundary tests.
 4. **Plugin spool boundary** — private atomic writes, hash verification, cleanup/recovery, durable-safe tool result.
 5. **Tools and origin binding** — request/claim schemas and `/drop-file`, with the existing forbidden-destination tests extended.
