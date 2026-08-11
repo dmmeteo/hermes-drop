@@ -6,6 +6,8 @@ import { chmod, mkdir, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { dirname } from 'node:path';
 
+import { PAYLOAD_KINDS } from './broker.js';
+import { PAYLOAD_KIND_FILES } from './file-container.js';
 import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
 
 const MAX_CONTROL_LINE_BYTES = 4096;
@@ -182,16 +184,42 @@ async function handleControlRequest(request, broker) {
         return { ok: false, error: 'invalid_request' };
       }
 
-      const created = await broker.create(
-        request.ttl_seconds === undefined ? {} : { ttlSeconds: Number(request.ttl_seconds) },
-      );
+      // The payload kind and its file count are validated on the same terms: a
+      // kind this broker does not speak, or a count that is not a usable one, is
+      // a caller mistake and must mint nothing on its way to being refused.
+      const payloadKind = request.payload_kind;
+      if (payloadKind !== undefined && !PAYLOAD_KINDS.includes(payloadKind)) {
+        return { ok: false, error: 'invalid_request' };
+      }
+      const maxFiles = request.max_files;
+      if (maxFiles !== undefined) {
+        // Meaningless on a text drop, so it is refused rather than ignored: a
+        // caller that asked for a file count and got a text drop was misheard.
+        if (payloadKind !== PAYLOAD_KIND_FILES) return { ok: false, error: 'invalid_request' };
+        if (!Number.isInteger(maxFiles) || maxFiles < 1) {
+          return { ok: false, error: 'invalid_request' };
+        }
+      }
+
+      const created = await broker.create({
+        ...(request.ttl_seconds === undefined ? {} : { ttlSeconds: Number(request.ttl_seconds) }),
+        ...(payloadKind === undefined ? {} : { payloadKind }),
+        ...(maxFiles === undefined ? {} : { maxFiles }),
+      });
       if (!created.ok) return created;
 
-      // Stated here rather than in broker.js: the version is a fact about the
-      // protocol this seam speaks, not about the handoff it just minted. Every
-      // drop starts with this response, so a client learns what it is talking to
-      // before there is a payload to lose — no probe op, no extra round trip.
-      const answer = { ...created, protocol_version: PROTOCOL_VERSION };
+      // Stated here rather than in broker.js: the version and the kinds this
+      // broker speaks are facts about the protocol this seam speaks, not about
+      // the handoff it just minted. Every drop starts with this response, so a
+      // client learns what it is talking to before there is a payload to lose —
+      // no probe op, no extra round trip. A plugin that needs file drops reads
+      // `payload_kinds` and refuses *before* posting a link, rather than
+      // discovering a text-only broker at submit time.
+      const answer = {
+        ...created,
+        protocol_version: PROTOCOL_VERSION,
+        payload_kinds: PAYLOAD_KINDS,
+      };
       if (!wantsNotice) return answer;
 
       return {

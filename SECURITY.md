@@ -88,7 +88,7 @@ other states, and no state carries a payload it is not named for.
 | `pending` | yes | no | `create` |
 | `submitted` | no | yes | the one envelope that decrypted |
 | `claimed` | no | no | the one `claim` that was handed over |
-| destroyed | no | no | TTL lapse, AEAD-failure budget, shutdown |
+| destroyed | no | no | TTL lapse, AEAD-failure budget, container-failure budget, shutdown |
 
 Key material exists **exactly** in `pending`, and the payload exists **exactly**
 in `submitted`. Those are checked invariants rather than descriptions: every step
@@ -121,6 +121,16 @@ pending ──one envelope decrypts──► submitted ──one claim──► 
   Only a `pending` handoff can reach the AEAD at all, so only a `pending` handoff
   can be destroyed this way. A malformed envelope is rejected on shape and costs
   nothing against the budget.
+- **`pending → destroyed`, the second way** — a *file* drop's container-failure
+  budget is spent. Reachable only after a successful AEAD, so only on a drop
+  minted `payload_kind: files`: the sender proved it holds the capability, and its
+  decrypted payload then failed HDROP2 validation (bad magic, bad manifest, a
+  digest that does not match the bytes). It is a separate counter from the AEAD
+  one — a broken client is not a guesser — sharing the same
+  `HANDOFF_MAX_AEAD_FAILURES` ceiling, and it is bounded rather than free because
+  validating a container is a SHA-256 over every byte of it. A text drop has no
+  such edge: nothing validates a secret beyond its size. The record stays
+  `pending` and holds no payload until the budget is spent.
 - **`pending | submitted | claimed → destroyed`** — the TTL lapses. Enforced both
   by the sweeper and lazily, on the next touch of the record, so a parked sweeper
   cannot extend a lifetime.
@@ -128,6 +138,24 @@ pending ──one envelope decrypts──► submitted ──one claim──► 
 
 There is no edge back. Nothing returns a handoff to `pending`, nothing re-arms a
 `claimed` one, and nothing revives a destroyed one.
+
+A file drop walks the same machine with two differences, both deliberate. Its
+`pending → submitted` edge additionally requires the decrypted payload to be a
+valid HDROP2 container, so the record never reaches `submitted` holding bytes
+nobody has verified; and it has no `submitted → claimed` edge yet, because `claim`
+answers the uniform `unavailable` for a file drop rather than base64 a 42 MiB
+container into one newline-delimited response line. Until the framed transfer
+lands (`docs/FILE_TRANSFER_MVP.md`, slice 3) a file drop leaves the machine only
+by TTL lapse, a spent failure budget or shutdown.
+
+Creation of a file drop is also refusable in a way a text drop's is not: each one
+reserves the largest plaintext it could hold (42 MiB plus its container header and
+manifest ceiling) against a process-wide live-file budget of four such
+reservations, and a fifth is refused with the same uniform `unavailable` while
+minting nothing. That budget bounds *resident payloads*. The transient cost of a
+submission in flight — a buffered base64 body, and the copies parsing it produces
+— is bounded separately, by admitting at most one widened upload at a time per
+drop.
 
 ### What each seam answers, in each state
 

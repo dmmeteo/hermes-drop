@@ -1,5 +1,6 @@
 // DOM wiring for the accepted Variant A page. All crypto and transport lives in
 // handoff-client.js; this file only moves between the three screens.
+import { PAYLOAD_KIND_TEXT } from '../file-container.js';
 import { createDeadline, formatRemaining } from './countdown.js';
 import {
   fetchMetadata,
@@ -76,6 +77,20 @@ async function start() {
   const askedAt = performance.now();
   metadata = await fetchMetadata({ capability, origin });
   if (!metadata) return show('unavailable');
+
+  // This page is a text page: one textarea, one Send, one UTF-8 secret sealed
+  // under envelope v1. A file drop advertises `payload_kind: "files"` and, with
+  // it, no `max_plaintext_bytes` at all — which is the field both size guards
+  // below read. Rendering the form anyway would leave them comparing against
+  // `undefined`, i.e. never firing, so an arbitrarily large secret would be
+  // sealed and posted into a body ceiling widened for containers, to be refused
+  // on the version mismatch at the far end. Refusing the link is the honest
+  // answer until the picker lands (docs/FILE_TRANSFER_MVP.md, slice 6), and it
+  // keeps `metadata` null so no later handler can act on it.
+  if (metadata.payload_kind !== PAYLOAD_KIND_TEXT) {
+    metadata = null;
+    return show('unavailable');
+  }
 
   // Anchored on the broker's clock, not the device's — see countdown.js. The
   // whole round trip is charged against the remaining span: that over-charges

@@ -10,6 +10,11 @@
 //   - only the one allowlisted suite is accepted from metadata.
 import { base64UrlToBytes, bytesToBase64Url, isBase64Url } from '../base64url.js';
 import {
+  FILE_ENVELOPE_VERSION,
+  PAYLOAD_KIND_FILES,
+  PAYLOAD_KIND_TEXT,
+} from '../file-container.js';
+import {
   CAPABILITY_LENGTH,
   EMPTY_AAD,
   ENVELOPE_VERSION,
@@ -43,7 +48,13 @@ export async function fetchMetadata({ capability, fetchImpl = fetch, origin = ''
   if (!response.ok) return null;
 
   const metadata = await response.json();
-  if (metadata.v !== ENVELOPE_VERSION || metadata.suite !== SUITE_ID) return null;
+  // The envelope version is a fact about the drop's payload kind, not a choice:
+  // a `files` drop that did not say v2, or a `text` drop that did not say v1, is
+  // a broker this page does not understand, and the safe reading of that is the
+  // same unavailable as everything else.
+  const expectedVersion =
+    metadata.payload_kind === PAYLOAD_KIND_FILES ? FILE_ENVELOPE_VERSION : ENVELOPE_VERSION;
+  if (metadata.v !== expectedVersion || metadata.suite !== SUITE_ID) return null;
   if (!isBase64Url(metadata.hid) || !isBase64Url(metadata.pk)) return null;
   if (base64UrlToBytes(metadata.pk).length !== PUBLIC_KEY_BYTES) return null;
   return metadata;
@@ -52,27 +63,44 @@ export async function fetchMetadata({ capability, fetchImpl = fetch, origin = ''
 /**
  * One RFC 9180 single-shot SealBase over the whole payload. No caller-chosen
  * nonce exists in this construction, and `aad` stays empty (RFC 9180 §8.1).
+ *
+ * `version` goes into `info`, not just into the JSON field: the broker rebuilds
+ * `info` from the version the *handoff's own payload kind* requires, so a v1
+ * ciphertext relabelled `v: 2` fails the AEAD instead of being opened as a
+ * container. Callers do not choose the version freely — they take it from the
+ * metadata they were served.
  */
-export async function sealEnvelope({ capability, metadata, plaintext }) {
+export async function sealBytesEnvelope({ capability, metadata, bytes, version }) {
   const suite = createSuite();
   const publicKeyBytes = base64UrlToBytes(metadata.pk);
   const recipientPublicKey = await suite.kem.deserializePublicKey(publicKeyBytes);
   const info = buildInfo({
     handoffId: metadata.hid,
     capabilityHash: await capabilityHash(capability),
+    version,
   });
 
+  const { ct, enc } = await suite.seal({ recipientPublicKey, info }, bytes, EMPTY_AAD);
+  return {
+    v: version,
+    suite: SUITE_ID,
+    hid: metadata.hid,
+    enc: bytesToBase64Url(new Uint8Array(enc)),
+    ct: bytesToBase64Url(new Uint8Array(ct)),
+    pkfp: bytesToBase64Url(await publicKeyFingerprint(publicKeyBytes)),
+  };
+}
+
+/** The text path: one UTF-8 secret, envelope v1, exactly as it always was. */
+export async function sealEnvelope({ capability, metadata, plaintext }) {
   const pt = utf8(plaintext);
   try {
-    const { ct, enc } = await suite.seal({ recipientPublicKey, info }, pt, EMPTY_AAD);
-    return {
-      v: ENVELOPE_VERSION,
-      suite: SUITE_ID,
-      hid: metadata.hid,
-      enc: bytesToBase64Url(new Uint8Array(enc)),
-      ct: bytesToBase64Url(new Uint8Array(ct)),
-      pkfp: bytesToBase64Url(await publicKeyFingerprint(publicKeyBytes)),
-    };
+    return await sealBytesEnvelope({
+      capability,
+      metadata,
+      bytes: pt,
+      version: ENVELOPE_VERSION,
+    });
   } finally {
     pt.fill(0);
   }
@@ -149,6 +177,10 @@ export async function sendSecret({ capability, plaintext, fetchImpl = fetch, ori
     return { status: 'unreachable' };
   }
   if (!metadata) return { status: 'unavailable' };
+  // This flow seals one UTF-8 secret. A drop that wants files is not something to
+  // fall back on: sealing text into it would be refused by the broker anyway, and
+  // stopping here keeps the page from asking for the wrong thing in the meantime.
+  if (metadata.payload_kind !== PAYLOAD_KIND_TEXT) return { status: 'unavailable' };
 
   if (plaintextByteLength(plaintext) > metadata.max_plaintext_bytes) {
     return { status: 'too_large', limit: metadata.max_plaintext_bytes };

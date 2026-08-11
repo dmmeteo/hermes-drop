@@ -505,7 +505,14 @@ and restart the gateway.
 | `HANDOFF_MAX_TTL_SECONDS` | `3600` | Ceiling for `create --ttl`. |
 | `HANDOFF_MAX_PLAINTEXT_BYTES` | `65536` | Enforced by the broker. See the claim-ceiling limitation above before raising it. |
 | `HANDOFF_MAX_BODY_BYTES` | `131072` | Request-body ceiling; also bounded at the proxy. |
-| `HANDOFF_MAX_AEAD_FAILURES` | `3` | Destroys the drop after this many. |
+| `HANDOFF_MAX_AEAD_FAILURES` | `3` | Destroys the drop after this many. Also the budget for container-validation failures on a file drop. |
+| `HANDOFF_MAX_FILES` | `5` | Files per file drop. **May only be lowered**; a higher value is refused at startup. |
+| `HANDOFF_MAX_FILE_BYTES` | `44040192` (42 MiB) | Per-file cap on a file drop; the total below stays authoritative. May only be lowered. |
+| `HANDOFF_MAX_FILE_TOTAL_BYTES` | `44040192` (42 MiB) | Total file plaintext per file drop. May only be lowered. |
+| `HANDOFF_MAX_LIVE_FILE_BYTES` | `176186556` | Process-wide live-file budget: four fully reserved drops. One drop reserves `44046639` — its 42 MiB of file bytes plus the container header and manifest ceiling it is held in. Creating a fifth is refused until one lapses or is claimed. May only be lowered, and never below one drop's reservation. Bounds *resident payloads*, not the transient cost of a submission in flight, which is capped instead by admitting one upload at a time per drop. |
+| `HANDOFF_REQUEST_TIMEOUT_MS` | `15000` | Whole-request deadline. Expiry answers the uniform `unavailable`, not a `408`. |
+| `HANDOFF_FILE_SUBMIT_TIMEOUT_MS` | `600000` | Deadline for one *admitted file submission*, extending the above for that request only. A maximal drop is a ~56 MiB body: 600 s clears it at just under 1 Mbit/s sustained upstream, and **a slower link cannot complete a 42 MiB drop** — raise this, or lower `HANDOFF_MAX_FILE_TOTAL_BYTES`. May not exceed `HANDOFF_MAX_TTL_SECONDS`. |
+| `HANDOFF_BODY_OVERRUN_ALLOWANCE_BYTES` | `1048576` | How far past a body ceiling the server keeps reading so the client still gets the uniform refusal instead of a reset. Additive, so it does not scale with the file ceiling. |
 | `HANDOFF_CONTROL_SOCKET` | `./run/control.sock` | `/run/handoff/control.sock` in the container. |
 | `HANDOFF_SOCKET_DIR` | *(required by compose)* | Host directory bind-mounted at `/run/handoff`. Mode `0700`, owned by `1000:1000`, created before first start. |
 | `HANDOFF_ENABLE_HSTS` | off | Enable only behind HTTPS. |

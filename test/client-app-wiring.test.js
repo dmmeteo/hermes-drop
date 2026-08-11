@@ -128,6 +128,30 @@ describe('the page script wiring', () => {
     assert.equal(dom.elements.get('unavailable').hidden, false);
   });
 
+  // The page is a text page: one textarea, one Send. A file drop advertises
+  // `payload_kind: "files"`, envelope v2 and no `max_plaintext_bytes` at all —
+  // which is exactly the field the pre-send size guard reads. Rendering the form
+  // anyway would leave that guard comparing against `undefined` (always false),
+  // so an arbitrarily large secret would be sealed and posted into a body ceiling
+  // widened for containers, only to be refused on the version mismatch. The page
+  // must therefore refuse the link outright until the file picker lands (slice 6),
+  // and this is the assertion that pins it where the browser actually runs.
+  it('refuses a file drop instead of offering the text form for it', async () => {
+    const created = await broker.control({ op: 'create', payload_kind: 'files' });
+    const { capability } = splitHandoffUrl(created.url);
+
+    const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
+
+    assert.equal(dom.elements.get('unavailable').hidden, false, 'the unavailable screen');
+    assert.equal(dom.elements.get('form').hidden, true, 'and never the text form');
+    assert.equal(dom.elements.get('app').dataset.state, 'unavailable');
+
+    // Nothing may be sealed or sent even if the button is driven directly.
+    dom.elements.get('secret').value = 'a secret typed into the wrong page';
+    await dom.elements.get('send').handlers.get('click')();
+    assert.equal(broker.testSnapshot(created.handoff_id).state, 'pending', 'nothing submitted');
+  });
+
   it('renders the form, sends once, and lands on the receipt', async () => {
     const created = await broker.control({ op: 'create' });
     const { capability } = splitHandoffUrl(created.url);

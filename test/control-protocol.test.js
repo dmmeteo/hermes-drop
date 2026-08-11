@@ -21,6 +21,7 @@ import { readFile } from 'node:fs/promises';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { PAYLOAD_KINDS } from '../src/broker.js';
 import { expiredNotice, receivedNotice, waitingNotice } from '../src/notice.js';
 import { startTestBroker } from './helpers/harness.js';
 
@@ -148,6 +149,92 @@ describe('the control protocol contract', () => {
         max_response_bytes: serverMin - 1,
       });
       assert.deepEqual(below, { ok: false, error: 'invalid_request' });
+    });
+
+    // The payload-kind capability is the exact analogue of notice_platforms: a
+    // list in the fixture that a foreign client reads to decide what it may ask
+    // for, held here against the broker's own list so the two cannot drift. The
+    // MVP designates it as the plugin's pre-flight check — a plugin must refuse
+    // file creation *before* posting a link if the broker lacks file support
+    // (docs/FILE_TRANSFER_MVP.md, Compatibility).
+    it('lists exactly the payload kinds the broker can mint', async () => {
+      assert.deepEqual(contract.payload_kinds, [...PAYLOAD_KINDS]);
+      assert.equal(typeof contract.payload_kinds_note, 'string');
+
+      for (const payload_kind of contract.payload_kinds) {
+        const created = await broker.control({ op: 'create', ttl_seconds: 60, payload_kind });
+        assert.equal(created.ok, true, payload_kind);
+        assert.equal(created.payload_kind, payload_kind);
+      }
+      const unlisted = await broker.control({ op: 'create', payload_kind: 'archive' });
+      assert.deepEqual(unlisted, { ok: false, error: 'invalid_request' });
+    });
+
+    it('echoes the capability on every create, so no probe op is needed', async () => {
+      const created = await broker.control({ op: 'create', ttl_seconds: 60 });
+      assert.deepEqual(created.payload_kinds, contract.payload_kinds);
+      assert.equal(
+        contract.ops.create.response.payload_kinds,
+        'array of the payload kinds this broker can mint; absent means ["text"]',
+      );
+    });
+
+    // Every documented kind-specific response key is present on the kind that owns
+    // it and absent on the other. A key that quietly appeared on both — or on
+    // neither — would leave the fixture describing a response nobody sends.
+    it('sends exactly the kind-specific response fields it documents', async () => {
+      const TEXT_ONLY = ['max_plaintext_bytes'];
+      const FILES_ONLY = ['max_files', 'max_file_bytes', 'max_total_bytes'];
+      for (const key of [...TEXT_ONLY, ...FILES_ONLY]) {
+        assert.match(
+          contract.ops.create.response[key],
+          /only/,
+          `${key} must document which kind it belongs to`,
+        );
+      }
+
+      const text = await broker.control({ op: 'create', ttl_seconds: 60 });
+      const files = await broker.control({
+        op: 'create',
+        ttl_seconds: 60,
+        payload_kind: 'files',
+      });
+      for (const key of TEXT_ONLY) {
+        assert.ok(key in text, `${key} must be present on a text drop`);
+        assert.ok(!(key in files), `${key} must be absent on a files drop`);
+      }
+      for (const key of FILES_ONLY) {
+        assert.ok(key in files, `${key} must be present on a files drop`);
+        assert.ok(!(key in text), `${key} must be absent on a text drop`);
+      }
+    });
+
+    it('documents the create request fields the server really validates', async () => {
+      const field = contract.ops.create.request.payload_kind;
+      assert.deepEqual(field.enum, [...PAYLOAD_KINDS]);
+      assert.equal(field.optional, true, 'a client that sends nothing gets a text drop');
+      assert.match(field.note, /unavailable/, 'a full live-file budget refuses uniformly');
+
+      const count = contract.ops.create.request.max_files;
+      assert.equal(count.optional, true);
+      assert.match(count.note, /narrow/i, 'it may only narrow the operator limit');
+
+      // ...and the server refuses it on a text drop rather than ignoring it, which
+      // is the half of the note a reader cannot verify from the fixture alone.
+      assert.deepEqual(await broker.control({ op: 'create', max_files: 2 }), {
+        ok: false,
+        error: 'invalid_request',
+      });
+    });
+
+    it('says that a files drop cannot be claimed over this seam', async () => {
+      assert.match(contract.ops.claim.summary, /files|text drops only/i);
+
+      const files = await broker.control({ op: 'create', ttl_seconds: 60, payload_kind: 'files' });
+      assert.deepEqual(await broker.control({ op: 'claim', handoff_id: files.handoff_id }), {
+        ok: false,
+        error: 'unavailable',
+      });
     });
 
     // Both halves of this repo ship together, but a Hermes-side plugin does not:

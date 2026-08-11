@@ -16,6 +16,8 @@
     "default_socket_path": "/run/handoff/control.sock",
     "socket_path_env": "HANDOFF_CONTROL_SOCKET"
   },
+  "payload_kinds": ["text", "files"],
+  "payload_kinds_note": "The payload kinds this broker can mint, echoed on every `create` response as `payload_kinds`. Additive and deliberately *not* a protocol version bump: a client that never sends `payload_kind` gets exactly the text drop it always got, and a client that needs file drops reads this list and refuses before posting a link rather than discovering a text-only broker at submit time. Absence of the field means text only. A `text` drop carries one UTF-8 secret under max_plaintext_bytes in envelope v1; a `files` drop carries one HDROP2 container under the file limits in envelope v2, and its bytes are NOT retrievable through `claim` — that is the framed transfer of slice 3 (docs/FILE_TRANSFER_MVP.md).",
   "version_notes": {
     "lossless_claim": "Version 2 added `max_response_bytes` on `claim`, the `response_too_large` error and `protocol_version` on the `create` response. Only a version 2 broker refuses an oversized claim *before* consuming it; a version 1 broker accepts the field, ignores it, and destroys the payload as it answers. A client therefore reads `protocol_version` rather than assuming the capability from its own age — the field is absent on version 1, and absence means 1.",
     "compatibility": "Additive. A version 1 client sends no new field and reads no new field, and behaves against a version 2 broker exactly as it did against a version 1 one."
@@ -42,16 +44,32 @@
           "optional": true,
           "enum": ["discord", "telegram", "plain"],
           "note": "Opt-in. When present, the response also carries notice, notice_received and notice_expired. An unlisted value is refused with invalid_request and mints nothing."
+        },
+        "payload_kind": {
+          "type": "string",
+          "optional": true,
+          "enum": ["text", "files"],
+          "note": "Defaults to `text`, which is the drop this protocol has always minted. An unlisted value is refused with invalid_request and mints nothing. A `files` drop additionally reserves its advertised maximum total against the broker's process-wide live-file budget at create time; when that budget is full the creation is refused with the uniform `unavailable` and nothing is minted."
+        },
+        "max_files": {
+          "type": "number",
+          "optional": true,
+          "note": "Only meaningful with payload_kind `files`, and refused with invalid_request on a text drop rather than ignored. A positive integer that may only *narrow* the operator's HANDOFF_MAX_FILES; a larger value is clamped down to it. Narrowing the count does not reduce the reservation, because one file may still be the whole per-drop byte total."
         }
       },
       "response": {
         "ok": true,
         "protocol_version": "number: the protocol this broker speaks; absent means 1",
+        "payload_kinds": "array of the payload kinds this broker can mint; absent means [\"text\"]",
+        "payload_kind": "string: the kind this handoff was minted as, `text` or `files`",
         "handoff_id": "22 base64url characters; non-secret and safe to log",
         "url": "<base>/#<capability> — the capability rides in the fragment and appears nowhere else",
         "expires_at": "epoch milliseconds",
         "ttl_seconds": "number",
-        "max_plaintext_bytes": "number",
+        "max_plaintext_bytes": "number; text drops only — the secret cap says nothing about a file drop and is not quoted at one",
+        "max_files": "number; files drops only — the count this drop will accept, after any narrowing",
+        "max_file_bytes": "number; files drops only — the per-file cap, with max_total_bytes remaining authoritative",
+        "max_total_bytes": "number; files drops only — the cap this drop reserved against the live-file budget",
         "notice": "only when notice_platform was given: the waiting message, rendered for that platform",
         "notice_received": "only when notice_platform was given: the content the waiting message is edited into on submit; identical on every platform",
         "notice_expired": "only when notice_platform was given: the content it is edited into on lapse; identical on every platform"
@@ -71,7 +89,7 @@
       "response": { "ok": true, "handoff_id": "string", "status": "submitted" }
     },
     "claim": {
-      "summary": "Consume the payload exactly once. The only op that returns plaintext.",
+      "summary": "Consume the payload exactly once. The only op that returns plaintext. Text drops only: a `files` drop answers `unavailable` here, untouched and still one-shot, because a container is not something to base64 into one newline-delimited line. Its bytes come out over the framed transfer of slice 3.",
       "request": {
         "op": "claim",
         "handoff_id": { "type": "string", "optional": false },
