@@ -5,6 +5,7 @@
     "kind": "unix-stream",
     "framing": "newline-delimited-json",
     "exchange": "one request line out, one response line back, then the server closes",
+    "exchange_note": "True of every op except the file claim, which is the one multi-message conversation on this socket: `begin_file_claim` answers with a metadata line, then the connection alternates length-framed binary out with `ack_frame` lines in, one per file, and finishes with a `commit_file_claim` line and its answer. See `file_claim` below. Nothing else on this socket ever writes a byte that is not part of a newline-terminated JSON line.",
     "max_request_bytes": 4096,
     "max_response_bytes": 1048576,
     "max_response_bytes_note": "The response line every conforming client must be able to buffer. Only `claim` can approach it — base64 of the broker's maxPlaintextBytes (65536 by default) is 87,384 bytes — so it is stated once here rather than derived twice. A client whose reader is smaller does not get to be silent about it: it advertises its real ceiling on `claim` and is refused before anything is consumed.",
@@ -17,16 +18,40 @@
     "socket_path_env": "HANDOFF_CONTROL_SOCKET"
   },
   "payload_kinds": ["text", "files"],
-  "payload_kinds_note": "The payload kinds this broker can mint, echoed on every `create` response as `payload_kinds`. Additive and deliberately *not* a protocol version bump: a client that never sends `payload_kind` gets exactly the text drop it always got, and a client that needs file drops reads this list and refuses before posting a link rather than discovering a text-only broker at submit time. Absence of the field means text only. A `text` drop carries one UTF-8 secret under max_plaintext_bytes in envelope v1; a `files` drop carries one HDROP2 container under the file limits in envelope v2, and its bytes are NOT retrievable through `claim` — that is the framed transfer of slice 3 (docs/FILE_TRANSFER_MVP.md).",
+  "payload_kinds_note": "The payload kinds this broker can mint, echoed on every `create` response as `payload_kinds`. Additive and deliberately *not* a protocol version bump: a client that never sends `payload_kind` gets exactly the text drop it always got, and a client that needs file drops reads this list and refuses before posting a link rather than discovering a text-only broker at submit time. Absence of the field means text only. A `text` drop carries one UTF-8 secret under max_plaintext_bytes in envelope v1; a `files` drop carries one HDROP2 container under the file limits in envelope v2, and its bytes are NOT retrievable through `claim` — they come out over the framed transfer described in `file_claim`.",
+  "file_claim": {
+    "protocol": 1,
+    "advertised_as": "Revision 1 *is* the conversation below, acks included — there is no earlier revision 1 with a different shape, and a change to the shape has to raise this number rather than reinterpret it. Published as `file_claim_protocol` on the `create` response; absence means this broker can mint a `files` drop but cannot transfer its bytes, which is exactly what a slice-2 broker is. A client that needs file drops checks BOTH `payload_kinds` and this field, and refuses before posting a link — discovering it after the user has already uploaded 42 MiB is a drop that can only lapse.",
+    "why_not_claim": "`claim` answers with one newline-delimited JSON line, so delivering a 42 MiB container through it would mean base64 in a ~57 MB line that both sides must hold whole. The transfer below streams instead: the broker writes views into the container it already holds, and neither side ever assembles a second copy.",
+    "conversation": [
+      "1. client sends one `begin_file_claim` line",
+      "2. broker answers one metadata line: the transfer id, the lease deadline, the total byte count and one entry per file (name, size, type) in transfer order",
+      "3. broker writes the frame for file 0 and then WAITS: uint32 big-endian length, then exactly that many bytes. The length always equals the entry's `size`, and a zero-length frame is a legitimately empty file — its header is the whole frame",
+      "4. client reads that frame, hashes it, and sends one `ack_frame` line naming the transfer, the index, the size it read and the SHA-256 it computed",
+      "5. broker checks the ack against the manifest and only then writes the next frame; steps 3-4 repeat until every file has been acked",
+      "6. client sends one `commit_file_claim` line carrying the byte count it received and the SHA-256 it computed over each file's received bytes",
+      "7. broker verifies, retires the payload, answers one line, and closes"
+    ],
+    "receipt": "Why the frames are acked one at a time instead of streamed and totalled at the end.\n\nThe broker's byte counter used to be fed by socket write completions, which mean the kernel accepted the bytes and not that the peer read them. For any payload smaller than the socket send buffer — a tunable, 208 KiB on an ordinary Linux host — every frame therefore 'completed' before the receiver had read a byte, so a receiver that committed straight after the metadata line was accepted. Above that size the same receiver was refused. A rule that holds for a 42 MiB drop and silently does not hold for a 16 KiB one is worse than no rule: it is absent for the most common drops and looks present in a test.\n\nAn ack is the fix because it cannot be produced by the kernel. The broker sends one frame and stops; the receiver has to read it and hash it to answer; the broker checks that answer against the manifest before it writes anything else; and `commit_file_claim` is refused unless every frame was acked. Nothing about that depends on a buffer size, so a receiver that commits a step early is refused identically at 16 bytes and at 42 MiB — including for a drop of only empty files, whose frames must still be acked.\n\nThe irreducible limit, unchanged and stated plainly: a caller that already knows the plaintext can compute any ack or digest it likes without reading anything. No exchange on this socket can distinguish that caller from an honest one, because the digests are of content it holds. The socket is 0600 and the caller is already trusted with the payload, so this is not a disclosure path — but `commit → ok` is a statement about an honest receiver having received the bytes, not a proof against a dishonest one. What the acks do buy, uniformly and regardless of size, is that an *ordinary or buggy* receiver cannot retire a payload it has not read.",
+    "lease": "Exactly one transfer lease may exist per handoff, and it is bound to the connection that opened it — there is no lease token to present on a second connection, so a lease cannot be stolen or forged by a caller who learns a transfer id. The lease has a bounded deadline (`lease_expires_at`) which is never later than the handoff's own expiry, and every way it can end without a commit — disconnect, timeout, a failed commit, handoff expiry, broker shutdown — returns the handoff to `submitted` with the payload intact.",
+    "turn_taking": "The numbered conversation above is strictly turn-taking, and the broker enforces it by *structure* rather than by timing. Each op is accepted in exactly one state of the conversation: `ack_frame` only while a frame is outstanding, and `commit_file_claim` only once every frame has been acked. Anything else — a commit pipelined behind the begin, a commit sent instead of an ack, an ack for a frame that is not the outstanding one, a second begin — is refused with `invalid_request` and the lease is released.\n\nEnforcing it structurally is what makes it size-independent. An earlier revision inferred the same rule from *when* data arrived relative to the frames going out, which is a fact about the socket send buffer rather than about the receiver, and is also a race for large frames: a receiver can legitimately answer before the broker's own write completion fires. Neither problem exists when the rule is 'the outstanding frame must be acked first'.\n\nInbound data is bounded rather than paused. The broker keeps reading — pausing would move an early line into the kernel and then deliver it looking timely, removing the evidence rather than the behaviour — and caps what it retains at one request line's worth, dropping the connection past that.",
+    "digests_are_not_echoed": "The metadata line deliberately does NOT carry each file's SHA-256, even though the broker knows it: a digest the receiver was handed is a digest the receiver can return without reading a byte. The receiver computes each digest over the bytes it actually received — once per frame in its `ack_frame`, and again over the whole set in its commit — and the broker compares them against the manifest before it advances. One limit remains, and it is irreducible rather than a gap to close: a digest only binds a caller that does not already know the content (see `receipt`). Within that limit the broker's `ok` on commit is the strongest verdict available to a receiver, and stronger than its own self-check: a receiver that writes files to a spool must publish them only after it, never before.",
+    "commit_is_the_only_retirement": "Nothing about a file transfer consumes the payload until the broker has accepted a commit. A transfer that fails at any point costs a refusal and leaves the handoff `submitted`, one-shot and claimable by the next `begin_file_claim` until its TTL lapses. `begin_file_claim` may be repeated after a failure, but not without limit: each granted lease costs a full digest pass over the container, so a handoff grants a bounded number of them (see `begin_file_claim.errors`) and refuses further attempts rather than destroying the payload.",
+    "lease_lost_mid_conversation": "The connection is closed without a final line. Writing a refusal instead is not possible in general — binary frames may be in flight, and a JSON line inserted between them would corrupt the stream — so one behaviour is used for every phase rather than two that differ by timing. What a receiver may conclude depends on whether it had already written its commit. Before the commit: nothing was consumed, and the transfer may be retried — that is `transfer_failed`. After the commit: the broker may have accepted it, retired the payload and lost only the answer, so the outcome is **indeterminate** and neither `transfer_failed` nor success may be reported. See `client_verdicts`.",
+    "client_verdicts": ["transfer_indeterminate"],
+    "client_verdicts_note": "Verdicts a *receiver* produces about its own transfer. They are not in `errors` because the broker never sends them: `errors` is the vocabulary of lines that come off the socket, and a receiver has to be able to say something the socket did not.\n\n`transfer_indeterminate` means the commit was written and no answer was read — because the connection closed, or because the receiver's own deadline elapsed after it had written the commit. `commit_file_claim` is one-shot, non-idempotent and not requeryable, so this outcome is genuinely unknown rather than failed: the payload may have been retired, or may still be waiting.\n\nSafe caller semantics, and there is only one safe set: **do not publish** anything received (the verification verdict never arrived), **do not retry** the transfer (a retry answered `unavailable` is indistinguishable from a drop that was already claimed, so a retry cannot resolve the ambiguity and can only compound it), and **do not record the drop as spent** (it may not be). Keep whatever was staged out of reach, surface the drop id for an operator, and let the TTL settle it. A receiver that maps this onto `transfer_failed` is asserting the payload survived, which it does not know; one that maps it onto success is asserting it was verified, which it also does not know."
+  },
   "version_notes": {
     "lossless_claim": "Version 2 added `max_response_bytes` on `claim`, the `response_too_large` error and `protocol_version` on the `create` response. Only a version 2 broker refuses an oversized claim *before* consuming it; a version 1 broker accepts the field, ignores it, and destroys the payload as it answers. A client therefore reads `protocol_version` rather than assuming the capability from its own age — the field is absent on version 1, and absence means 1.",
+    "file_claim": "The framed transfer (`begin_file_claim` / `commit_file_claim`, the `transfer_failed` error, `file_claim_protocol` on `create`) is additive and deliberately *not* a version 3. Nothing a version 2 client sends or reads changed: it never names the new ops, never receives `transfer_failed` — that error is reachable only from them — and ignores one more field on `create` exactly as it already ignores `payload_kinds`. Versioning it would have forced every text-only client to widen its accepted-version check for a capability it will never use, and the capability is already advertised as a field a client can test for.",
     "compatibility": "Additive. A version 1 client sends no new field and reads no new field, and behaves against a version 2 broker exactly as it did against a version 1 one."
   },
   "notice_platforms": ["discord", "telegram", "plain"],
-  "errors": ["invalid_request", "response_too_large", "unavailable"],
+  "errors": ["invalid_request", "response_too_large", "transfer_failed", "unavailable"],
   "error_notes": {
-    "invalid_request": "A caller mistake: unknown op, missing or ill-typed field, oversized line, unsupported notice_platform, unusable max_response_bytes. Never a statement about a handoff.",
+    "invalid_request": "A caller mistake: unknown op, missing or ill-typed field, oversized line, unsupported notice_platform, unusable max_response_bytes, an op sent in a phase the connection is not in — including a `commit_file_claim` while a frame is still outstanding, which is how an early commit is refused whatever the payload's size. Never a statement about a handoff.",
     "unavailable": "One body for missing, malformed, expired, consumed and lapsed. A content invariant, not a timing one: `await` blocks only for a live pending handoff and therefore leaks liveness to its local caller by construction.",
+    "transfer_failed": "The two file-claim ops only. When the broker sends it, it means exactly one thing and a client may rely on it: **nothing was consumed**. The payload is untouched, still `submitted`, still one-shot, and still claimable by the next `begin_file_claim` until the TTL lapses. It is deliberately distinguishable from `unavailable`, which a client is entitled to read as \"this drop is over\": a transfer that hit a busy lease, a lapsed lease or a digest mismatch must not be recorded as a spent drop, because that would manufacture the loss the refusal just prevented. It carries a `reason` for local diagnosis — `transfer_in_progress`, `lease_expired`, `lease_not_yours`, `transfer_id_mismatch`, `incomplete_transfer`, `size_mismatch`, `digest_mismatch`, `handoff_expiring`, `attempt_budget_spent` — which is a statement about the transfer and never about a payload, a filename or a caller's identity. `ack_frame` adds `frame_ack_mismatch` and `frame_ack_out_of_order`, and `commit_file_claim` adds `frames_not_acked`. Reachable only through the 0600 socket, by a caller already trusted with the plaintext.\n\nThe guarantee is scoped to refusals the broker actually spoke. A receiver that never read an answer knows nothing about what the broker did, and must not borrow this error to say it does: if it had already written a commit, the outcome is `transfer_indeterminate` (see `file_claim.client_verdicts`). A receiver may still use `transfer_failed` for a failure of its own that provably preceded the commit — an abandoned stream, a truncated read — because in those cases no commit existed to be accepted.",
     "response_too_large": "`claim` only, and only when the caller advertised a max_response_bytes the answer would not fit in. Nothing is consumed: the payload is untouched, still one-shot, and still claimable by a reader that can hold it until the TTL lapses. Carries required_bytes and max_response_bytes so an operator can act on the mismatch. It is deliberately distinguishable from `unavailable` — it is a statement about the caller's own reader, not about the handoff — and it does tell that caller a payload of that size is waiting. Acceptable for the same reason `await`'s timing leak is: `claim` is reachable only through the 0600 socket, by a caller already trusted with the plaintext."
   },
   "ops": {
@@ -61,6 +86,7 @@
         "ok": true,
         "protocol_version": "number: the protocol this broker speaks; absent means 1",
         "payload_kinds": "array of the payload kinds this broker can mint; absent means [\"text\"]",
+        "file_claim_protocol": "number: the framed file-transfer revision this broker speaks (see file_claim); absent means it cannot transfer file bytes at all, whatever payload_kinds says",
         "payload_kind": "string: the kind this handoff was minted as, `text` or `files`",
         "handoff_id": "22 base64url characters; non-secret and safe to log",
         "url": "<base>/#<capability> — the capability rides in the fragment and appears nowhere else",
@@ -108,6 +134,94 @@
         "ok": true,
         "handoff_id": "string",
         "plaintext_b64": "base64 of the payload bytes — transport encoding for the JSON line, not a protection measure"
+      }
+    },
+    "begin_file_claim": {
+      "summary": "Take the one transfer lease on a submitted `files` drop and stream its bytes. Phase 1 of 2: it hands over bytes and consumes nothing. Files drops only — a `text` drop answers `unavailable` here, exactly as a `files` drop does at `claim`.",
+      "request": {
+        "op": "begin_file_claim",
+        "handoff_id": { "type": "string", "optional": false },
+        "lease_ms": {
+          "type": "number",
+          "optional": true,
+          "note": "A positive integer that may only *narrow* the broker's own lease (HANDOFF_FILE_CLAIM_LEASE_MS, 60000 by default); a larger value is clamped down to it. A receiver that knows it writes to a slow disk cannot buy more time here — that is an operator's decision, because the lease is what bounds how long one drop can hold the live-file budget hostage. Ill-typed values are refused with invalid_request rather than ignored. The result is additionally clamped to the handoff's own remaining time, so `lease_expires_at` is never a deadline the broker cannot honour; when too little of the TTL is left to be worth streaming for, the begin is refused with `transfer_failed` / `handoff_expiring` *before* any bytes move, rather than after a full transfer the commit could not have settled."
+        }
+      },
+      "response": {
+        "ok": true,
+        "handoff_id": "string",
+        "transfer_id": "22 base64url characters, fresh per lease. Not a credential: the lease is bound to this connection, so the id only lets a commit name which transfer it is committing.",
+        "lease_expires_at": "epoch milliseconds; the frames and the commit must both land before it",
+        "total_bytes": "number: the sum of every entry's size, and exactly how many payload bytes the frames carry",
+        "files": "array in transfer order of { name, size, type }: the display name the manifest carried (already canonical — never a path and never to be joined onto one), its exact byte length, and the untrusted MIME hint, which may be empty. No digest — see file_claim.digests_are_not_echoed",
+        "then": "the frame for file 0, on this connection, immediately after this line. The broker then waits for its `ack_frame` before writing file 1"
+      },
+      "errors": {
+        "unavailable": "unknown, expired, still pending, already claimed, or a text drop",
+        "transfer_failed": "reason `transfer_in_progress`: another connection holds the lease, including one that took it during this request's own manifest pass. reason `handoff_expiring`: too little of the handoff's TTL is left for a transfer to be committable. reason `attempt_budget_spent`: this handoff has already granted its bounded number of leases without a commit; the payload is still there and still lapses on its TTL, but no further manifest pass will be spent on it. Nothing was consumed in any of the three",
+        "invalid_request": "missing or ill-typed handoff_id or lease_ms, or a connection that already holds a lease"
+      }
+    },
+    "ack_frame": {
+      "summary": "Acknowledge one frame the receiver has read and hashed, so the broker will send the next. It consumes nothing and it is the step that makes receipt size-independent (see file_claim.receipt). Accepted only on the connection holding the lease, and only for the frame that is currently outstanding.",
+      "request": {
+        "op": "ack_frame",
+        "transfer_id": { "type": "string", "optional": false, "note": "The transfer id this connection's begin_file_claim answered with." },
+        "index": {
+          "type": "number",
+          "optional": false,
+          "note": "The position in the manifest of the frame being acked. Must be exactly the outstanding one: acks are strictly in order, and an index that is not the expected one is a refusal rather than something to reorder."
+        },
+        "size": {
+          "type": "number",
+          "optional": false,
+          "note": "How many bytes that frame delivered. Must equal the manifest entry's size."
+        },
+        "sha256": {
+          "type": "string",
+          "optional": false,
+          "note": "64 lowercase hex characters, computed over the bytes that frame actually delivered. Compared against the container's own manifest, which the broker has and the receiver was never given."
+        }
+      },
+      "response": {
+        "ok": true,
+        "index": "number: the frame that was acked",
+        "next_index": "number: the frame the broker has just written and is now waiting on, or null when that was the last one — at which point the only op left is commit_file_claim"
+      },
+      "errors": {
+        "transfer_failed": "reason `frame_ack_mismatch` (the size or the digest disagrees with the manifest) or `frame_ack_out_of_order` (an index other than the outstanding one). Nothing was consumed; the lease is released and a fresh begin_file_claim can try again",
+        "unavailable": "the handoff was destroyed under the transfer, or was already claimed",
+        "invalid_request": "missing or ill-typed fields, a connection that holds no lease, or an ack sent when no frame is outstanding"
+      }
+    },
+    "commit_file_claim": {
+      "summary": "Acknowledge a fully received and verified transfer, and retire the payload. The last step, and the only thing in the protocol that consumes a `files` drop. Accepted only on the connection that opened the lease, and only once every frame has been acked.",
+      "request": {
+        "op": "commit_file_claim",
+        "handoff_id": { "type": "string", "optional": false, "note": "Must be the handoff this connection's lease is on." },
+        "transfer_id": { "type": "string", "optional": false, "note": "Must be the transfer id the matching begin_file_claim answered with." },
+        "received_bytes": {
+          "type": "number",
+          "optional": false,
+          "note": "Total payload bytes the client actually received across all frames, length prefixes excluded. Must equal total_bytes."
+        },
+        "digests": {
+          "type": "array",
+          "optional": false,
+          "note": "One 64-character lowercase-hex SHA-256 per file, in transfer order, each computed over the bytes that file's frame actually delivered. The broker compares them against the container's own manifest; a mismatch is a refusal and not a retirement."
+        }
+      },
+      "response": {
+        "ok": true,
+        "handoff_id": "string",
+        "status": "claimed",
+        "files": "number: how many files were transferred",
+        "bytes": "number: how many payload bytes were transferred"
+      },
+      "errors": {
+        "transfer_failed": "reason `lease_expired`, `lease_not_yours`, `transfer_id_mismatch`, `frames_not_acked`, `incomplete_transfer`, `size_mismatch` or `digest_mismatch`. Nothing was consumed; the handoff is back to `submitted` and a fresh begin_file_claim can try again",
+        "unavailable": "the handoff was destroyed during the transfer, or was already claimed — there is nothing left to commit. Rare on the wire and deliberately so: a destroy drops the lease holder's connection, and the lease deadline is clamped inside the handoff's own TTL, so a receiver normally meets a closed connection rather than this line. It remains reachable in the narrow race where a commit is processed after the handoff lapsed but before the release reached the socket, and it is the answer an in-process caller gets",
+        "invalid_request": "missing or ill-typed fields, a connection that holds no lease, or a commit sent while a frame is still outstanding — the early-commit case, refused identically at every payload size (see file_claim.receipt). A commit is never accepted on a connection that did not open the transfer, whatever ids it names"
       }
     }
   },

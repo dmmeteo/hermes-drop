@@ -34,7 +34,12 @@ import {
   fileContainerCeiling,
 } from '../src/file-container.js';
 import { AEAD_TAG_BYTES } from '../src/hpke-suite.js';
-import { createFileDrop, splitHandoffUrl, startTestBroker } from './helpers/harness.js';
+import {
+  claimFileDrop,
+  createFileDrop,
+  splitHandoffUrl,
+  startTestBroker,
+} from './helpers/harness.js';
 
 const TTL_SECONDS = 120;
 const utf8 = (text) => new TextEncoder().encode(text);
@@ -465,7 +470,7 @@ describe('the advertised body ceiling holds a maximal container', () => {
       'a submitted drop can never need a widened body again',
     );
 
-    core.testClaimFileDrop(submitted.id);
+    assert.equal((await claimFileDrop(broker, submitted.id)).ok, true);
     assert.equal(core.submitBodyCeiling(submitted.capability), textCeiling, 'claimed');
 
     const expired = await createFileDrop(broker, { ttlSeconds: TTL_SECONDS });

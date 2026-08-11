@@ -27,7 +27,12 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import { fetchMetadata, sealEnvelope, submitEnvelope } from '../src/client/handoff-client.js';
 import { DEFAULTS } from '../src/config.js';
 import { DEFAULT_FILE_LIMITS, fileContainerCeiling } from '../src/file-container.js';
-import { createFileDrop, splitHandoffUrl, startTestBroker } from './helpers/harness.js';
+import {
+  claimFileDrop,
+  createFileDrop,
+  splitHandoffUrl,
+  startTestBroker,
+} from './helpers/harness.js';
 
 const MIB = 1024 * 1024;
 const TTL_SECONDS = 120;
@@ -219,11 +224,17 @@ describe('the live-file budget', () => {
     assert.equal(await drop.send(await drop.seal(SAMPLE_FILES)), 'received');
     assert.equal(budget().reservedBytes, DEFAULT_DROP_BYTES);
 
-    const claimed = core.testClaimFileDrop(drop.id);
+    // The real claim path: a framed transfer over the control socket, committed
+    // with digests the receiver computed. Nothing else retires a file payload, so
+    // nothing else can prove the reservation is given back when one does.
+    const claimed = await claimFileDrop(broker, drop.id);
     assert.equal(claimed.ok, true, JSON.stringify(claimed));
-    assert.equal(claimed.files, 1);
+    assert.equal(claimed.fileCount, 1);
     assert.equal(claimed.bytes, SAMPLE_FILES[0].bytes.length);
-    assert.ok(!('plaintext' in claimed), 'the retirement seam hands over no bytes');
+    assert.ok(
+      !('plaintext_b64' in claimed),
+      'no seam on this path base64s a payload into a line; the bytes came over the stream',
+    );
 
     assert.equal(broker.testSnapshot(drop.id).state, 'claimed');
     assert.equal(broker.testSnapshot(drop.id).hasPlaintext, false);
@@ -239,11 +250,11 @@ describe('the live-file budget', () => {
     const drop = await createFileDrop(broker, { ttlSeconds: TTL_SECONDS });
     assert.equal(await drop.send(await drop.seal(SAMPLE_FILES)), 'received');
 
-    assert.equal(core.testClaimFileDrop(drop.id).ok, true);
+    assert.equal((await claimFileDrop(broker, drop.id)).ok, true);
     assert.equal(budget().reservedBytes, 0);
     // A second claim, then expiry, then shutdown: the receipt is destroyed once
     // more but its reservation was already given back.
-    assert.equal(core.testClaimFileDrop(drop.id).ok, false);
+    assert.equal((await claimFileDrop(broker, drop.id)).ok, false);
     core.sweep(Date.now() + TTL_SECONDS * 1000 + 1);
     core.destroyAll();
     assert.equal(budget().reservedBytes, 0, 'no double release, and no negative counter');

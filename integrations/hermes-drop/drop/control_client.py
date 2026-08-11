@@ -40,7 +40,40 @@ NOTICE_PLATFORMS: Sequence[str] = ("discord", "telegram", "plain")
 PROTOCOL_VERSION = 2
 
 #: contract/control-protocol.json -> errors
-ERRORS: Sequence[str] = ("invalid_request", "response_too_large", "unavailable")
+ERRORS: Sequence[str] = (
+    "invalid_request",
+    "response_too_large",
+    "transfer_failed",
+    "unavailable",
+)
+
+#: contract/control-protocol.json -> file_claim.protocol. The framed file-transfer
+#: revision *this client* implements; see :func:`supports_file_claim` for what the
+#: broker on the other end implements.
+FILE_CLAIM_PROTOCOL = 1
+
+#: A file transfer failed and **nothing was consumed**: the payload is untouched,
+#: still one-shot, and still claimable by the next ``begin_file_claim``. Named for
+#: the same reason as :data:`RESPONSE_TOO_LARGE` and it matters more here, because a
+#: transfer has many more ways to fail than a claim does — a busy lease, a lapsed
+#: lease, a digest that did not match. A caller that recorded any of those as a spent
+#: drop would manufacture the loss the two-phase protocol exists to prevent.
+TRANSFER_FAILED = "transfer_failed"
+
+#: contract/control-protocol.json -> file_claim.client_verdicts
+#:
+#: A verdict this side produces, never a line the broker sends — which is why it is
+#: deliberately **not** in :data:`ERRORS`. It means the commit was written and no
+#: answer was read: the connection closed, or this client stopped waiting. The commit
+#: is one-shot, non-idempotent and not requeryable, so the payload may have been
+#: retired with only the answer lost.
+#:
+#: There is exactly one safe response, and it is none of the obvious ones: publish
+#: nothing (the verification verdict never arrived), retry nothing (a retry answered
+#: ``unavailable`` cannot be told apart from a drop that was already claimed, so it
+#: adds ambiguity rather than resolving it), and record nothing as spent (it may not
+#: be). Surface the drop id for an operator and let the TTL settle it.
+TRANSFER_INDETERMINATE = "transfer_indeterminate"
 
 #: The broker refused *before consuming* because the answer would not fit in the
 #: ``max_response_bytes`` this client advertised. Named because it is the one
@@ -145,6 +178,30 @@ def supports_lossless_claim(created: Optional[Mapping[str, Any]]) -> bool:
     if isinstance(version, bool) or not isinstance(version, int):
         return False
     return version >= PROTOCOL_VERSION
+
+
+def supports_file_claim(created: Optional[Mapping[str, Any]]) -> bool:
+    """Can the broker that answered *created* hand back file bytes at all?
+
+    ``payload_kinds`` containing ``files`` is not the same question and does not
+    answer this one. For one release the broker could mint a ``files`` drop and had
+    no way to transfer it — the bytes are deliberately not retrievable through
+    ``claim`` — so a plugin that checked only the payload kind would post a link,
+    let the user upload 42 MiB, and then discover there was no way to collect it.
+    Both capabilities are therefore checked, and this one is checked *before* a link
+    is posted.
+
+    Absence means "cannot", for the same reason it does in
+    :func:`supports_lossless_claim`: a broker without the capability published no
+    field at all, and unknown is not "probably fine" when the cost of being wrong is
+    a drop the user filled in and nobody can read.
+    """
+    if not isinstance(created, Mapping):
+        return False
+    revision = created.get("file_claim_protocol")
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        return False
+    return revision >= FILE_CLAIM_PROTOCOL
 
 
 async def control_request(
@@ -296,6 +353,7 @@ async def claim(
 
 __all__ = [
     "BROKER_UNAVAILABLE",
+    "FILE_CLAIM_PROTOCOL",
     "DEFAULT_CONTROL_SOCKET",
     "DEFAULT_TIMEOUT_SECONDS",
     "ERRORS",
@@ -306,9 +364,12 @@ __all__ = [
     "NOTICE_PLATFORMS",
     "PROTOCOL_VERSION",
     "RESPONSE_TOO_LARGE",
+    "TRANSFER_FAILED",
+    "TRANSFER_INDETERMINATE",
     "await_submission",
     "claim",
     "control_request",
     "create",
+    "supports_file_claim",
     "supports_lossless_claim",
 ]

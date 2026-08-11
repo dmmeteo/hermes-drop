@@ -249,6 +249,28 @@ class BrokerHandle:
         line = self.proc.stdout.readline().strip()
         return line
 
+    def submit_files(self, url: str, files: "list[tuple[str, bytes]]") -> str:
+        """Submit a real HDROP2 container to a ``files`` drop, in the harness.
+
+        ``--public`` mode only, and the same production path ``submit`` uses: the
+        container comes from ``src/file-container.js`` and is sealed as envelope
+        v2, so a Python receiver reading the framed transfer is reading bytes the
+        browser's own encoder produced.
+
+        Names are base64'd on the wire because this protocol is whitespace
+        separated and a filename is allowed to contain spaces.
+        """
+        parts = [
+            f"{base64.b64encode(name.encode('utf-8')).decode('ascii')}:"
+            f"{base64.b64encode(content).decode('ascii')}"
+            for name, content in files
+        ]
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(f"SUBMIT_FILES {url} {' '.join(parts)}\n")
+        self.proc.stdin.flush()
+        assert self.proc.stdout is not None
+        return self.proc.stdout.readline().strip()
+
     def stop(self) -> None:
         if self.proc.poll() is None:
             self.proc.terminate()

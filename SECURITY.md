@@ -87,14 +87,25 @@ other states, and no state carries a payload it is not named for.
 | --- | --- | --- | --- |
 | `pending` | yes | no | `create` |
 | `submitted` | no | yes | the one envelope that decrypted |
-| `claimed` | no | no | the one `claim` that was handed over |
+| `transferring` | no | yes | `begin_file_claim` — a substate of `submitted`, files drops only |
+| `claimed` | no | no | the one claim that was handed over |
 | destroyed | no | no | TTL lapse, AEAD-failure budget, container-failure budget, shutdown |
 
 Key material exists **exactly** in `pending`, and the payload exists **exactly**
-in `submitted`. Those are checked invariants rather than descriptions: every step
-of every lifecycle test asserts `hasPrivateKey === (state is pending)` and
-`hasPlaintext === (state is submitted)`, so "the key is gone" and "the payload is
-gone" are observable facts, not intentions.
+in `submitted` or `transferring`. Those are checked invariants rather than
+descriptions: every step of every lifecycle test asserts
+`hasPrivateKey === (state is pending)` and `hasPlaintext === (state is submitted)`,
+so "the key is gone" and "the payload is gone" are observable facts, not
+intentions.
+
+`transferring` is a payload-bearing substate and nothing more. It is unreachable
+for a text drop, it holds the same bytes `submitted` held, and every seam answers
+in it exactly as it answers in `submitted` — including `await`, which reports
+`submitted`, because whether a local receiver is currently reading a payload is not
+news about whether the browser sent one. It exists because a 42 MiB container
+cannot be handed over in one response line, so its claim is two operations with a
+stream between them, and the state machine has to be able to say "handed out but
+not yet given up".
 
 Destruction removes the record from both indexes, so `destroyed` has no
 observable form beyond the record's absence — a destroyed handoff and one that
@@ -116,6 +127,49 @@ pending ──one envelope decrypts──► submitted ──one claim──► 
   them, so exactly one submit wins however many arrive at once.
 - **`submitted → claimed`** — one `claim` hands the bytes to the local caller.
   Also synchronous, so a second concurrent claim can never observe `submitted`.
+- **`submitted → transferring → claimed`** — a *file* drop's claim, which is a
+  conversation rather than one operation because its payload is too large for one
+  response line. `begin_file_claim` takes the one transfer lease and writes the first
+  frame; the receiver reads it, hashes it and sends an `ack_frame`; the broker checks
+  that ack against the manifest and only then writes the next frame; and
+  `commit_file_claim` retires the payload once every frame has been acked, which
+  nothing else does. The commit is accepted only on the connection that opened the
+  lease. The broker deliberately never sends the digests, so an ack is evidence of
+  receipt rather than an assertion about it.
+
+  One frame at a time is not politeness — it is what makes that evidence
+  size-independent. A socket write completes when the *kernel* takes the bytes, so an
+  earlier revision that streamed everything and totalled it at the end accepted an
+  early commit for any payload below the send buffer (a tunable, ~208 KiB) and refused
+  it above. An ack cannot be produced by a kernel: to answer, a receiver must have read
+  the frame and hashed it. What remains forgeable is a caller that already knows the
+  plaintext, and no exchange on this socket can change that — the socket is `0600` and
+  that caller is already trusted with the payload. What the acks guarantee, uniformly at
+  16 bytes and at 42 MiB, is that an ordinary or buggy receiver cannot retire a payload
+  it never read.
+- **`transferring → submitted`** — every way a transfer can fail: the receiver
+  disconnects or half-closes, the bounded lease deadline
+  (`HANDOFF_FILE_CLAIM_LEASE_MS`, 60 s by default) lapses, or a commit is refused
+  for a byte count, a digest that does not match, or arriving out of turn. The
+  payload is untouched and still one-shot, so the next `begin_file_claim` can
+  collect it. This is the one edge in the machine that goes *backwards*, and it is
+  what makes a lossy local receiver cost a refusal instead of the user's files. It is
+  answered with `transfer_failed`, which a client must not treat like `unavailable`:
+  the first means the drop is still there, the second means it is over.
+
+  Repeatable, but not without limit. Each granted lease costs a full SHA-256 pass
+  over the container and a failed transfer restores the drop for free, so one handoff
+  grants at most `HANDOFF_MAX_TRANSFER_ATTEMPTS` (8) leases and then refuses with
+  `transfer_failed` / `attempt_budget_spent`. Unlike the submit path's container
+  budget this does **not** destroy the drop: the container is known good and the
+  failures are the receiver's, so destroying would throw away the user's files over a
+  broken consumer. The payload stays and lapses on its own TTL.
+
+  The lease deadline is also clamped inside the handoff's own expiry, and a `begin`
+  is refused outright (`transfer_failed` / `handoff_expiring`) when less than a
+  second of TTL remains. Publishing a deadline the broker cannot honour would mean
+  streaming up to 42 MiB and then destroying the payload under a receiver that did
+  everything right.
 - **`pending → destroyed`** — the AEAD-failure budget (`HANDOFF_MAX_AEAD_FAILURES`,
   3 by default) is spent, so the submit endpoint cannot become a retry oracle.
   Only a `pending` handoff can reach the AEAD at all, so only a `pending` handoff
@@ -142,11 +196,18 @@ There is no edge back. Nothing returns a handoff to `pending`, nothing re-arms a
 A file drop walks the same machine with two differences, both deliberate. Its
 `pending → submitted` edge additionally requires the decrypted payload to be a
 valid HDROP2 container, so the record never reaches `submitted` holding bytes
-nobody has verified; and it has no `submitted → claimed` edge yet, because `claim`
-answers the uniform `unavailable` for a file drop rather than base64 a 42 MiB
-container into one newline-delimited response line. Until the framed transfer
-lands (`docs/FILE_TRANSFER_MVP.md`, slice 3) a file drop leaves the machine only
-by TTL lapse, a spent failure budget or shutdown.
+nobody has verified; and it reaches `claimed` through the two-phase framed
+transfer above rather than through `claim`, which answers the uniform
+`unavailable` for a file drop rather than base64 a 42 MiB container into one
+newline-delimited response line.
+
+A live transfer keeps its live-file reservation for as long as it holds the lease,
+which is why the lease has a deadline at all: a receiver that crashed mid-transfer
+must not be able to hold a quarter of the process-wide file budget until the TTL
+lapses. Expiry and shutdown reach a `transferring` record like any other — the
+lease holder is told, its connection is dropped, and the reservation is released
+before the bytes are wiped, so nothing is left streaming views into a payload that
+has already been zeroized.
 
 Creation of a file drop is also refusable in a way a text drop's is not: each one
 reserves the largest plaintext it could hold (42 MiB plus its container header and
@@ -165,11 +226,25 @@ drop.
 | `POST /api/submit`, same envelope | received | received | received | unavailable |
 | `POST /api/submit`, different envelope | received¹ | unavailable | unavailable | unavailable |
 | `await` | blocks, then unavailable | submitted | unavailable | unavailable |
-| `claim` | unavailable | **the payload, once** | unavailable | unavailable |
+| `claim` | unavailable | **the payload, once** — text drops only² | unavailable | unavailable |
+| `begin_file_claim` | unavailable | **the manifest and the frames** — files drops only² | unavailable | unavailable |
+| `commit_file_claim` | invalid_request³ | invalid_request³ | invalid_request³ | invalid_request³ |
 
 ¹ Against a `pending` handoff a "different" envelope is simply the first submit,
 and wins like any other. Only after one has won does a second, different envelope
 become the refusal that row is about.
+
+² The two claim paths are exclusive by payload kind, and each answers the uniform
+`unavailable` for the other's kind. `transferring` is not a column because every
+row answers there exactly as it does under `submitted`, with one addition: a
+second `begin_file_claim` is refused with `transfer_failed` / `transfer_in_progress`
+rather than `unavailable`, because the payload is still there and the caller is
+entitled to try again.
+
+³ A commit is accepted only on a connection that personally opened a lease and
+streamed all of it. There is no state of the handoff in which a commit from
+anywhere else is honoured, so the answer is about the caller rather than about the
+handoff — which is why it is `invalid_request` and not `unavailable`.
 
 Three properties hold across that whole table:
 
@@ -183,10 +258,30 @@ Three properties hold across that whole table:
   the retirement: the handoff is still `submitted`, still holding the same bytes,
   still one-shot, and still claimable by a reader that can hold it. It is
   repeatable and costs nothing each time.
+- **A failed transfer is never a retirement.** A file claim retires the payload at
+  the commit and nowhere else, so a disconnect, a truncated write, a lapsed lease,
+  a mismatched digest or a commit from a connection that does not hold the lease
+  all cost a refusal and leave the drop `submitted` and collectable. The refusal
+  says so: `transfer_failed` means nothing was consumed.
+- **The conversation is turn-taking, and enforced structurally rather than by
+  timing.** Each op is accepted in exactly one state: `ack_frame` only while a frame is
+  outstanding, `commit_file_claim` only once every frame has been acked. A commit
+  pipelined behind the begin, sent instead of an ack, or sent while a frame is still
+  outstanding is refused with `invalid_request` — identically at every payload size.
+  Nothing legitimate is lost: a receiver cannot have hashed bytes it had not read.
+- **One outcome is unknown, and is named rather than guessed.** `commit_file_claim`
+  is one-shot, non-idempotent and not requeryable. A receiver that wrote one and read
+  no answer — the connection closed, or its own deadline elapsed — cannot tell an
+  accepted commit whose answer was lost from one that never landed, so it reports
+  `transfer_indeterminate`, a verdict the broker never sends. The only safe response
+  is to publish nothing, retry nothing and record nothing as spent, and let the TTL
+  settle it. Reporting `transfer_failed` there would assert the payload survived;
+  reporting success would assert it was verified. Neither is known.
 - **A malformed call is never a transition.** Ill-typed handoff ids, unknown ops,
   unusable ceilings, garbage envelopes, capabilities that are not capabilities:
   all are refused with the contract's own vocabulary (`unavailable`,
-  `invalid_request`, `response_too_large`) and leave the machine where it was.
+  `invalid_request`, `response_too_large`, `transfer_failed`) and leave the machine
+  where it was.
 
 ### What deletion guarantees
 

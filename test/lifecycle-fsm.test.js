@@ -17,6 +17,13 @@
 //              indexes, so `destroyed` has no externally observable form beyond
 //              the absence of the record. Tests spell it `gone` for that reason.
 //
+// One state is deliberately absent from this file: `transferring`, the substate a
+// file drop enters while its container is being streamed to a local receiver. It
+// is unreachable for a text drop — the whole machine here — and it is pinned as a
+// machine of its own in test/file-claim-transfer.test.js. What this file does
+// assert about it is the boundary: the two file-claim ops appear in the malformed
+// battery below, so a text handoff cannot be moved by them from any state.
+//
 // The broker is driven through its real seams wherever one exists (the browser
 // client for metadata/submit, the control socket for await/claim) so that what is
 // pinned is the machine an operator and a browser actually meet. The in-process
@@ -569,6 +576,21 @@ describe('lifecycle: the broker state machine', () => {
         ['create with a negative ttl', { op: 'create', ttl_seconds: -60 }],
         ['create with an over-policy ttl', { op: 'create', ttl_seconds: 999_999 }],
         ['create for an unknown platform', { op: 'create', notice_platform: 'irc' }],
+        // The file-claim ops, against the text machine they have no business in.
+        // A text drop has no container to transfer, so every one of these is a
+        // refusal from a state that must not move — including the commit, which is
+        // the one call in the protocol that can retire a payload and is here
+        // precisely because it must never do so for a caller with no lease.
+        ['begin a transfer with no id', { op: 'begin_file_claim' }],
+        ['begin a transfer with a numeric id', { op: 'begin_file_claim', handoff_id: 42 }],
+        ['begin a transfer on a text drop', { op: 'begin_file_claim', handoff_id: handoff.id }],
+        ['commit a transfer nobody began', {
+          op: 'commit_file_claim',
+          handoff_id: handoff.id,
+          transfer_id: 'AAAAAAAAAAAAAAAAAAAAAA',
+          received_bytes: 0,
+          digests: [],
+        }],
       ]) {
         record(label, await broker.control(request));
       }

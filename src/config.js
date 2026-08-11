@@ -64,6 +64,45 @@ const DEFAULT_FILE_SUBMIT_TIMEOUT_MS = 600_000;
  */
 const DEFAULT_BODY_OVERRUN_ALLOWANCE_BYTES = 1024 * 1024;
 
+/**
+ * How long one file-claim transfer lease may live (docs/FILE_TRANSFER_MVP.md,
+ * "Lifecycle changes": a bounded lease timeout returns `transferring` to
+ * `submitted`).
+ *
+ * It bounds two different things at once, which is why it is an operator's number
+ * and a receiver may only narrow it. It is the longest a crashed or wedged
+ * receiver can keep a drop out of reach of the next one — and, because a leased
+ * drop still holds its live-file reservation, the longest it can hold a quarter of
+ * the process-wide file budget without making progress.
+ *
+ * 60 seconds is generous for what happens inside a lease: the bytes travel over a
+ * Unix socket, and the receiver's real work is hashing them and writing them to a
+ * local disk. A maximal 42 MiB drop needs roughly two seconds of that on an
+ * ordinary SSD and well under twenty on a slow one.
+ */
+const DEFAULT_FILE_CLAIM_LEASE_MS = 60_000;
+
+/**
+ * How many transfer leases one handoff will grant without a commit.
+ *
+ * Each granted lease costs a full SHA-256 pass over the container — up to 42 MiB of
+ * event-loop-blocking hashing — and a failed transfer deliberately restores the drop
+ * for free, so the pass is repeatable for the whole TTL unless it is bounded. The
+ * submit path bounds container validation the same way and for the same stated
+ * reason (`containerFailures`, `src/broker.js`).
+ *
+ * It differs from that one in what happens when the budget is spent: the submit path
+ * destroys the drop, because the caller there is proving it cannot produce a valid
+ * container. Here the container is known good and the failures are the *receiver's*,
+ * so destroying would throw away the user's files over a broken consumer. The
+ * handoff simply stops granting leases and lapses on its TTL.
+ *
+ * Eight leaves real room for the retries a receiver legitimately needs — a crash, a
+ * lapsed lease, a lost connection — while capping the work one drop can be made to
+ * do at roughly a second of hashing.
+ */
+const DEFAULT_MAX_TRANSFER_ATTEMPTS = 8;
+
 export const DEFAULTS = Object.freeze({
   port: 8787,
   host: '0.0.0.0',
@@ -87,6 +126,8 @@ export const DEFAULTS = Object.freeze({
   requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   fileSubmitTimeoutMs: DEFAULT_FILE_SUBMIT_TIMEOUT_MS,
   bodyOverrunAllowanceBytes: DEFAULT_BODY_OVERRUN_ALLOWANCE_BYTES,
+  fileClaimLeaseMs: DEFAULT_FILE_CLAIM_LEASE_MS,
+  maxTransferAttempts: DEFAULT_MAX_TRANSFER_ATTEMPTS,
 });
 
 const NUMERIC = new Set([
@@ -104,6 +145,8 @@ const NUMERIC = new Set([
   'requestTimeoutMs',
   'fileSubmitTimeoutMs',
   'bodyOverrunAllowanceBytes',
+  'fileClaimLeaseMs',
+  'maxTransferAttempts',
 ]);
 
 const ENV_KEYS = {
@@ -124,6 +167,8 @@ const ENV_KEYS = {
   HANDOFF_REQUEST_TIMEOUT_MS: 'requestTimeoutMs',
   HANDOFF_FILE_SUBMIT_TIMEOUT_MS: 'fileSubmitTimeoutMs',
   HANDOFF_BODY_OVERRUN_ALLOWANCE_BYTES: 'bodyOverrunAllowanceBytes',
+  HANDOFF_FILE_CLAIM_LEASE_MS: 'fileClaimLeaseMs',
+  HANDOFF_MAX_TRANSFER_ATTEMPTS: 'maxTransferAttempts',
 };
 
 /** The environment key an operator would have set to produce this config key. */
@@ -247,6 +292,28 @@ export function loadConfig(overrides = {}, env = process.env) {
     config.bodyOverrunAllowanceBytes < 0
   ) {
     throw new Error(`${ENV_KEY_FOR.bodyOverrunAllowanceBytes} must be a non-negative integer`);
+  }
+  // A lease may be raised as well as lowered — how long a receiver legitimately
+  // needs is a fact about the operator's disk, not a security ceiling — but it may
+  // not outlive the longest drop this broker will mint, because a lease on a
+  // handoff that has already lapsed cannot be committed.
+  if (!Number.isSafeInteger(config.fileClaimLeaseMs) || config.fileClaimLeaseMs < 1) {
+    throw new Error(`${ENV_KEY_FOR.fileClaimLeaseMs} must be a positive integer`);
+  }
+  // At least two, or a single transient failure would strand a payload nobody can
+  // collect — which is the loss the whole two-phase design exists to prevent.
+  if (!Number.isSafeInteger(config.maxTransferAttempts) || config.maxTransferAttempts < 2) {
+    throw new Error(
+      `${ENV_KEY_FOR.maxTransferAttempts} must be an integer of at least 2: one transfer must ` +
+        'be retriable after a receiver crash, or a lost connection would strand the payload',
+    );
+  }
+  if (config.fileClaimLeaseMs > config.maxTtlSeconds * 1000) {
+    throw new Error(
+      `${ENV_KEY_FOR.fileClaimLeaseMs} (${config.fileClaimLeaseMs}) exceeds the longest drop ` +
+        `this broker will mint (${ENV_KEY_FOR.maxTtlSeconds}=${config.maxTtlSeconds}s): a lease ` +
+        'on a handoff that has already lapsed could never be committed',
+    );
   }
 
   if (config.baseUrl) config.baseUrl = config.baseUrl.replace(/\/+$/, '');

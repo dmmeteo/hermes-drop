@@ -12,6 +12,24 @@ import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
 
 const MAX_CONTROL_LINE_BYTES = 4096;
 
+/**
+ * The framed file-transfer revision this broker speaks, published on every
+ * `create` (docs/FILE_TRANSFER_MVP.md, slice 3).
+ *
+ * Separate from `PROTOCOL_VERSION` on purpose. Adding the transfer is additive —
+ * a text-only client sends none of it, receives none of it, and could not tell a
+ * broker with it from a broker without — so bumping the protocol version would
+ * have forced every such client to widen an accepted-version check for a
+ * capability it will never use. What a *file* client needs is not a version
+ * ordering but a yes-or-no answer, before it posts a link, and that is what this
+ * field is: absence means this broker can mint a `files` drop and cannot transfer
+ * one, which is exactly what a slice-2 broker was.
+ */
+const FILE_CLAIM_PROTOCOL = 1;
+
+/** uint32 big-endian length in front of each file's bytes. */
+const FRAME_HEADER_BYTES = 4;
+
 // The protocol this broker speaks, published on every `create` so a client that
 // upgrades on its own schedule can tell what it is talking to instead of
 // inferring it. Version 2 is the one that refuses an oversized claim before
@@ -94,27 +112,7 @@ export async function startControlServer({ socketPath, broker, logger, dirOps })
   const server = createServer({ allowHalfOpen: true }, (socket) => {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
-    let buffer = '';
-    socket.on('data', async (chunk) => {
-      buffer += chunk.toString('utf8');
-      if (buffer.length > MAX_CONTROL_LINE_BYTES) {
-        socket.end(`${JSON.stringify({ ok: false, error: 'invalid_request' })}\n`);
-        return;
-      }
-      const newline = buffer.indexOf('\n');
-      if (newline < 0) return;
-      const line = buffer.slice(0, newline);
-      buffer = '';
-      let response;
-      try {
-        response = await handleControlRequest(JSON.parse(line), broker);
-      } catch (error) {
-        logger.warn?.(`control request rejected: ${error.message}`);
-        response = { ok: false, error: 'invalid_request' };
-      }
-      socket.end(`${JSON.stringify(response)}\n`);
-    });
-    socket.on('error', (error) => logger.warn?.(`control socket error: ${error.message}`));
+    serveConnection({ socket, broker, logger });
   });
 
   await new Promise((resolve, reject) => {
@@ -140,6 +138,405 @@ export async function startControlServer({ socketPath, broker, logger, dirOps })
       await rm(socketPath, { force: true });
     },
   };
+}
+
+const INVALID_REQUEST = Object.freeze({ ok: false, error: 'invalid_request' });
+
+/**
+ * One connection, from accept to close.
+ *
+ * Nearly every op on this socket is one line in, one line out, then closed. The
+ * file claim is the exception and the reason this function exists: it is a
+ * *conversation* — a begin, a metadata line, length-framed binary, a commit, an
+ * answer — and it has to be one connection rather than two round trips, because
+ * the connection is the lease.
+ *
+ * Three things follow from that and are all here rather than in the broker:
+ *
+ *   PHASE   what the connection will accept next. A commit is only ever accepted
+ *           in `awaiting_commit`, which is reachable only by having personally
+ *           begun the transfer and streamed all of it. A caller that learns a
+ *           handoff id and a transfer id therefore still cannot commit: there is
+ *           no phase it can present them in.
+ *   ORDER   data events are processed through one promise chain. Without it a
+ *           commit line pipelined behind the begin could be handled while the
+ *           frames were still going out, and the "every advertised byte was
+ *           flushed" check would be racing the writes it is about.
+ *   RELEASE the lease is given back however the connection ends — a refusal, an
+ *           error, a client that hangs up mid-frame, a process that dies. That is
+ *           what makes a failed transfer cost a refusal instead of a payload.
+ *
+ * The `session` object is also the lease's owner token. Its identity is the
+ * authorization: it never leaves this closure, so no other connection can present
+ * it and nothing on the wire can imitate it.
+ */
+function serveConnection({ socket, broker, logger }) {
+  const session = {
+    phase: 'idle',
+    lease: null,
+    /** The frame views this transfer is walking, indexed by ack (`writeFrame`). */
+    frames: null,
+    /** Which frame the receiver still owes an ack for, or null. */
+    outstandingFrame: null,
+    /**
+     * Inbound bytes seen while a frame was being written, so a flood is dropped
+     * rather than retained.
+     *
+     * A pure memory bound and deliberately *not* a turn-taking verdict. An earlier
+     * revision refused a commit because data had arrived while the broker was still
+     * writing; that inferred receipt from the socket send buffer — a tunable — and it
+     * was also a race, because a receiver can legitimately answer a large frame
+     * before the broker's own write completion fires. Turn-taking is now structural:
+     * every frame must be acked before the next is written, and a commit is only
+     * accepted once all of them are (`file_claim.turn_taking`).
+     *
+     * Why bound rather than `socket.pause()`: pausing stops Node reading the fd, so
+     * an early line accumulates in the *kernel* buffer and then arrives after the
+     * resume looking exactly like a timely one — it hides the behaviour instead of
+     * bounding it.
+     */
+    inboundDuringFrameBytes: 0,
+  };
+  let buffer = Buffer.alloc(0);
+  // Serializes the async handling of successive lines. `socket.on('data')` will
+  // happily re-enter an async listener; the file claim cannot survive that.
+  let chain = Promise.resolve();
+
+  /** Gives the lease back, if this connection still holds one. Idempotent. */
+  function releaseLease(reason) {
+    const lease = session.lease;
+    if (!lease) return;
+    session.lease = null;
+    broker.abandonFileClaim(lease.handoffId, lease.transferId, reason);
+  }
+
+  /** The last thing written on this connection: one line, then closed. */
+  function answerAndClose(response) {
+    if (session.phase === 'closed') return;
+    session.phase = 'closed';
+    // Whatever the answer is, a lease that survived to here was not committed.
+    releaseLease('connection_closed');
+    socket.end(`${JSON.stringify(response)}\n`);
+  }
+
+  /** One chunk, flushed to the peer — the unit the broker counts as progress. */
+  function write(chunk) {
+    return new Promise((resolve, reject) => {
+      if (socket.destroyed || socket.writableEnded) {
+        reject(new Error('connection closed'));
+        return;
+      }
+      socket.write(chunk, (error) => (error ? reject(error) : resolve()));
+    });
+  }
+
+  /**
+   * The broker took the lease away — the deadline lapsed, or the handoff was
+   * destroyed under it. The connection is dropped rather than answered: binary
+   * frames may be in flight, and a JSON line inserted between them would corrupt
+   * the stream, so one behaviour is used for every phase rather than two that
+   * differ by timing. The contract says so, and a receiver must treat a closed
+   * connection as a failed transfer.
+   */
+  function onLeaseLost(reason) {
+    logger.info?.(`control file claim lease lost reason=${reason}`);
+    // The broker has already released it; clearing this first is what stops the
+    // close handler from abandoning a lease that no longer exists.
+    session.lease = null;
+    session.phase = 'closed';
+    socket.destroy();
+  }
+
+  async function beginFileClaim(request) {
+    // Set before the manifest pass, which is a full SHA-256 over the container and
+    // therefore the longest window on this connection: inbound data arriving during it
+    // is bounded on the same terms as data arriving mid-frame.
+    session.phase = 'beginning';
+    if (typeof request.handoff_id !== 'string') return answerAndClose(INVALID_REQUEST);
+    const leaseMs = request.lease_ms;
+    // Ill-typed rather than ignored: a receiver that asked for a deadline and
+    // silently got a different one cannot reason about its own timeout.
+    if (leaseMs !== undefined && (!Number.isInteger(leaseMs) || leaseMs < 1)) {
+      return answerAndClose(INVALID_REQUEST);
+    }
+
+    const begun = await broker.beginFileClaim(request.handoff_id, {
+      owner: session,
+      onLeaseLost,
+      ...(leaseMs === undefined ? {} : { leaseMs }),
+    });
+    if (!begun.ok) return answerAndClose(begun);
+
+    session.lease = { handoffId: begun.handoff_id, transferId: begun.transfer_id };
+    // The frame views, held here for the life of the conversation and indexed by the
+    // `next_index` each ack answers with. Kept in this closure rather than on the
+    // broker's record so the record retains no filename and no second reference to
+    // the payload between submit and claim.
+    session.frames = begun.files;
+
+    // Metadata carries the name, the size and the untrusted MIME hint, and
+    // deliberately no digest: the receiver has to compute what it acks.
+    if (
+      !(await writeStep(
+        `${JSON.stringify({
+          ok: true,
+          handoff_id: begun.handoff_id,
+          transfer_id: begun.transfer_id,
+          lease_expires_at: begun.lease_expires_at,
+          total_bytes: begun.total_bytes,
+          files: begun.files.map((file) => ({
+            name: file.name,
+            size: file.size,
+            type: file.type,
+          })),
+        })}\n`,
+      ))
+    ) {
+      return;
+    }
+    // ...and then exactly one frame, after which the connection waits. The receiver
+    // has to read it and hash it to say anything the broker will accept.
+    await writeFrame(0);
+  }
+
+  /**
+   * Writes frame `index` and leaves the connection waiting for its ack.
+   *
+   * One frame at a time is the whole mechanism behind size-independent receipt: the
+   * broker stops here, and no amount of socket buffer can answer for the receiver.
+   */
+  async function writeFrame(index) {
+    const file = session.frames[index];
+    const header = Buffer.allocUnsafe(FRAME_HEADER_BYTES);
+    header.writeUInt32BE(file.size, 0);
+    // A lease lost mid-frame has already destroyed the socket; the phase check stops
+    // us writing views the broker may have zeroized rather than trusting `write` to
+    // notice. Checked before the header *and* between the header and the body,
+    // because the body is the write large enough for a lease to lapse underneath it.
+    session.phase = 'streaming';
+    if (!(await writeStep(header))) return;
+    // `file.bytes` is a view into the broker's container and is handed to `write` as
+    // one: a 42 MiB file is not copied to be sent.
+    if (file.size > 0 && !(await writeStep(file.bytes))) return;
+
+    // ORDER IS LOAD-BEARING — this transition must happen before this function
+    // returns, with no `await` after it and nothing deferred to a later tick.
+    //
+    // What makes the conversation race-free is that every phase change and every line
+    // dispatch happen on the one promise chain, so a line can never be judged against
+    // a phase that is mid-update. That holds only while the update is synchronous with
+    // the end of the write. Deferring it — an `await` here, a `setImmediate`, an
+    // unawaited promise — would let the ack the receiver has *already* sent be
+    // dispatched while the phase still reads `streaming`, and it would be refused as
+    // an ack with no frame outstanding. That failure is timing-dependent and would
+    // appear only under load or on large frames, which is exactly the class of bug the
+    // structural rule replaced (see `ackFileClaimFrame` in src/broker.js).
+    session.phase = 'awaiting_frame_ack';
+    session.outstandingFrame = index;
+  }
+
+  /**
+   * One write, with the failure handling every step of the conversation shares.
+   * Returns false when the connection is gone and the caller should stop.
+   */
+  async function writeStep(chunk) {
+    if (session.phase === 'closed') return false;
+    try {
+      await write(chunk);
+    } catch (error) {
+      // The peer went away mid-transfer. Nothing was consumed, and the lease goes
+      // back so the next receiver can have it without waiting out the deadline.
+      logger.warn?.(`control file claim stream failed: ${error.message}`);
+      session.phase = 'closed';
+      releaseLease('stream_failed');
+      socket.destroy();
+      return false;
+    }
+    return session.phase !== 'closed';
+  }
+
+  async function ackFrame(request) {
+    const lease = session.lease;
+    if (!lease) return answerAndClose(INVALID_REQUEST);
+    if (typeof request.transfer_id !== 'string') return answerAndClose(INVALID_REQUEST);
+    if (!Number.isInteger(request.index) || request.index < 0) {
+      return answerAndClose(INVALID_REQUEST);
+    }
+    if (!Number.isInteger(request.size) || request.size < 0) {
+      return answerAndClose(INVALID_REQUEST);
+    }
+    if (typeof request.sha256 !== 'string') return answerAndClose(INVALID_REQUEST);
+
+    const result = broker.ackFileClaimFrame(lease.handoffId, request.transfer_id, {
+      owner: session,
+      index: request.index,
+      size: request.size,
+      digest: request.sha256,
+    });
+    if (!result.ok) return answerAndClose(result);
+
+    // The answer goes out before the next frame, so the receiver always reads a line
+    // where it expects a line and binary where it expects binary.
+    if (!(await writeStep(`${JSON.stringify({ ok: true, index: result.index, next_index: result.next_index })}\n`))) {
+      return;
+    }
+    if (result.next_index === null) {
+      session.phase = 'awaiting_commit';
+      session.outstandingFrame = null;
+      return;
+    }
+    await writeFrame(result.next_index);
+  }
+
+  function commitFileClaim(request) {
+    const lease = session.lease;
+    // Unreachable while the phase check above holds, and checked anyway: this is
+    // the line that must never retire a payload for a caller that did not stream
+    // it.
+    if (!lease) return answerAndClose(INVALID_REQUEST);
+    if (request.handoff_id !== lease.handoffId) return answerAndClose(INVALID_REQUEST);
+    if (typeof request.transfer_id !== 'string') return answerAndClose(INVALID_REQUEST);
+    if (!Number.isInteger(request.received_bytes) || request.received_bytes < 0) {
+      return answerAndClose(INVALID_REQUEST);
+    }
+    if (!Array.isArray(request.digests)) return answerAndClose(INVALID_REQUEST);
+
+    // The transfer id comes from the request rather than from the lease, so a
+    // commit that names the wrong transfer is refused by the broker as exactly
+    // that instead of being quietly corrected into a valid one.
+    const result = broker.commitFileClaim(lease.handoffId, request.transfer_id, {
+      owner: session,
+      receivedBytes: request.received_bytes,
+      digests: request.digests,
+    });
+    // `answerAndClose` releases whatever lease is left. A commit the broker
+    // accepted left none; one it refused for a mismatched id left the real one,
+    // and that has to go back rather than sit out its deadline.
+    answerAndClose(result);
+  }
+
+  async function handleLine(line) {
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch (error) {
+      logger.warn?.(`control request rejected: ${error.message}`);
+      return answerAndClose(INVALID_REQUEST);
+    }
+    if (!request || typeof request !== 'object') return answerAndClose(INVALID_REQUEST);
+
+    switch (request.op) {
+      // The two ops that are a conversation rather than an exchange. Each is
+      // accepted in exactly one phase; anything else — a commit with no lease, a
+      // second begin on one connection, a line after a commit — is a caller
+      // mistake, and answering it ends the connection and the lease with it.
+      case 'begin_file_claim':
+        if (session.phase !== 'idle') return answerAndClose(INVALID_REQUEST);
+        return beginFileClaim(request);
+
+      case 'ack_frame':
+        // Only while a frame is outstanding. This is the phase an early commit lands
+        // in, and refusing the commit here rather than inferring anything from
+        // timing is what makes the rule hold at every payload size.
+        if (session.phase !== 'awaiting_frame_ack') return answerAndClose(INVALID_REQUEST);
+        return ackFrame(request);
+
+      case 'commit_file_claim':
+        if (session.phase !== 'awaiting_commit') {
+          logger.warn?.(
+            `control file claim refused reason=commit_out_of_turn phase=${session.phase}`,
+          );
+          return answerAndClose(INVALID_REQUEST);
+        }
+        return commitFileClaim(request);
+
+      default: {
+        // Every other op: one line in, one line out, then closed, exactly as
+        // before. They are not available mid-conversation.
+        if (session.phase !== 'idle') return answerAndClose(INVALID_REQUEST);
+        let response;
+        try {
+          response = await handleControlRequest(request, broker);
+        } catch (error) {
+          logger.warn?.(`control request rejected: ${error.message}`);
+          response = INVALID_REQUEST;
+        }
+        return answerAndClose(response);
+      }
+    }
+  }
+
+  async function onChunk(chunk) {
+    if (session.phase === 'closed') return;
+    buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
+    // Bounded unconditionally, not only while a line is incomplete. `buffer` holds a
+    // whole line including its newline — the unit `transport.max_request_bytes`
+    // counts in (`transport.size_convention`) — and this protocol never has more
+    // than two lines in flight on one connection, so anything past the ceiling is
+    // either an oversized request or a flood, and both are the same refusal.
+    if (buffer.length > MAX_CONTROL_LINE_BYTES) return answerAndClose(INVALID_REQUEST);
+    for (;;) {
+      if (session.phase === 'closed') return;
+      const newline = buffer.indexOf(0x0a);
+      if (newline < 0) return;
+      const line = buffer.subarray(0, newline).toString('utf8');
+      buffer = buffer.subarray(newline + 1);
+      await handleLine(line);
+    }
+  }
+
+  socket.on('data', (chunk) => {
+    // A memory bound, not a verdict. While a frame is being written the chain is
+    // busy, so each arriving chunk is held in a closure until it drains — for a
+    // 42 MiB frame that is an arbitrary amount of broker memory held for the length
+    // of the write, working directly against the budget this slice exists to bound.
+    // One request line's worth is kept, which is all a legitimate ack needs; past
+    // that the connection goes, which costs the caller its lease and the payload
+    // nothing. Whether the line itself was *allowed* is decided by the phase machine
+    // when it is parsed, not here.
+    if (session.phase === 'streaming' || session.phase === 'beginning') {
+      session.inboundDuringFrameBytes += chunk.length;
+      if (session.inboundDuringFrameBytes > MAX_CONTROL_LINE_BYTES) {
+        logger.warn?.('control file claim connection dropped reason=inbound_flood');
+        session.phase = 'closed';
+        releaseLease('inbound_flood');
+        socket.destroy();
+        return;
+      }
+    }
+    chain = chain.then(() => onChunk(chunk)).catch((error) => {
+      logger.warn?.(`control connection failed: ${error.message}`);
+      session.phase = 'closed';
+      releaseLease('connection_failed');
+      socket.destroy();
+    });
+  });
+  // The disconnect edge: a receiver that dies mid-frame, or hangs up without
+  // committing, gives its lease back here and the payload stays claimable.
+  socket.on('close', () => releaseLease('receiver_disconnected'));
+
+  // Half-close, which is not the same edge and used to be indistinguishable from
+  // a healthy pause. The server keeps its side open when a peer ends its writable
+  // half (`allowHalfOpen`), because a client is allowed to send its one request
+  // line with `end()` and still be answered. But a peer that has ended its
+  // writable half can never send a commit — so a lease held at that moment is a
+  // lease nothing will ever finish, and holding it to its deadline would keep the
+  // next receiver waiting a minute for a payload already sitting there.
+  //
+  // Queued behind the chain rather than acted on at once: `end` can arrive while a
+  // pipelined commit is still being processed, and that commit is entitled to
+  // settle first.
+  socket.on('end', () => {
+    chain = chain
+      .then(() => {
+        if (!session.lease) return;
+        session.phase = 'closed';
+        releaseLease('receiver_half_closed');
+        socket.end();
+      })
+      .catch((error) => logger.warn?.(`control half-close failed: ${error.message}`));
+  });
+  socket.on('error', (error) => logger.warn?.(`control socket error: ${error.message}`));
 }
 
 /**
@@ -219,6 +616,11 @@ async function handleControlRequest(request, broker) {
         ...created,
         protocol_version: PROTOCOL_VERSION,
         payload_kinds: PAYLOAD_KINDS,
+        // The other half of the pre-flight check. `payload_kinds` says this broker
+        // can mint a file drop; this says it can also hand the bytes back. They
+        // were separate capabilities for one release and a client cannot assume
+        // the pair, so both are advertised.
+        file_claim_protocol: FILE_CLAIM_PROTOCOL,
       };
       if (!wantsNotice) return answer;
 

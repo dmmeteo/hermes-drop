@@ -84,6 +84,32 @@ describe('the control protocol contract', () => {
       assert.equal(contract.transport.socket_dir_mode, '0700');
     });
 
+    // The request ceiling counts the whole line *including* its newline, same as
+    // the response one (`transport.size_convention`). Pinned against the real
+    // server because it is a boundary a client cannot discover safely: a line one
+    // byte over is answered, not dropped, so a client that measured it the other
+    // way would see a working request refused and have nothing to go on.
+    it('applies its request ceiling to the line including the newline', async () => {
+      const limit = contract.transport.max_request_bytes;
+      // A syntactically valid request, padded with an ignored field to an exact
+      // wire length. `handoff_id` is unknown, so the answer at the limit is the
+      // uniform `unavailable` — a statement about the handoff, which is only
+      // reachable if the line was read at all.
+      const lineOf = (bytes) => {
+        const skeleton = { op: 'await', handoff_id: 'abcdefghijklmnopqrstuv', pad: '' };
+        const padding = bytes - 1 - Buffer.byteLength(JSON.stringify(skeleton));
+        return { ...skeleton, pad: 'p'.repeat(padding) };
+      };
+
+      const atLimit = lineOf(limit);
+      assert.equal(Buffer.byteLength(`${JSON.stringify(atLimit)}\n`), limit);
+      assert.deepEqual(await broker.control(atLimit), { ok: false, error: 'unavailable' });
+
+      const overLimit = lineOf(limit + 1);
+      assert.equal(Buffer.byteLength(`${JSON.stringify(overLimit)}\n`), limit + 1);
+      assert.deepEqual(await broker.control(overLimit), { ok: false, error: 'invalid_request' });
+    });
+
     it('lists exactly the notice platforms the renderer registry supports', () => {
       const sample = { handoffId: 'abcdefghijklmnopqrstuv', url: 'https://x.test/#c', expiresAt: 0 };
       for (const platform of contract.notice_platforms) {
@@ -93,10 +119,10 @@ describe('the control protocol contract', () => {
       assert.ok(!contract.notice_platforms.includes('slack'));
     });
 
-    it('publishes the same three error bodies the broker actually uses', async () => {
+    it('publishes the same error bodies the broker actually uses, and no others', async () => {
       assert.deepEqual(
         [...contract.errors].sort(),
-        ['invalid_request', 'response_too_large', 'unavailable'],
+        ['invalid_request', 'response_too_large', 'transfer_failed', 'unavailable'],
       );
 
       const invalid = await broker.control({ op: 'await' });
@@ -104,8 +130,10 @@ describe('the control protocol contract', () => {
       const unavailable = await broker.control({ op: 'claim', handoff_id: 'nope' });
       assert.equal(unavailable.error, 'unavailable');
       // `response_too_large` needs a live payload to be about, so it is proved
-      // against the broker in test/seam4-claim.test.js. What is pinned here is
-      // that the fixture names it and that every published error has a note.
+      // against the broker in test/seam4-claim.test.js, and `transfer_failed`
+      // needs a live transfer, so it is proved in test/file-claim-transfer.test.js.
+      // What is pinned here is that the fixture names them and that every published
+      // error has a note.
       for (const error of contract.errors) {
         assert.equal(typeof contract.error_notes[error], 'string', `${error} needs a note`);
       }
@@ -240,6 +268,132 @@ describe('the control protocol contract', () => {
     // Both halves of this repo ship together, but a Hermes-side plugin does not:
     // it is installed once and upgraded on its own schedule. So the one thing a
     // foreign client cannot be asked to infer is which protocol it is talking to.
+    // The framed transfer is the second capability this fixture has to carry
+    // without a version bump, and the reasoning is the same as `payload_kinds`':
+    // a text-only client sends none of it and reads none of it, so ordering it
+    // against a version would make every such client widen a check for something
+    // it will never use. What a *file* client needs is a yes-or-no answer before
+    // it posts a link, which is what `file_claim_protocol` is.
+    it('advertises the framed file claim as a capability rather than a version', async () => {
+      assert.equal(contract.version, 2, 'the framed transfer is additive to version 2');
+      assert.match(contract.version_notes.file_claim, /additive/i);
+      assert.equal(typeof contract.file_claim.protocol, 'number');
+
+      const created = await broker.control({ op: 'create', ttl_seconds: 60 });
+      assert.equal(created.file_claim_protocol, contract.file_claim.protocol);
+      assert.equal(created.protocol_version, 2, 'and the protocol version is untouched by it');
+      assert.match(
+        contract.ops.create.response.file_claim_protocol,
+        /absent means/,
+        'absence has to mean something specific, because a slice-2 broker sends nothing',
+      );
+    });
+
+    it('documents the framing precisely enough for a foreign client to implement', async () => {
+      const source = await read('src/control-server.js');
+      const frameHeader = Number(source.match(/FRAME_HEADER_BYTES = (\d+)/)[1]);
+      const protocol = Number(source.match(/FILE_CLAIM_PROTOCOL = (\d+)/)[1]);
+
+      assert.equal(protocol, contract.file_claim.protocol);
+      assert.equal(frameHeader, 4, 'a uint32 length prefix, as the conversation describes');
+      const framing = contract.file_claim.conversation.join(' ');
+      assert.match(framing, /uint32 big-endian/, 'the width and the byte order are both stated');
+      assert.match(framing, /zero-length frame/, 'and an empty file is a legitimate frame');
+      // The two halves a client could get wrong silently: what it must compute, and
+      // what the broker will not tell it.
+      assert.match(contract.file_claim.digests_are_not_echoed, /computes/);
+      assert.match(contract.file_claim.commit_is_the_only_retirement, /until/);
+      assert.match(contract.transport.exchange_note, /begin_file_claim/);
+    });
+
+    // The turn-taking rule is a wire requirement, not an implementation detail: a
+    // third implementation reading only this fixture has to know that a commit sent
+    // early is refused, or it will write one and lose a payload learning why.
+    it('states that the conversation is turn-taking, and enforces it structurally', async () => {
+      assert.match(contract.file_claim.turn_taking, /invalid_request/);
+      assert.match(
+        contract.file_claim.turn_taking,
+        /size-independent/i,
+        'the reason for the structure is the property it buys',
+      );
+      assert.match(
+        contract.ops.commit_file_claim.errors.invalid_request,
+        /outstanding/i,
+        'the op that refuses an early commit has to document the refusal',
+      );
+      // The ack is the mechanism, so a third implementation must find it in the ops.
+      const ack = contract.ops.ack_frame;
+      assert.equal(ack.request.op, 'ack_frame');
+      for (const field of ['transfer_id', 'index', 'size', 'sha256']) {
+        assert.equal(ack.request[field].optional, false, `${field} binds the ack to a frame`);
+      }
+      assert.match(ack.request.sha256.note, /over the bytes that frame actually delivered/i);
+      assert.match(ack.request.index.note, /outstanding/i, 'acks are strictly in order');
+      assert.equal(
+        ack.response.next_index,
+        'number: the frame the broker has just written and is now waiting on, or null when that was the last one — at which point the only op left is commit_file_claim',
+      );
+    });
+
+    // The finding this replaced: the old rule was inferred from whether the broker was
+    // still writing, which is a fact about the socket send buffer. It held for a 42 MiB
+    // drop and silently did not hold for a 16 KiB one. The fixture has to say why the
+    // ack exists, or a third implementation will "optimise" it away.
+    it('explains why receipt cannot be inferred from write completions', async () => {
+      const receipt = contract.file_claim.receipt;
+      assert.match(receipt, /send buffer/i);
+      assert.match(receipt, /kernel/i);
+      assert.match(receipt, /16 bytes and at 42 MiB|every payload size/i);
+      // ...and keeps the irreducible limit stated rather than quietly dropped.
+      assert.match(receipt, /already knows the plaintext/i);
+      assert.match(contract.file_claim.digests_are_not_echoed, /irreducible/i);
+    });
+
+    // A receiver has to be able to say something the socket did not. Keeping that
+    // vocabulary *out* of `errors` is the point: `errors` is what comes off the wire,
+    // and a client verdict is not.
+    it('names the verdicts a receiver produces, separately from the broker\'s errors', async () => {
+      assert.deepEqual(contract.file_claim.client_verdicts, ['transfer_indeterminate']);
+      for (const verdict of contract.file_claim.client_verdicts) {
+        assert.ok(!contract.errors.includes(verdict), `${verdict} is not a broker error`);
+      }
+      const note = contract.file_claim.client_verdicts_note;
+      // The three prohibitions are the whole safe reading, and a consumer that gets
+      // any of them wrong either publishes unverified files or discards received ones.
+      assert.match(note, /do not publish/i);
+      assert.match(note, /do not retry/i);
+      assert.match(note, /(do not|nothing as) (record|spent)/i);
+      assert.match(
+        contract.file_claim.lease_lost_mid_conversation,
+        /indeterminate/i,
+        'and the close that produces it has to point at it',
+      );
+    });
+
+    // A client that treats this like `unavailable` marks a drop spent that is still
+    // sitting there — which is the exact loss the two-phase protocol exists to
+    // prevent. So the fixture has to say what it means, and the server has to mean
+    // it, and both are checked here rather than only in the transfer suite.
+    it('publishes `transfer_failed` as a refusal that consumed nothing', async () => {
+      assert.ok(contract.errors.includes('transfer_failed'));
+      assert.match(contract.error_notes.transfer_failed, /nothing was consumed/i);
+      // ...and scopes that promise to refusals the broker actually spoke, or it would
+      // contradict the indeterminate verdict above.
+      assert.match(contract.error_notes.transfer_failed, /scoped to refusals the broker/i);
+
+      const files = await broker.control({ op: 'create', ttl_seconds: 60, payload_kind: 'files' });
+      // No payload yet, so there is nothing for a transfer to fail *about*: a
+      // pending drop is `unavailable` here, not `transfer_failed`.
+      assert.deepEqual(
+        await broker.control({ op: 'begin_file_claim', handoff_id: files.handoff_id }),
+        { ok: false, error: 'unavailable' },
+        'the two errors are not interchangeable',
+      );
+      for (const op of ['begin_file_claim', 'commit_file_claim']) {
+        assert.deepEqual(await broker.control({ op }), { ok: false, error: 'invalid_request' });
+      }
+    });
+
     it('states its protocol version on the wire, in the response every drop starts with', async () => {
       const created = await broker.control({ op: 'create', ttl_seconds: 60 });
       assert.equal(created.ok, true);

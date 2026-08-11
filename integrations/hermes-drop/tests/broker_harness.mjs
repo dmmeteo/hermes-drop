@@ -20,6 +20,10 @@
 //   stdout          `READY <socketPath>`, then `BASE_URL <url>` in --public mode
 //   stdin           `SUBMIT <handoffUrl> <base64-of-utf8-plaintext>` (--public
 //                   only) -> one line `SUBMITTED <status>` back on stdout
+//                   `SUBMIT_FILES <handoffUrl> <name>:<base64> ...` (--public
+//                   only) -> the same, for a `files` drop: it builds a real HDROP2
+//                   container and seals it as envelope v2, so the Python receiver
+//                   under test meets bytes the production encoder produced
 //   SIGTERM/SIGINT  closes everything and exits 0
 //
 // The submit path deliberately goes through `sendSecret`, the same module the
@@ -28,9 +32,10 @@
 import { createInterface } from 'node:readline';
 
 import { createBroker } from '../../../src/broker.js';
-import { sendSecret } from '../../../src/client/handoff-client.js';
+import { fetchMetadata, sealBytesEnvelope, sendSecret } from '../../../src/client/handoff-client.js';
 import { loadConfig } from '../../../src/config.js';
 import { startControlServer } from '../../../src/control-server.js';
+import { FILE_ENVELOPE_VERSION, encodeFileContainer } from '../../../src/file-container.js';
 import { startHandoffBroker } from '../../../src/main.js';
 
 const socketPath = process.argv[2];
@@ -80,19 +85,68 @@ if (wantsPublic) {
 }
 
 if (wantsPublic) {
+  const capabilityOf = (url) => {
+    const hashIndex = url.indexOf('#');
+    return hashIndex < 0 ? null : url.slice(hashIndex + 1);
+  };
+
+  /**
+   * One real HDROP2 container, sealed as envelope v2 and posted to the real submit
+   * endpoint — the same path `test/helpers/harness.js` uses on the Node side. The
+   * Python receiver under test therefore meets bytes the production encoder
+   * produced rather than a fixture written to agree with it.
+   */
+  const submitFiles = async (url, specs) => {
+    const capability = capabilityOf(url);
+    const metadata = await fetchMetadata({ capability, origin: baseUrl });
+    const files = specs.map((spec) => {
+      const separator = spec.indexOf(':');
+      return {
+        name: Buffer.from(spec.slice(0, separator), 'base64').toString('utf8'),
+        type: '',
+        bytes: new Uint8Array(Buffer.from(spec.slice(separator + 1), 'base64')),
+      };
+    });
+    const container = await encodeFileContainer(files, {
+      limits: {
+        maxFiles: metadata.max_files,
+        maxFileBytes: metadata.max_file_bytes,
+        maxTotalBytes: metadata.max_total_bytes,
+      },
+    });
+    const envelope = await sealBytesEnvelope({
+      capability,
+      metadata,
+      bytes: container,
+      version: FILE_ENVELOPE_VERSION,
+    });
+    const response = await fetch(`${baseUrl}/api/submit`, {
+      method: 'POST',
+      headers: { 'x-handoff-capability': capability, 'content-type': 'application/json' },
+      body: JSON.stringify(envelope),
+    });
+    return response.ok ? 'received' : 'unavailable';
+  };
+
   const lines = createInterface({ input: process.stdin });
   lines.on('line', async (line) => {
-    const [command, url, encoded] = line.trim().split(/\s+/);
-    if (command !== 'SUBMIT') {
-      process.stdout.write('SUBMIT_ERROR unknown-command\n');
-      return;
-    }
+    const [command, url, ...rest] = line.trim().split(/\s+/);
     try {
-      const hashIndex = url.indexOf('#');
-      const capability = hashIndex < 0 ? null : url.slice(hashIndex + 1);
-      const plaintext = Buffer.from(encoded, 'base64').toString('utf8');
-      const outcome = await sendSecret({ capability, plaintext, origin: baseUrl });
-      process.stdout.write(`SUBMITTED ${outcome.status}\n`);
+      if (command === 'SUBMIT') {
+        const plaintext = Buffer.from(rest[0], 'base64').toString('utf8');
+        const outcome = await sendSecret({
+          capability: capabilityOf(url),
+          plaintext,
+          origin: baseUrl,
+        });
+        process.stdout.write(`SUBMITTED ${outcome.status}\n`);
+        return;
+      }
+      if (command === 'SUBMIT_FILES') {
+        process.stdout.write(`SUBMITTED ${await submitFiles(url, rest)}\n`);
+        return;
+      }
+      process.stdout.write('SUBMIT_ERROR unknown-command\n');
     } catch (error) {
       process.stdout.write(`SUBMIT_ERROR ${error.message.replace(/\s+/g, '-')}\n`);
     }

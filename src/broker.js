@@ -16,10 +16,41 @@
 //     the 0600 admin socket, by a caller already trusted with the plaintext,
 //     and because handoff ids are public by design;
 //   - nothing here logs, returns or serializes plaintext except `claim()`, whose
-//     bytes go straight to the local admin CLI's stdout;
+//     bytes go straight to the local admin CLI's stdout, and `beginFileClaim()`,
+//     which hands container views to the local streamer;
 //   - `claim()` never consumes a payload it cannot hand over: a caller that
 //     declares how much it can receive is refused *before* the retirement, so a
 //     reader too small for the answer costs a refusal rather than the secret.
+//
+// The transfer lease (docs/FILE_TRANSFER_MVP.md, slice 3). A `files` payload is
+// too large to hand over in one answer, so its claim is two operations with a
+// stream between them, and the state machine grows the substate that makes that
+// lossless:
+//
+//   submitted --beginFileClaim--> transferring --commitFileClaim--> claimed
+//                                      |
+//                                      +-- disconnect, lease timeout, failed
+//                                          commit --> submitted
+//
+// Three rules make it lossless rather than merely two-phase:
+//
+//   ONE      at most one lease per handoff, taken and released inside a
+//            synchronous gate, so concurrent receivers cannot both stream.
+//   OWNED    the lease belongs to an `owner` token the caller supplies — the
+//            control server passes its per-connection session object, so the
+//            lease is the connection and there is nothing to forge. Knowing a
+//            transfer id buys nothing.
+//   COMMIT   the retirement happens in `commitFileClaim` and nowhere else, only
+//            after the receiver has acknowledged every frame with a digest that
+//            matches the manifest. Frames go out one at a time and each one has to be
+//            acked before the next is written, so "the receiver has the bytes" does
+//            not depend on the socket send buffer — see `ackFileClaimFrame`. Every
+//            other outcome is a refusal that leaves the payload `submitted` and
+//            one-shot.
+//
+// A lease holds its live-file reservation for its whole duration, which is why
+// the lease has a bounded deadline: an abandoned transfer must not be able to
+// hold a quarter of the process budget until the TTL lapses.
 //
 // Payload kinds (docs/FILE_TRANSFER_MVP.md, slice 2). A handoff is minted as
 // `text` — one UTF-8 secret under `maxPlaintextBytes`, envelope v1, unchanged in
@@ -87,6 +118,29 @@ import {
 const UNAVAILABLE = Object.freeze({ ok: false, error: 'unavailable' });
 const RECEIPT = Object.freeze({ ok: true, status: 'received' });
 const INVALID_REQUEST = Object.freeze({ ok: false, error: 'invalid_request' });
+
+/**
+ * The refusal that means *nothing was consumed*. A caller may rely on that: the
+ * payload is still `submitted`, still one-shot, and still claimable by the next
+ * transfer. It is deliberately not `unavailable`, which a client is entitled to
+ * read as "this drop is over" — recording a busy lease or a mismatched digest as a
+ * spent drop would manufacture the loss the refusal just prevented.
+ */
+function transferFailed(reason) {
+  return { ok: false, error: 'transfer_failed', reason };
+}
+
+/**
+ * The least remaining TTL worth granting a lease for.
+ *
+ * Not an operator dial: it is a statement about what a transfer needs to be
+ * *committable*, not about deployment. Below a second the frames of a maximal drop
+ * cannot land, and even a small drop is a coin flip — and the cost of losing the
+ * flip is the whole transfer plus the payload, because the record is destroyed at
+ * expiry while the receiver is mid-stream. Refusing before any byte moves is
+ * strictly better than that for every party.
+ */
+const MIN_TRANSFER_LEASE_MS = 1000;
 
 /** The payload kinds this broker speaks, advertised on `create`. */
 export const PAYLOAD_KINDS = Object.freeze([PAYLOAD_KIND_TEXT, PAYLOAD_KIND_FILES]);
@@ -190,6 +244,44 @@ export function createBroker(config, logger = console) {
     return base64Length(record.maxPayloadBytes + AEAD_TAG_BYTES) + ENVELOPE_JSON_OVERHEAD_BYTES;
   }
 
+  /**
+   * Ends a transfer lease, whatever ended it, and puts the record back where it
+   * was. The only place `transferring` is left, and idempotent by construction:
+   * the lease is detached before anything else happens, so a timeout that fires
+   * while a commit is already running finds nothing to release.
+   *
+   * `reason` is a fixed vocabulary and never carries a name, a digest or a
+   * capability, because it is logged.
+   *
+   * `notifyHolder` is the difference between the two kinds of ending. A lease that
+   * the holder itself ended — a commit, a refused commit, an explicit abandon — is
+   * released quietly, because the holder is mid-answer and telling it to drop its
+   * connection would take the answer with it. A lease ended *under* the holder —
+   * the deadline, an expiry, a shutdown — has to reach it, or it would keep
+   * streaming views into a record that no longer owns those bytes.
+   */
+  function clearLease(record, reason, notifyHolder = false) {
+    const lease = record?.transfer;
+    if (!lease) return null;
+    record.transfer = null;
+    clearTimeout(lease.timer);
+    if (record.state === 'transferring') record.state = 'submitted';
+    logger.info?.(
+      `handoff transfer ended hid=${record.handoffId} reason=${reason} ` +
+        `acked=${lease.ackedBytes}/${lease.totalBytes}`,
+    );
+    if (notifyHolder) {
+      try {
+        lease.onLeaseLost?.(reason);
+      } catch (error) {
+        // A throwing callback is the holder's problem and must not take the
+        // release — or the destroy that is probably calling it — down with it.
+        logger.warn?.(`handoff transfer notify failed hid=${record.handoffId}: ${error.message}`);
+      }
+    }
+    return lease;
+  }
+
   /** Wakes anyone blocked in `waitForSubmission`, exactly once per waiter. */
   function notify(record, outcome) {
     const waiters = record.waiters;
@@ -204,6 +296,10 @@ export function createBroker(config, logger = console) {
    * envelope digest, a capability hash and timestamps.
    */
   function retire(record) {
+    // A commit clears its own lease before retiring, so this only ever fires for
+    // a lease nothing is holding any more. It is here so that "claimed" cannot
+    // coexist with a live transfer under any future caller either.
+    clearLease(record, 'claimed');
     // `claim` detaches the payload first, so this cannot wipe the bytes in flight
     // to the operator.
     zeroize(record.plaintext);
@@ -218,6 +314,18 @@ export function createBroker(config, logger = console) {
   }
 
   function destroy(record, reason) {
+    // ORDER IS LOAD-BEARING — do not move the wipe above this line.
+    //
+    // A lease holder is streaming *views into* `record.plaintext` (see
+    // `beginFileClaim`), and `socket.write` holds a reference to the view rather
+    // than a copy of it. Releasing the lease first tells the holder to stop and
+    // destroys its connection, which discards whatever is still queued; zeroizing
+    // first would instead turn queued frames into zeros on the wire. Even that fails
+    // safe — the receiver's digests would not match and the commit would be refused
+    // — but it would spend a whole transfer to arrive there, and a partially drained
+    // frame can still be zeroized mid-flight regardless, which is why the digest
+    // check is the backstop and this ordering is the intent.
+    clearLease(record, 'handoff_destroyed', true);
     zeroize(record.plaintext);
     record.plaintext = null;
     record.keyPair = null;
@@ -432,6 +540,10 @@ export function createBroker(config, logger = console) {
           envelopeVersion,
           reservedBytes,
           bodySlotBusy: false,
+          /** The one live transfer lease, or null. See `clearLease` above. */
+          transfer: null,
+          /** Leases granted without a commit. Bounded by `maxTransferAttempts`. */
+          transferAttempts: 0,
           fileCount: 0,
           fileTotalBytes: 0,
           state: 'pending',
@@ -623,7 +735,14 @@ export function createBroker(config, logger = console) {
     waitForSubmission(handoffId, timeoutMs) {
       const record = live(byHandoffId.get(handoffId), Date.now());
       if (!record) return Promise.resolve('unavailable');
-      if (record.state === 'submitted') return Promise.resolve('submitted');
+      // `transferring` answers `submitted` because that is what it is: a payload
+      // that arrived and has not been consumed. The substate is an internal fact
+      // about who is currently reading it, and a subscriber whose whole question
+      // is "has the browser sent it yet" must not be given a third answer to
+      // handle — least of all one that could be mistaken for a terminal state.
+      if (record.state === 'submitted' || record.state === 'transferring') {
+        return Promise.resolve('submitted');
+      }
       // Already claimed: waiting cannot make it claimable again.
       if (record.state !== 'pending') return Promise.resolve('unavailable');
 
@@ -731,23 +850,323 @@ export function createBroker(config, logger = console) {
     },
 
     /**
-     * Test-only stand-in for the file claim that slice 3 will build: it performs
-     * exactly the retirement a real claim performs — payload zeroized, receipt
-     * kept, reservation released — and hands back a count and a byte total
-     * instead of bytes. It exists so the release-on-claim edge is provable now,
-     * and it is deliberately incapable of moving a payload anywhere.
+     * Seam 4b, phase 1: take the one transfer lease on a submitted `files` drop
+     * and hand the streamer what it needs to write.
      *
-     * Slice 3 replaces it with `begin_file_claim` → transfer → `commit_file_claim`
-     * over the control socket. Nothing outside tests may call it in the meantime.
+     * It consumes nothing. What comes back is a manifest and a set of **views into
+     * the container** — never copies, so a 42 MiB claim costs no second 42 MiB,
+     * which is what makes the live-file budget's number mean what it says. The
+     * views are only as good as the record that owns them: `clearLease` tells the
+     * holder the instant that stops being true (expiry, shutdown, timeout).
+     *
+     * Digests are deliberately *not* returned. The receiver computes them over the
+     * bytes it actually received and `commitFileClaim` checks them, so the commit
+     * is evidence of receipt rather than an echo of this response.
+     *
+     * `owner` is whatever token the caller can prove it holds later — the control
+     * server passes its per-connection session object, which is why the lease
+     * cannot be committed from a second connection.
      */
-    testClaimFileDrop(handoffId) {
+    async beginFileClaim(handoffId, { owner, leaseMs, onLeaseLost } = {}) {
       const record = live(byHandoffId.get(handoffId), Date.now());
-      if (!record || record.state !== 'submitted' || !record.plaintext) return UNAVAILABLE;
+      if (!record || !record.plaintext) return UNAVAILABLE;
       if (record.payloadKind !== PAYLOAD_KIND_FILES) return UNAVAILABLE;
-      const files = record.fileCount;
-      const bytes = record.fileTotalBytes;
+      // The busy lease is answered *before* the state check, and that order is the
+      // whole difference between the two refusals. `transferring` is not
+      // `submitted`, so checking the state first would tell a second receiver
+      // `unavailable` — which it is entitled to read as "this drop is over" — about
+      // a payload that is merely being read by someone else right now.
+      if (record.transfer || record.state === 'transferring') {
+        return transferFailed('transfer_in_progress');
+      }
+      if (record.state !== 'submitted') return UNAVAILABLE;
+
+      // Every granted lease costs a full digest pass over the container below, and
+      // `abandonFileClaim` gives the drop back for free — so the number of passes
+      // one drop can be made to spend has to be bounded, exactly as the submit path
+      // bounds container validation with `containerFailures`. Unlike that path this
+      // one does *not* destroy the drop when the budget is spent: a receiver that
+      // crashed eight times is a broken receiver, not a reason to throw away the
+      // user's files. The payload stays and lapses on its own TTL.
+      if (record.transferAttempts >= config.maxTransferAttempts) {
+        logger.warn?.(
+          `handoff transfer refused hid=${handoffId} reason=attempt_budget_spent ` +
+            `attempts=${record.transferAttempts}/${config.maxTransferAttempts}`,
+        );
+        return transferFailed('attempt_budget_spent');
+      }
+
+      // Narrow-only, and nonsense reads as "no narrowing asked for" — the same
+      // reading `narrowFileLimits` gives a model tool's argument. The control
+      // server refuses an ill-typed `lease_ms` before it gets here; this is what
+      // holds for an in-process caller.
+      const asked = Number.isSafeInteger(leaseMs) && leaseMs > 0 ? leaseMs : Infinity;
+      // ...and clamped to the handoff's own remaining time, because
+      // `lease_expires_at` is published as the deadline the frames and the commit
+      // must both land before. A deadline past the record's expiry is one this
+      // broker cannot honour: it would stream up to 42 MiB and then destroy the
+      // payload under a receiver that did everything right.
+      const remainingMs = record.expiresAt - Date.now();
+      // Below the floor there is no point starting: an honest refusal now costs the
+      // caller a round trip, where a lease costs it a full transfer that could never
+      // have been committed. Nothing is consumed and nothing is destroyed — the drop
+      // simply lapses on its own clock, so this is `transfer_failed` and not
+      // `unavailable`.
+      if (remainingMs < MIN_TRANSFER_LEASE_MS) {
+        logger.info?.(
+          `handoff transfer refused hid=${handoffId} reason=handoff_expiring ` +
+            `remaining_ms=${Math.max(0, remainingMs)}`,
+        );
+        return transferFailed('handoff_expiring');
+      }
+      const effectiveLeaseMs = Math.min(config.fileClaimLeaseMs, asked, remainingMs);
+
+      // The manifest is re-derived from the container on every transfer rather
+      // than cached at submit, which costs one SHA-256 pass and buys two things:
+      // the record retains no filename and no digest between submit and claim, and
+      // the digests the commit is checked against were verified against these
+      // bytes moments ago rather than against whatever they were at submit time
+      // (see the ownership note in src/file-container.js).
+      let decoded;
+      try {
+        decoded = await decodeFileContainer(record.plaintext, { limits: record.fileLimits });
+      } catch (error) {
+        if (!(error instanceof FileContainerError)) throw error;
+        // Unreachable through any ordinary path: `submit` refused anything that
+        // was not already a valid container. Reaching it means the bytes changed
+        // under us — a destroy that raced this decode, most plausibly — so the
+        // record is left exactly as it is and the caller is told nothing.
+        logger.warn?.(`handoff transfer container rejected hid=${handoffId} code=${error.code}`);
+        return UNAVAILABLE;
+      }
+
+      // Synchronous single-use gate: nothing may await between here and the
+      // mutation, or two receivers could both leave the decode believing they won.
+      //
+      // In the *same order* as the pre-await gate above, and for the same reason —
+      // which matters more here, not less. The window this gate closes is the whole
+      // digest pass, so two connections arriving together both land in it, and
+      // answering the loser `unavailable` would tell it a payload it can see is
+      // gone. Checking the state first would do exactly that.
+      if (!record.plaintext) return UNAVAILABLE;
+      if (record.transfer || record.state === 'transferring') {
+        return transferFailed('transfer_in_progress');
+      }
+      if (record.state !== 'submitted') return UNAVAILABLE;
+
+      const transferId = bytesToBase64Url(randomBytes(16));
+      // The deadline is fixed *here*, against a clock read after the manifest pass,
+      // and clamped again to the record's own expiry. Adding `effectiveLeaseMs` to
+      // this later clock without re-clamping would put the deadline past the handoff
+      // by however long the pass took — which for a maximal container is tens of
+      // milliseconds, and is exactly the overshoot the clamp exists to remove.
+      const leaseExpiresAt = Math.min(Date.now() + effectiveLeaseMs, record.expiresAt);
+      const lease = {
+        transferId,
+        owner,
+        onLeaseLost,
+        totalBytes: decoded.totalBytes,
+        expectedDigests: decoded.files.map((file) => file.sha256),
+        expectedSizes: decoded.files.map((file) => file.size),
+        /** The frame the receiver must ack next; `files.length` means all are in. */
+        nextFrame: 0,
+        /** Bytes the receiver proved it hashed, one validated ack at a time. */
+        ackedBytes: 0,
+        expiresAt: leaseExpiresAt,
+        timer: setTimeout(() => {
+          // Guarded against the release that already happened: a commit clears the
+          // lease first, so a timer that fires just behind one finds nothing.
+          if (record.transfer?.transferId !== transferId) return;
+          clearLease(record, 'lease_timeout', true);
+        }, Math.max(1, leaseExpiresAt - Date.now())),
+      };
+      lease.timer.unref();
+      record.transfer = lease;
+      record.state = 'transferring';
+      // Counted here, at the point a lease is actually granted, so refusals above
+      // cost nothing and only real digest passes are charged.
+      record.transferAttempts += 1;
+      logger.info?.(
+        `handoff transfer began hid=${handoffId} files=${decoded.files.length} ` +
+          `bytes=${decoded.totalBytes} lease_ms=${leaseExpiresAt - Date.now()} ` +
+          `attempt=${record.transferAttempts}/${config.maxTransferAttempts}`,
+      );
+
+      return {
+        ok: true,
+        handoff_id: handoffId,
+        transfer_id: transferId,
+        lease_expires_at: lease.expiresAt,
+        total_bytes: decoded.totalBytes,
+        files: decoded.files.map((file) => ({
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          bytes: file.bytes,
+        })),
+      };
+    },
+
+    /**
+     * Validates one frame acknowledgement and advances the transfer.
+     *
+     * This is the transfer's progress authority, and it replaced a byte counter fed
+     * by socket write completions. That counter was not evidence of receipt and the
+     * difference mattered: a write completes when the *kernel* takes the bytes, so
+     * for any payload smaller than the socket send buffer every frame "completed"
+     * before the receiver had read one, and an early commit was accepted below that
+     * size and refused above it. A rule that depends on a tunable buffer size is
+     * absent exactly where drops are most common.
+     *
+     * An ack cannot be produced by a kernel. To answer, a receiver has to have read
+     * the frame and hashed it, and the digest is checked against the manifest — which
+     * the broker holds and the receiver was never given. What remains forgeable is a
+     * caller that already knows the plaintext, and no exchange over this socket can
+     * fix that (see `file_claim.receipt` in the contract). What it does buy,
+     * uniformly at 16 bytes and at 42 MiB, is that an ordinary or buggy receiver
+     * cannot retire a payload it never read.
+     *
+     * Strictly in order, and synchronous: `next_index` is the only frame that can be
+     * acked, so a duplicate or a skipped ack is a refusal rather than something to
+     * reconcile.
+     */
+    ackFileClaimFrame(handoffId, transferId, { owner, index, size, digest } = {}) {
+      const record = live(byHandoffId.get(handoffId), Date.now());
+      if (!record || !record.plaintext) return UNAVAILABLE;
+      if (record.state !== 'transferring' || !record.transfer) {
+        // The lease lapsed or was released under the caller. The payload survived it,
+        // which is what `transfer_failed` promises.
+        return record.state === 'submitted' ? transferFailed('lease_expired') : UNAVAILABLE;
+      }
+
+      const lease = record.transfer;
+      if (lease.transferId !== transferId) return transferFailed('transfer_id_mismatch');
+      if (lease.owner !== owner) return transferFailed('lease_not_yours');
+      if (lease.nextFrame >= lease.expectedSizes.length) return INVALID_REQUEST;
+      if (index !== lease.nextFrame) {
+        logger.warn?.(
+          `handoff transfer refused hid=${handoffId} reason=frame_ack_out_of_order ` +
+            `acked=${index} expected=${lease.nextFrame}`,
+        );
+        clearLease(record, 'frame_ack_out_of_order');
+        return transferFailed('frame_ack_out_of_order');
+      }
+      // Size and digest together. Nothing about *which* of them differed is logged:
+      // one is a length and the other is a statement about content.
+      if (size !== lease.expectedSizes[index] || digest !== lease.expectedDigests[index]) {
+        logger.warn?.(
+          `handoff transfer refused hid=${handoffId} reason=frame_ack_mismatch frame=${index}`,
+        );
+        clearLease(record, 'frame_ack_mismatch');
+        return transferFailed('frame_ack_mismatch');
+      }
+
+      lease.ackedBytes += size;
+      lease.nextFrame += 1;
+      const done = lease.nextFrame >= lease.expectedSizes.length;
+      // No frame bytes come back here. The streamer already holds the views this
+      // transfer's `beginFileClaim` handed it and indexes them by `next_index`, so the
+      // record keeps no second reference to the payload and — the part that matters —
+      // no filename between submit and claim.
+      return { ok: true, index, next_index: done ? null : lease.nextFrame };
+    },
+
+    /**
+     * Seam 4b, phase 2: the ACK, and the only thing in the protocol that retires a
+     * `files` payload.
+     *
+     * Four conditions, in the order that costs the caller least to get right:
+     * the lease is live and theirs, the broker really flushed every advertised
+     * byte, the receiver counted the same number, and the digests it computed over
+     * those bytes are the manifest's. Only then — synchronously, with no await
+     * between the last check and the retirement — is the payload consumed.
+     *
+     * Everything else is `transfer_failed` with the record back to `submitted`,
+     * which is the whole point of the two phases.
+     */
+    commitFileClaim(handoffId, transferId, { owner, receivedBytes, digests } = {}) {
+      const record = live(byHandoffId.get(handoffId), Date.now());
+      // Gone, or already claimed: there is nothing to commit and nothing to keep,
+      // so this is the uniform refusal rather than a statement about a transfer.
+      if (!record || !record.plaintext) return UNAVAILABLE;
+      if (record.state === 'submitted' && !record.transfer) {
+        // The lease lapsed or was released under the caller; the payload survived
+        // it, which is exactly what `transfer_failed` promises.
+        return transferFailed('lease_expired');
+      }
+      if (record.state !== 'transferring' || !record.transfer) return UNAVAILABLE;
+
+      const lease = record.transfer;
+      if (lease.transferId !== transferId) return transferFailed('transfer_id_mismatch');
+      if (lease.owner !== owner) return transferFailed('lease_not_yours');
+      // Every frame acked, which is the size-independent form of "the receiver has it".
+      // Unreachable over the wire — the connection will not accept a commit while a
+      // frame is outstanding — and checked here because this is the function that
+      // retires the payload, and it must not depend on a caller's phase discipline.
+      if (lease.nextFrame !== lease.expectedSizes.length) {
+        logger.warn?.(
+          `handoff transfer refused hid=${handoffId} reason=frames_not_acked ` +
+            `acked=${lease.nextFrame}/${lease.expectedSizes.length}`,
+        );
+        clearLease(record, 'frames_not_acked');
+        return transferFailed('frames_not_acked');
+      }
+      if (lease.ackedBytes !== lease.totalBytes) {
+        logger.warn?.(
+          `handoff transfer refused hid=${handoffId} reason=incomplete_transfer ` +
+            `acked=${lease.ackedBytes}/${lease.totalBytes}`,
+        );
+        clearLease(record, 'incomplete_transfer');
+        return transferFailed('incomplete_transfer');
+      }
+      if (receivedBytes !== lease.totalBytes) {
+        logger.warn?.(
+          `handoff transfer refused hid=${handoffId} reason=size_mismatch ` +
+            `claimed=${receivedBytes} transferred=${lease.totalBytes}`,
+        );
+        clearLease(record, 'size_mismatch');
+        return transferFailed('size_mismatch');
+      }
+      if (!digestsMatch(digests, lease.expectedDigests)) {
+        // The count and the order are part of the match, not conditions before it:
+        // a receiver that returns the right digests in the wrong order did not
+        // receive the files this manifest describes. Nothing about which digest
+        // differed is logged — that is a statement about content.
+        logger.warn?.(`handoff transfer refused hid=${handoffId} reason=digest_mismatch`);
+        clearLease(record, 'digest_mismatch');
+        return transferFailed('digest_mismatch');
+      }
+
+      const files = lease.expectedDigests.length;
+      const bytes = lease.totalBytes;
+      clearLease(record, 'committed');
       retire(record);
-      return { ok: true, handoff_id: handoffId, files, bytes };
+      return { ok: true, handoff_id: handoffId, status: 'claimed', files, bytes };
+    },
+
+    /**
+     * Gives a lease back without committing it — the disconnect path, and what an
+     * in-process caller uses when it decides not to finish. Idempotent, and it
+     * cannot end a lease that is not the one named.
+     */
+    abandonFileClaim(handoffId, transferId, reason = 'abandoned') {
+      const record = byHandoffId.get(handoffId);
+      if (record?.transfer?.transferId !== transferId) return false;
+      clearLease(record, reason);
+      return true;
+    },
+
+    /**
+     * Test-only: move a live record's deadline. The counterpart to `sweep(now)`,
+     * which already lets a test choose *when* expiry happens; this lets it choose a
+     * deadline instead, which is the only way to exercise "too little TTL left to
+     * start a transfer" without a real sleep racing the setup.
+     */
+    testSetExpiry(handoffId, expiresAt) {
+      const record = byHandoffId.get(handoffId);
+      if (!record) return false;
+      record.expiresAt = expiresAt;
+      return true;
     },
 
     /** Test-only introspection. Returns no plaintext and no key material. */
@@ -769,10 +1188,27 @@ export function createBroker(config, logger = console) {
         fileTotalBytes: record.fileTotalBytes,
         reservedBytes: record.reservedBytes,
         bodySlotBusy: record.bodySlotBusy,
+        // The live transfer lease as four numbers and an id. Deliberately not the
+        // lease object: that one holds the manifest's digests and a callback into
+        // whoever is streaming, and neither belongs in something a test prints.
+        transfer: record.transfer
+          ? {
+              transferId: record.transfer.transferId,
+              expiresAt: record.transfer.expiresAt,
+              ackedBytes: record.transfer.ackedBytes,
+              nextFrame: record.transfer.nextFrame,
+              totalBytes: record.transfer.totalBytes,
+              files: record.transfer.expectedDigests.length,
+            }
+          : null,
+        transferAttempts: record.transferAttempts,
         expiresAt: record.expiresAt,
         waiters: record.waiters.length,
         serialized: JSON.stringify(record, (key, value) => {
           if (key === 'plaintext') return value ? '[redacted]' : null;
+          // Same reasoning as above, and it matters more here: this string is what
+          // the invariant tests grep for leaked payloads.
+          if (key === 'transfer') return value ? `[lease ${value.transferId}]` : null;
           if (value instanceof Uint8Array) return toHex(value);
           if (key === 'keyPair') return value ? '[CryptoKeyPair]' : null;
           if (key === 'waiters') return value.length;
@@ -801,6 +1237,30 @@ function isEnvelopeShapeValid(envelope, { envelopeVersion, maxPayloadBytes }) {
   // Reject oversized ciphertext before any crypto work.
   if (envelope.ct.length > base64Length(maxPayloadBytes + AEAD_TAG_BYTES)) return false;
   return true;
+}
+
+/** Lowercase hex, fixed width — the same single digest spelling the manifest accepts. */
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/**
+ * Does what the receiver computed match the container, in count, order and value?
+ *
+ * All three at once and with no early distinction between them: a client that
+ * returns the right digests in the wrong order did not receive the files this
+ * manifest describes, and a client that returns four digests for five files has
+ * not received the drop either. The comparison is not constant-time because
+ * nothing here is a secret being guessed — these are the digests of bytes the
+ * caller was just handed, over a socket only a caller trusted with the plaintext
+ * can reach.
+ */
+function digestsMatch(digests, expected) {
+  if (!Array.isArray(digests) || digests.length !== expected.length) return false;
+  return expected.every(
+    (digest, index) =>
+      typeof digests[index] === 'string' &&
+      SHA256_HEX.test(digests[index]) &&
+      digests[index] === digest,
+  );
 }
 
 function safeDecode(value, expectedBytes) {

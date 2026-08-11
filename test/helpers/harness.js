@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { startHandoffBroker } from '../../src/main.js';
 import { controlRequest } from '../../src/control-client.js';
 import { fetchMetadata, sealBytesEnvelope } from '../../src/client/handoff-client.js';
+import { receiveFileClaim } from '../../src/file-claim-client.js';
 import { FILE_ENVELOPE_VERSION, encodeFileContainer } from '../../src/file-container.js';
 
 export async function startTestBroker(overrides = {}) {
@@ -73,6 +74,19 @@ export async function createFileDrop(broker, { ttlSeconds = 120, maxFiles } = {}
       return response.ok ? 'received' : 'unavailable';
     },
   };
+}
+
+/**
+ * Claims a file drop the way the plugin will: `begin_file_claim` over the real
+ * control socket, the real length-framed stream, and a commit carrying digests
+ * the receiver computed itself (src/file-claim-client.js).
+ *
+ * This is the only way to retire a file payload. There is deliberately no shortcut
+ * that skips the transfer — a test that could retire a container without moving it
+ * would be pinning a claim path production does not have.
+ */
+export function claimFileDrop(broker, handoffId, options) {
+  return receiveFileClaim(broker.controlSocketPath, handoffId, options);
 }
 
 /** One HDROP2 container, sealed under the metadata's own advertised limits. */
