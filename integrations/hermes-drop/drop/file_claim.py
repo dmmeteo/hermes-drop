@@ -55,11 +55,16 @@ FRAME_HEADER_BYTES = 4
 #: handed on in pieces rather than assembled twice in memory.
 CHUNK_BYTES = 256 * 1024
 
-#: The metadata line is bounded by the container's manifest ceiling (~6.4 KB at
-#: five files), so this is generous. It is stated because ``StreamReader``'s
-#: default limit is a footgun on this socket — see ``control_client``'s
-#: ``MAX_RESPONSE_BYTES`` for the review that made that concrete.
-MAX_LINE_BYTES = 1024 * 1024
+#: The metadata line is bounded by the container's manifest ceiling — 6437 bytes
+#: at five files (``docs/FILE_TRANSFER_MVP.md``) plus the transfer id, the deadline
+#: and the byte count — so 64 KiB is an order of magnitude of headroom rather than
+#: the two orders 1 MiB was. Sized from the thing it bounds, because the length of
+#: this line is the broker's choice and not this client's: a receiver that will
+#: buffer a megabyte for a 6 KB manifest is trusting a peer for no reason. It is
+#: stated at all because ``StreamReader``'s default limit is a footgun on this
+#: socket — see ``control_client``'s ``MAX_RESPONSE_BYTES`` for the review that
+#: made that concrete.
+MAX_LINE_BYTES = 64 * 1024
 
 DEFAULT_TIMEOUT_SECONDS = 120.0
 
@@ -106,6 +111,7 @@ async def receive_file_claim(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     on_chunk: Optional[ChunkSink] = None,
     keep_bytes: bool = True,
+    progress: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one whole file claim and return a verdict dict.
 
@@ -132,7 +138,15 @@ async def receive_file_claim(
 
     # Mutable, because the one thing the timeout handler below has to know is
     # whether the commit had already gone out — and that is decided inside `_claim`.
-    progress: Dict[str, Any] = {"commit_written": False}
+    #
+    # A caller may pass its own dict to observe it. That is not a convenience: a
+    # spool has to know the same thing this handler does, because a cancellation
+    # before the commit means the staged bytes may be discarded and one after it
+    # means they are the only copy left and must be held. Without the signal the
+    # only safe behaviour would be to hold on every cancellation.
+    if progress is None:
+        progress = {}
+    progress.setdefault("commit_written", False)
 
     try:
         return await asyncio.wait_for(

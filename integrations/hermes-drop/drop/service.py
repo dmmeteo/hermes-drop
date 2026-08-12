@@ -99,6 +99,24 @@ UNRECORDED_CLAIM_NOTE = (
     "already destroyed its copy, so a retry can only fail. Use the value above."
 )
 
+#: The file equivalent of ``UNRECORDED_CLAIM_NOTE``: the paths are already in the
+#: result and they are the only copy of the files, so the claim is not withheld —
+#: what is left is to stop the retry the unmarked entry now looks to permit.
+UNRECORDED_FILE_CLAIM_NOTE = (
+    "These files were delivered, but the local record of the claim could not be "
+    "written. Do not call the file claim for this drop again: the broker has already "
+    "destroyed its copy, so a retry can only fail. Use the paths above."
+)
+
+#: Said when the drop was spent and produced nothing — the broker retired the
+#: payload and the publish failed — and the durable record could not be updated
+#: either. The model's only correct move is to stop and ask again through a new link.
+UNRECORDED_SPENT_FILE_CLAIM_NOTE = (
+    "This drop was used up without delivering anything, and the local record of that "
+    "could not be written. Do not call the file claim for this drop again: ask for the "
+    "files through a new link."
+)
+
 #: Said in the receipt, because the model is the party that has to behave
 #: idempotently when a second notice arrives.
 RECEIPT_NOTE = (
@@ -122,6 +140,7 @@ class DropService:
         waiters: Any = None,
         deliver: Optional[Callable[..., Any]] = None,
         clock: Callable[[], float] = time.time,
+        spool: Any = None,
     ) -> None:
         from . import control_client
         from . import messenger as messenger_mod
@@ -134,6 +153,10 @@ class DropService:
         self._waiters = waiters if waiters is not None else waiter_mod.REGISTRY
         self._deliver = deliver
         self._clock = clock
+        # ``None`` means "the configured one", resolved at claim time rather than
+        # here: constructing a ``Spool`` is free, but a service is built in
+        # processes that never claim a file.
+        self._spool = spool
 
     # -- create -------------------------------------------------------------
 
@@ -398,6 +421,50 @@ class DropService:
             claimed["note"] = UNRECORDED_CLAIM_NOTE
         return claimed
 
+    # -- claim, for a file drop ---------------------------------------------
+
+    async def claim_files(self, origin: Any, drop_id: str, **overrides: Any) -> Dict[str, Any]:
+        """Materialize a file drop into the spool and record what that did.
+
+        The same two responsibilities ``claim`` has, in the same order, for the
+        payload kind whose bytes must never enter the conversation:
+        ``materialize_file_claim`` performs the authorization (the routing tuple,
+        never ``session_key``) and the transfer, and this method turns its
+        ``mark_spent`` verdict into the durable one-shot record.
+
+        ``mark_spent`` is not advice. It is true exactly when the broker has
+        retired the payload — a success, a broker that answered ``unavailable``, or
+        a publish that failed *after* the commit — and an unmarked entry in those
+        cases makes a later retry look legitimate when it can only fail. It is
+        false for the indeterminate verdict, because there the drop may still be
+        live and marking it spent would throw it away.
+
+        Bookkeeping is not allowed to fail the claim, for the reason
+        :meth:`_record_claim` gives at length: by this point the paths are the only
+        copy of the user's files.
+        """
+        from . import materialize
+
+        result = await materialize.materialize_file_claim(
+            drop_id,
+            origin,
+            journal=self._journal,
+            socket_path=self._socket_path,
+            spool=self._spool,
+            **overrides,
+        )
+        if not (result.get("ok") or result.get("mark_spent")):
+            return result
+
+        if not self._record_claim(drop_id):
+            result = dict(result)
+            result["note"] = (
+                UNRECORDED_FILE_CLAIM_NOTE
+                if result.get("ok")
+                else UNRECORDED_SPENT_FILE_CLAIM_NOTE
+            )
+        return result
+
     def _record_claim(self, drop_id: str) -> bool:
         """Mark the drop spent. ``False`` when the durable record did not take it.
 
@@ -445,5 +512,7 @@ __all__ = [
     "RECEIPT_NOTE",
     "SIZE_REMEDIATION",
     "UNRECORDED_CLAIM_NOTE",
+    "UNRECORDED_FILE_CLAIM_NOTE",
+    "UNRECORDED_SPENT_FILE_CLAIM_NOTE",
     "DropService",
 ]

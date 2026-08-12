@@ -505,6 +505,37 @@ def _resolve_runner_default() -> Any:
         return None
 
 
+async def _arm_spool() -> None:
+    """Purge what a previous process left in the file spool, and start the janitor.
+
+    Here rather than in ``register()`` for the reason ``register()`` avoids every
+    other footprint: plugin discovery runs in *every* CLI process, and a recursive
+    directory walk in ``hermes plugins list`` is exactly the cost this package
+    refuses to pay. This function runs only from a reconcile pass, which happens
+    only when a live gateway runner exists.
+
+    Here rather than only on the claim path because the claim path is not enough:
+    a gateway that claims files, restarts and never claims again would keep every
+    published *and quarantined* directory forever — and a quarantined one is held
+    precisely because it may be the only copy of a user's file, on the promise that
+    the TTL settles it. Nothing settles it if nothing sweeps.
+
+    Never raises, and costs nothing when file drops are switched off.
+    """
+    from . import config as config_mod
+
+    if not config_mod.spool_configured():
+        return
+    try:
+        from . import spool as spool_mod
+
+        spool = spool_mod.Spool()
+        await asyncio.to_thread(spool_mod.ensure_started, spool)
+        spool_mod.ensure_janitor(spool)
+    except Exception:  # noqa: BLE001 - a reconcile pass must not fail on housekeeping
+        logger.warning("hermes-drop: could not arm the file spool", exc_info=True)
+
+
 async def _reconcile_for_runner(runner: Any) -> Dict[str, Any]:
     """The production coroutine: build everything from the live runner.
 
@@ -513,6 +544,7 @@ async def _reconcile_for_runner(runner: Any) -> Dict[str, Any]:
     """
     from . import waiter as waiter_mod
 
+    await _arm_spool()
     journal = journal_mod.DropJournal()
     return await reconcile(
         journal=journal,
