@@ -22,6 +22,12 @@ The MVP does **not** include:
 
 Those ideas may be considered independently later and must not enlarge this implementation.
 
+## Invocation model
+
+The primary interface is natural language, not a slash command. When the user asks Hermes to provide, reveal, return, or generate a secret, Hermes should use the outbound-drop tool automatically instead of placing plaintext in chat.
+
+The model-facing tool exists because Hermes needs a safe execution boundary, but it exposes no destination fields and always delivers back to the authoritative origin conversation. The MVP does **not** add a public slash command. A deterministic command may be reconsidered later only if a real non-model workflow appears; it is not part of this implementation.
+
 ## Approved UX
 
 Hermes posts an origin-bound message containing:
