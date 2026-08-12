@@ -35,38 +35,36 @@ The key architectural issue is therefore **not encryption**. It is keeping binar
 
 ## Product/API shape
 
+The approved user-facing direction is a **single universal drop**. See
+[`UNIVERSAL_DROP_DELIVERY_PLAN.md`](UNIVERSAL_DROP_DELIVERY_PLAN.md) for the
+migration and delivery package.
+
 ### Request
 
-Add a separate model tool rather than overloading `request_private_input`:
+The existing `request_private_input` tool and `/drop` command create one
+origin-bound link that accepts either text or files. Do not add
+`request_private_files` or `/drop-file` to the primary UX. The sender chooses
+payload type in the browser; the model does not choose it at request time.
 
-- `request_private_files({ purpose?, minutes?, max_files? })`
-- No destination fields, preserving the origin-bound schema invariant.
-- `max_files` may only narrow the broker/operator limit; it cannot raise it.
-
-Add `/drop-file` as the deterministic command equivalent. The existing `/drop` remains text-only and backward compatible.
+No destination fields are added, preserving the origin-bound schema invariant.
 
 ### Browser
 
-The metadata response gains a non-secret request mode and limits:
+One form renders the existing textarea and a native multi-file picker, with
+drag/drop as progressive enhancement, selected-file rows, remove actions, totals,
+and pre-encryption limit errors. Text and files are mutually exclusive in one
+submission. There is one Send action and the existing one-shot/exact-envelope
+retry behavior.
 
-```json
-{
-  "payload_kind": "files",
-  "max_files": 5,
-  "max_total_bytes": 44040192,
-  "max_file_bytes": 44040192
-}
-```
+The metadata response advertises both supported envelope versions and the file
+limits. The same `POST /api/submit` endpoint accepts either a text v1 envelope or
+a file v2 envelope. A small non-secret payload declaration allows the broker to
+apply the correct body ceiling and acquire file memory before body buffering;
+the declaration must match the encrypted envelope version.
 
-For file drops, the page renders:
-
-- a native multi-file picker (`accept` unrestricted);
-- drag/drop as progressive enhancement;
-- selected filename, byte size, remove action, total size;
-- explicit limit errors before encryption;
-- the existing one-shot Send/retry behavior.
-
-Do not put filenames in status messages, URLs, logs, or unencrypted metadata.
+File bytes are not base64 encoded: the browser seals the HDROP2 byte container
+directly. Do not put filenames in status messages, URLs, logs, or unencrypted
+metadata.
 
 ### Encrypted payload
 
@@ -227,9 +225,10 @@ submitted -> transferring -> claimed
    - *the Python receiver streams **per chunk** (`ChunkSink`), which is the only shape that can write 42 MiB to a spool without a second copy — and the shape whose per-file predecessor silently delivered zero bytes while its digests still verified;*
    - *the frames are views into the broker's container, so the receiver owns every byte it retains, and `destroy()`'s release-before-zeroize ordering is load-bearing.*
 4. **Plugin spool boundary** — private atomic writes, hash verification, cleanup/recovery, durable-safe tool result.
-5. **Tools and origin binding** — request/claim schemas and `/drop-file`, with the existing forbidden-destination tests extended.
-6. **Browser UX** — picker, multi-file list, limits, container assembly, exact-envelope retry.
-7. **End-to-end/security pass** — browser → broker → plugin spool, restart/expiry/race tests, README/SECURITY/deployment docs.
+5. **Universal broker choice state** — one pending link accepts either text v1 or files v2; pre-body kind declaration/reservation, race and compatibility tests.
+6. **Universal Hermes dispatch** — existing `request_private_input` and `/drop`, origin authorization, internal text-vault/file-spool claim routing; no `/drop-file` or separate request tool.
+7. **One browser form** — textarea plus picker/list/drag-drop, mutually-exclusive send modes, limits, HDROP2 assembly, exact-envelope retry.
+8. **End-to-end/security pass** — universal browser → broker → Hermes dispatch, restart/expiry/race tests, README/SECURITY/deployment docs and manual smoke gate.
 
 ## Acceptance criteria
 
