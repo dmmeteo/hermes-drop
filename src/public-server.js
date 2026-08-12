@@ -8,10 +8,20 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
+import { PAYLOAD_DECLARATIONS, PAYLOAD_DECLARATION_HEADER } from './broker.js';
+
 /** The single generic unavailable body shared by every failure path. */
 export const UNAVAILABLE_JSON = '{"status":"unavailable"}';
 
 export const CAPABILITY_HEADER = 'x-handoff-capability';
+
+/**
+ * The pre-body payload declaration (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md, U1),
+ * re-exported from the broker that owns and advertises it. It is read here, before
+ * the body, because it is what decides how large that body may be.
+ */
+export { PAYLOAD_DECLARATIONS, PAYLOAD_DECLARATION_HEADER };
+
 
 const PUBLIC_DIR = fileURLToPath(new URL('./public/', import.meta.url));
 
@@ -206,13 +216,26 @@ async function handle(request, response, context) {
       return log(404);
     }
 
-    // Admission before buffering. The bound is the drop's own: a text drop keeps
-    // `maxBodyBytes` and is not gated, while a live file drop is widened to what
-    // its advertised limits can produce and admits one body at a time. Asking the
-    // broker first is what keeps a 42 MiB container from being cut off by a
-    // ceiling sized for a 64 KiB secret — without raising that ceiling, or the
-    // number of concurrent 56 MiB buffers, for anyone else.
-    const slot = broker.acquireSubmitSlot(capability);
+    // Which lane this body is, declared before it is read. Only the two words the
+    // broker speaks get past here: anything else — a third value, a repeated header
+    // Node has joined with a comma, a non-string — is the uniform refusal, so the
+    // broker is never handed a declaration it would have to interpret. Absence is
+    // passed through as absence, which a universal drop reads as text for the
+    // documented compatibility window.
+    const declaration = request.headers[PAYLOAD_DECLARATION_HEADER];
+    if (declaration !== undefined && !PAYLOAD_DECLARATIONS.includes(declaration)) {
+      sendUnavailable(response, config);
+      return log(404);
+    }
+
+    // Admission before buffering. The bound is the drop's own: a text submission
+    // keeps `maxBodyBytes` and is not gated, while a declared file submission is
+    // widened to what the drop's advertised limits can produce, admits one body at a
+    // time, and reserves its file memory *here* — before the first byte. Asking the
+    // broker first is what keeps a 42 MiB container from being cut off by a ceiling
+    // sized for a 64 KiB secret — without raising that ceiling, or the number of
+    // concurrent 56 MiB buffers, for anyone else.
+    const slot = broker.acquireSubmitSlot(capability, { declaration });
     if (!slot.ok) {
       sendUnavailable(response, config);
       return log(404);
@@ -237,7 +260,7 @@ async function handle(request, response, context) {
       // alongside the ciphertext, the decoded ciphertext and the plaintext.
       body = null;
 
-      const result = await broker.submit(capability, envelope);
+      const result = await broker.submit(capability, envelope, { declaration });
       if (!result.ok) {
         sendUnavailable(response, config);
         return log(404);
@@ -246,10 +269,13 @@ async function handle(request, response, context) {
       return log(200);
     } finally {
       // However this ended — receipt, refusal, deadline, transport error or an
-      // abort halfway through the body — the next attempt must be admissible.
+      // abort halfway through the body — the next attempt must be admissible, and
+      // the file memory this request reserved must be back in the process budget
+      // unless the submission won and took it over.
       slot.release();
     }
   }
+
 
   sendUnavailable(response, config);
   return log(404);

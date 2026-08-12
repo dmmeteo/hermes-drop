@@ -211,13 +211,13 @@ describe('the control protocol contract', () => {
     // it and absent on the other. A key that quietly appeared on both — or on
     // neither — would leave the fixture describing a response nobody sends.
     it('sends exactly the kind-specific response fields it documents', async () => {
-      const TEXT_ONLY = ['max_plaintext_bytes'];
-      const FILES_ONLY = ['max_files', 'max_file_bytes', 'max_total_bytes'];
-      for (const key of [...TEXT_ONLY, ...FILES_ONLY]) {
+      const TEXT_CAPS = ['max_plaintext_bytes'];
+      const FILE_CAPS = ['max_files', 'max_file_bytes', 'max_total_bytes'];
+      for (const key of [...TEXT_CAPS, ...FILE_CAPS]) {
         assert.match(
           contract.ops.create.response[key],
           /only/,
-          `${key} must document which kind it belongs to`,
+          `${key} must document which kinds it belongs to`,
         );
       }
 
@@ -227,14 +227,64 @@ describe('the control protocol contract', () => {
         ttl_seconds: 60,
         payload_kind: 'files',
       });
-      for (const key of TEXT_ONLY) {
+      // A universal drop quotes *both* sets, because its requester chose neither
+      // lane and may not be told about only one of them. That is the one case where
+      // "kind-specific" means two kinds, so it is asserted rather than left to the
+      // reader of the two exclusions below.
+      const universal = await broker.control({
+        op: 'create',
+        ttl_seconds: 60,
+        payload_kind: 'universal',
+      });
+      for (const key of TEXT_CAPS) {
         assert.ok(key in text, `${key} must be present on a text drop`);
         assert.ok(!(key in files), `${key} must be absent on a files drop`);
+        assert.ok(key in universal, `${key} must be present on a universal drop`);
       }
-      for (const key of FILES_ONLY) {
+      for (const key of FILE_CAPS) {
         assert.ok(key in files, `${key} must be present on a files drop`);
         assert.ok(!(key in text), `${key} must be absent on a text drop`);
+        assert.ok(key in universal, `${key} must be present on a universal drop`);
       }
+    });
+
+    // The universal drop's contract has two halves in two places: `create` mints the
+    // link over this socket, and the sender's choice arrives on the browser-facing
+    // submit endpoint. A foreign client that implements one half from this fixture
+    // and guesses the other would guess at the one thing the AEAD binds, so both are
+    // published here and both are held against the running broker.
+    it('publishes the universal drop and the declaration that chooses its lane', async () => {
+      const { PAYLOAD_DECLARATIONS, PAYLOAD_DECLARATION_HEADER } = await import(
+        '../src/public-server.js'
+      );
+      const universal = contract.universal_drop;
+
+      assert.ok(contract.payload_kinds.includes(universal.payload_kind));
+      assert.match(universal.pending_choice, /exactly one/i, 'one link still takes one submission');
+      assert.equal(universal.declaration.header, PAYLOAD_DECLARATION_HEADER);
+      assert.deepEqual(universal.declaration.values, [...PAYLOAD_DECLARATIONS]);
+      assert.deepEqual(universal.declaration.envelope_versions, { text: 1, files: 2 });
+      assert.match(universal.declaration.binding, /unavailable/, 'a mismatch is the uniform body');
+      assert.match(universal.declaration.compatibility_window, /omits the header/);
+      assert.match(universal.declaration.reservation, /before the body is buffered/);
+
+      // ...and the broker really advertises all three facts to the page, so nothing
+      // in the paragraphs above has to be known in advance by whoever renders it.
+      const created = await broker.control({
+        op: 'create',
+        ttl_seconds: 60,
+        payload_kind: 'universal',
+      });
+      const capability = created.url.slice(created.url.indexOf('#') + 1);
+      const response = await fetch(`${broker.baseUrl}/api/metadata`, {
+        method: 'POST',
+        headers: { 'x-handoff-capability': capability },
+      });
+      const metadata = await response.json();
+      assert.equal(metadata.payload_kind, universal.payload_kind);
+      assert.deepEqual(metadata.accepts, universal.declaration.values);
+      assert.deepEqual(metadata.envelope_versions, universal.declaration.envelope_versions);
+      assert.equal(metadata.payload_declaration, universal.declaration.header);
     });
 
     it('documents the create request fields the server really validates', async () => {

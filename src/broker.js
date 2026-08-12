@@ -55,18 +55,52 @@
 // Payload kinds (docs/FILE_TRANSFER_MVP.md, slice 2). A handoff is minted as
 // `text` — one UTF-8 secret under `maxPlaintextBytes`, envelope v1, unchanged in
 // every respect — or as `files`, which carries one HDROP2 container under the
-// file limits and envelope v2. The kind is fixed at creation and decides three
-// things that must never be decided by the submitter: which envelope version the
-// broker will rebuild `info` with, which ceiling the ciphertext is measured
-// against, and whether the decrypted bytes must parse as a container before the
-// record may reach `submitted`.
+// file limits and envelope v2. The kind decides three things that must never be
+// decided freely by the submitter: which envelope version the broker will rebuild
+// `info` with, which ceiling the ciphertext is measured against, and whether the
+// decrypted bytes must parse as a container before the record may reach
+// `submitted`.
+//
+// The universal drop (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md, U1). A third kind is
+// minted without that choice made — `pending(choice)` — because the sender, not
+// the requester, decides in the browser:
+//
+//   pending(choice)
+//     ├─ accepted v1 text  → submitted(text)
+//     └─ accepted v2 files → submitted(files)
+//
+// Two rules keep that from handing the submitter the three decisions above:
+//
+//   DECLARE  one submission says which lane it is *before* its body is read, in a
+//            non-secret request header next to the capability. The broker resolves
+//            that declaration to a kind once, and every ceiling, version and
+//            validation rule for that request comes from the resolution — never
+//            from the envelope's own `v`, which is a claim, not an authority.
+//   BIND     the resolved kind's version goes into `info`, so a declaration and a
+//            ciphertext that disagree cannot open. A mismatch is refused before any
+//            crypto, and neither the drop nor the AEAD budget pays for it.
+//
+// A universal record's kind is fixed by the winning submission, in the same
+// synchronous step that stores the payload, and is immutable afterwards: from
+// `submitted` onward it is indistinguishable from a drop minted that way, which is
+// what lets `claim`, `beginFileClaim` and every other seam stay as they were. A
+// competing submission of the other kind then reads as a declaration that
+// contradicts a fixed kind, i.e. the same uniform `unavailable` as any second
+// submission.
 //
 // The live-file byte budget, in one place because every release has to agree
 // with it:
 //
-//   RESERVE  `create` takes one reservation, synchronously, before its first
-//            await. Refused when it does not fit, with the same uniform
-//            `unavailable` as everything else.
+//   RESERVE  a drop minted as `files` takes one reservation in `create`,
+//            synchronously, before its first await. Refused when it does not fit,
+//            with the same uniform `unavailable` as everything else.
+//   LEASE    a *universal* drop reserves nothing at creation — it may never carry
+//            a file at all, and four idle text-capable links must not exhaust the
+//            budget. Its reservation is taken by the `files` declaration in
+//            `acquireSubmitSlot`, before a byte of the body is buffered, and it
+//            converts into the reservation above in the same synchronous step that
+//            fixes the kind. Every other ending — refusal, abort, deadline, expiry,
+//            shutdown — gives it back.
 //   HOLD     `submit` does not release. From submit onward the broker really is
 //            holding those bytes, so releasing there would let the process
 //            exceed the budget it enforced at create.
@@ -97,6 +131,7 @@ import {
   FileContainerError,
   PAYLOAD_KIND_FILES,
   PAYLOAD_KIND_TEXT,
+  PAYLOAD_KIND_UNIVERSAL,
   decodeFileContainer,
   fileContainerCeiling,
   narrowFileLimits,
@@ -142,8 +177,37 @@ function transferFailed(reason) {
  */
 const MIN_TRANSFER_LEASE_MS = 1000;
 
-/** The payload kinds this broker speaks, advertised on `create`. */
-export const PAYLOAD_KINDS = Object.freeze([PAYLOAD_KIND_TEXT, PAYLOAD_KIND_FILES]);
+/** The payload kinds this broker can mint, advertised on `create`. */
+export const PAYLOAD_KINDS = Object.freeze([
+  PAYLOAD_KIND_TEXT,
+  PAYLOAD_KIND_FILES,
+  PAYLOAD_KIND_UNIVERSAL,
+]);
+
+/**
+ * The lanes one submission can declare, and the only two a universal link accepts.
+ * `universal` is deliberately not among them: it is what a *link* is before a
+ * sender chooses, never something a submission may claim to be.
+ */
+export const PAYLOAD_DECLARATIONS = Object.freeze([PAYLOAD_KIND_TEXT, PAYLOAD_KIND_FILES]);
+
+/**
+ * The request header the declaration rides in, following the capability's own
+ * convention (`x-handoff-capability`) rather than inventing a second one.
+ *
+ * It is spelled here, next to the rules that interpret it, because the broker is
+ * what *advertises* it in a universal link's metadata: a page is told the header
+ * name rather than having to know it. The transport seam re-exports this
+ * (src/public-server.js) and the browser bundle states the same header in its own
+ * canonical casing (src/client/handoff-client.js), the way it already does for the
+ * capability. All three are held together by test/universal-drop.test.js.
+ *
+ * What it carries is the whole reason it is safe: one of two fixed words, chosen by
+ * the sender, revealing text-versus-files to a broker that is about to receive the
+ * payload anyway. No name, size, MIME hint, count or digest is in it, and nothing
+ * secret can be: it is written before the body it describes.
+ */
+export const PAYLOAD_DECLARATION_HEADER = 'x-handoff-payload';
 
 /**
  * Everything in one submit body that is not the base64 ciphertext: the version,
@@ -185,6 +249,7 @@ export function createBroker(config, logger = console) {
   const byHandoffId = new Map();
   let baseUrl = config.baseUrl;
 
+
   /** The operator's validated per-drop file caps; narrow-only, checked at startup. */
   const fileLimits = config.fileLimits;
   /** Sum of every live reservation. Only `reserveFileBytes`/`release` may move it. */
@@ -209,39 +274,138 @@ export function createBroker(config, logger = console) {
   }
 
   /**
-   * The two numbers a drop's payload kind fixes, resolved once at creation
-   * rather than on every submit: the largest plaintext it can carry, and the
-   * envelope version its `info` must be built with. Both are read from the
-   * record afterwards, never from the envelope.
+   * The two numbers a payload kind fixes: the largest plaintext it can carry, and
+   * the envelope version its `info` must be built with. Resolved at creation for a
+   * drop minted `text` or `files`, and once per submission for a universal one —
+   * from the declared lane, never from the envelope.
+   *
+   * `universal` has neither number, on purpose: a record that answered here with a
+   * default would be a record whose ceiling a submitter could pick by silence.
    */
   function payloadShapeFor(payloadKind, limits) {
-    if (payloadKind !== PAYLOAD_KIND_FILES) {
+    if (payloadKind === PAYLOAD_KIND_FILES) {
+      return {
+        maxPayloadBytes: fileContainerCeiling(limits),
+        envelopeVersion: FILE_ENVELOPE_VERSION,
+      };
+    }
+    if (payloadKind === PAYLOAD_KIND_TEXT) {
       return { maxPayloadBytes: config.maxPlaintextBytes, envelopeVersion: ENVELOPE_VERSION };
     }
-    return {
-      maxPayloadBytes: fileContainerCeiling(limits),
-      envelopeVersion: FILE_ENVELOPE_VERSION,
-    };
+    return { maxPayloadBytes: null, envelopeVersion: null };
   }
 
   /**
-   * The record a widened submit body would be read for, or `null` for everything
-   * else — unknown, malformed, expired, a text drop, or a file drop that has
-   * already been submitted to or claimed. `null` is what collapses the ceiling
-   * back to `maxBodyBytes`, so a caller without a live pending file capability
-   * learns nothing and buys no extra buffer.
+   * The live *pending* record a capability names, or `null` for everything else —
+   * unknown, malformed, expired, submitted or claimed. `null` is what collapses
+   * every ceiling below back to `maxBodyBytes`, so a caller without a live pending
+   * capability learns nothing and buys no extra buffer.
    */
-  function widenableRecord(capability) {
+  function pendingRecord(capability) {
     const record = resolve(capability);
-    if (!record || record.state !== 'pending' || record.payloadKind !== PAYLOAD_KIND_FILES) {
-      return null;
-    }
+    if (!record || record.state !== 'pending') return null;
     return record;
   }
 
-  function bodyCeilingFor(record) {
-    if (record === null) return config.maxBodyBytes;
-    return base64Length(record.maxPayloadBytes + AEAD_TAG_BYTES) + ENVELOPE_JSON_OVERHEAD_BYTES;
+  /** A live record that may legitimately need the widened file retry ceiling. */
+  function fileSubmitRecord(capability, declaration) {
+    const record = resolve(capability);
+    if (!record) return null;
+    if (record.state === 'pending') return record;
+    if (
+      record.state === 'submitted' &&
+      record.payloadKind === PAYLOAD_KIND_FILES &&
+      declaration === PAYLOAD_KIND_FILES
+    ) return record;
+    return null;
+  }
+
+  /** Canonical full retry identity, including the resolved declaration. */
+  function envelopeIdentity(envelope, declaration) {
+    return sha256HexSync(
+      JSON.stringify([
+        envelope.v,
+        envelope.hid,
+        envelope.pkfp,
+        envelope.enc,
+        envelope.ct,
+        declaration,
+      ]),
+    );
+  }
+
+  /**
+   * The lane one submission is being made as, or `null` for a refusal.
+   *
+   * Three cases, and the middle one is the whole point of the slice:
+   *
+   *   - a drop minted `text` or `files` has its lane already. A declaration that
+   *     agrees is accepted, silence is accepted, and a declaration that
+   *     *contradicts* it is refused — never ignored, because a sender that declared
+   *     one lane and had the other applied would have been misheard about the only
+   *     thing it was asked;
+   *   - a universal drop takes the declaration. `text` and `files` are the two
+   *     lanes; anything else is a refusal;
+   *   - a universal drop with no declaration reads as `text`. That is the
+   *     documented compatibility window for a client from before the declaration,
+   *     and it is safe in the one direction that matters: silence buys the small
+   *     ceiling, no reservation and envelope v1, so an undeclared container is a
+   *     version mismatch rather than an admission.
+   *
+   * The lane of a *universal* link is read from `mintedKind`, not from the kind its
+   * winning submission fixed, so silence means the same thing for the whole life of
+   * that link: an undeclared retry of a container is refused after the container
+   * won exactly as it was before. A rule whose meaning changed with the record's
+   * state would be one nobody could audit from the header alone.
+   */
+  function resolveSubmitKind(record, declaration) {
+    if (declaration !== undefined && declaration !== null) {
+      if (!PAYLOAD_DECLARATIONS.includes(declaration)) return null;
+    }
+    if (record.mintedKind === PAYLOAD_KIND_UNIVERSAL) {
+      return declaration ?? PAYLOAD_KIND_TEXT;
+    }
+    if (declaration && declaration !== record.payloadKind) return null;
+    return record.payloadKind;
+  }
+
+  /** The widened body ceiling for one file submission against this record's limits. */
+  function fileBodyCeiling(record) {
+    const ceiling = fileContainerCeiling(record.fileLimits);
+    return base64Length(ceiling + AEAD_TAG_BYTES) + ENVELOPE_JSON_OVERHEAD_BYTES;
+  }
+
+  /**
+   * Reserves the file budget for one submission that has not been read yet, or
+   * refuses. Synchronous like `reserveFileBytes` and for the same reason.
+   *
+   * A drop minted `files` already reserved at creation, so its lease holds nothing
+   * and releases nothing — the reservation there belongs to the record from the
+   * moment it exists. Only a universal drop's file lane borrows.
+   */
+  function takeFileSubmitLease(record) {
+    // One lease per record, structurally. `bodySlotBusy` already admits one file
+    // body at a time and is the refusal a caller sees; this is what makes a second
+    // lease impossible rather than merely unreachable.
+    if (record.submitLease) return null;
+    if (record.reservedBytes > 0) return { bytes: 0, held: false };
+    const bytes = fileContainerCeiling(record.fileLimits);
+    if (!reserveFileBytes(bytes)) return null;
+    const lease = { bytes, held: true };
+    record.submitLease = lease;
+    record.reservedBytes = bytes;
+    return lease;
+  }
+
+  /**
+   * Gives one submit lease back. Idempotent, and it cannot release a lease that is
+   * no longer the record's — a converted lease (the submission won) or one a
+   * `destroy` already took back both land here and do nothing.
+   */
+  function releaseFileSubmitLease(record, lease) {
+    if (!lease?.held || record.submitLease !== lease) return;
+    record.submitLease = null;
+    releaseReservation(record);
   }
 
   /**
@@ -332,6 +496,11 @@ export function createBroker(config, logger = console) {
     record.publicKeyBytes = null;
     record.state = 'destroyed';
     releaseReservation(record);
+    // A submit lease is a reservation too, and the release above took it back. The
+    // request that holds it is told nothing — it will find its body refused like any
+    // other submission to a record that is gone — so the pointer is dropped here to
+    // keep "holds a lease" and "holds bytes" from disagreeing for a destroyed record.
+    record.submitLease = null;
     byCapabilityHash.delete(record.capabilityHashHex);
     byHandoffId.delete(record.handoffId);
     notify(record, 'unavailable');
@@ -366,10 +535,10 @@ export function createBroker(config, logger = console) {
    * record can be in flight, which is what makes the pending -> submitted
    * transition below a single-use gate.
    */
-  async function acceptEnvelope(record, envelope, envelopeKeyHex) {
+  async function acceptEnvelope(record, envelope, envelopeKeyHex, submission) {
     if (envelope.hid !== record.handoffId) return UNAVAILABLE;
 
-    const maxPayloadBytes = record.maxPayloadBytes;
+    const { kind, maxPayloadBytes, envelopeVersion } = submission;
     const enc = safeDecode(envelope.enc, ENC_BYTES);
     const ct = safeDecode(envelope.ct);
     const pkfp = safeDecode(envelope.pkfp, 16);
@@ -388,7 +557,7 @@ export function createBroker(config, logger = console) {
     const info = buildInfo({
       handoffId: record.handoffId,
       capabilityHash: record.capabilityHash,
-      version: record.envelopeVersion,
+      version: envelopeVersion,
     });
 
     let plaintext;
@@ -424,7 +593,7 @@ export function createBroker(config, logger = console) {
     // handed anyway (see the ownership note in src/file-container.js).
     let fileCount = 0;
     let fileTotalBytes = 0;
-    if (record.payloadKind === PAYLOAD_KIND_FILES) {
+    if (kind === PAYLOAD_KIND_FILES) {
       try {
         const decoded = await decodeFileContainer(plaintext, { limits: record.fileLimits });
         fileCount = decoded.files.length;
@@ -452,6 +621,40 @@ export function createBroker(config, logger = console) {
       zeroize(plaintext);
       return UNAVAILABLE;
     }
+    if (kind === PAYLOAD_KIND_FILES) {
+      if (record.reservedBytes === 0) {
+        // No pre-body lease was taken, so this is an in-process caller that went
+        // straight to `submit` rather than through `acquireSubmitSlot`. The budget
+        // still has to hold, so the reservation happens here — late, but inside the
+        // same gate and still before the record holds a single payload byte.
+        if (!reserveFileBytes(maxPayloadBytes)) {
+          zeroize(plaintext);
+          logger.warn?.(
+            `handoff submit refused hid=${record.handoffId} reason=live_file_budget ` +
+              `wanted=${maxPayloadBytes} limit=${config.maxLiveFileBytes}`,
+          );
+          return UNAVAILABLE;
+        }
+        record.reservedBytes = maxPayloadBytes;
+      }
+      // The lease converts here and only here: from this line the reserved bytes are
+      // the record's own, released by the retirement or by `destroy` like every other
+      // drop's, and whichever request held the lease has nothing left to give back.
+      record.submitLease = null;
+    }
+    // A *text* winner deliberately converts nothing. The two lanes race, so a file
+    // body can be admitted and holding its reservation when the secret lands — and
+    // that reservation belongs to the upload that is now being refused, not to the
+    // record. Taking it over here would leave a text drop holding 42 MiB of file
+    // budget for the rest of its TTL, for a payload it does not have; leaving it
+    // alone lets the refused request's `release` give it straight back.
+
+    // The choice is made, and it is made once. Everything downstream — the claim
+    // seam, the transfer lease, the ceiling a retry is measured against — reads the
+    // kind from the record, so a universal drop stops being universal right here.
+    record.payloadKind = kind;
+    record.maxPayloadBytes = maxPayloadBytes;
+    record.envelopeVersion = envelopeVersion;
     record.plaintext = plaintext;
     record.envelopeKeyHex = envelopeKeyHex;
     record.state = 'submitted';
@@ -480,11 +683,16 @@ export function createBroker(config, logger = console) {
     /**
      * Seam 1: mint a handoff and return its one-time URL.
      *
-     * `payloadKind` is fixed here and never revisited: it decides the envelope
-     * version, the ciphertext ceiling and whether a container is required. A
-     * `files` drop also reserves its advertised maximum against the process-wide
-     * budget *before the first await*, so two concurrent creations cannot both
-     * pass a check only one of them fits through.
+     * `payloadKind` decides the envelope version, the ciphertext ceiling and
+     * whether a container is required. `text` and `files` fix all three here and
+     * never revisit them; `universal` mints the link without the choice made and
+     * resolves them once per submission from the sender's declaration.
+     *
+     * A `files` drop reserves its advertised maximum against the process-wide
+     * budget *before the first await*, so two concurrent creations cannot both pass
+     * a check only one of them fits through. A universal drop reserves nothing: it
+     * may never carry a file at all, and pre-reserving would let four idle
+     * text-capable links exhaust a budget for bytes nobody sent.
      */
     async create({ ttlSeconds = config.ttlSeconds, payloadKind = PAYLOAD_KIND_TEXT, maxFiles } = {}) {
       if (!PAYLOAD_KINDS.includes(payloadKind)) return INVALID_REQUEST;
@@ -494,13 +702,17 @@ export function createBroker(config, logger = console) {
       if (!baseUrl) throw new Error('broker baseUrl is not resolved yet');
 
       const isFiles = payloadKind === PAYLOAD_KIND_FILES;
+      const isUniversal = payloadKind === PAYLOAD_KIND_UNIVERSAL;
       // A requester may narrow the file count and never raise it; nonsense is
       // read as "no narrowing asked for", which is what the codec's own resolver
-      // does with a model tool's argument.
-      const limits = isFiles ? narrowFileLimits(fileLimits, { maxFiles }) : null;
+      // does with a model tool's argument. A universal link carries the file limits
+      // too: they are half of what its metadata advertises, and the ceiling its file
+      // lane is measured against.
+      const limits = isFiles || isUniversal ? narrowFileLimits(fileLimits, { maxFiles }) : null;
       const { maxPayloadBytes, envelopeVersion } = payloadShapeFor(payloadKind, limits);
       // The reservation is the ceiling the broker will actually enforce on this
-      // drop's plaintext, so the two can never disagree.
+      // drop's plaintext, so the two can never disagree. A universal drop has no
+      // such ceiling yet, and reserves when its file lane is declared.
       const reservedBytes = isFiles ? maxPayloadBytes : 0;
       if (isFiles && !reserveFileBytes(reservedBytes)) {
         // Not a caller mistake and not a statement about any one handoff, so it
@@ -535,10 +747,24 @@ export function createBroker(config, logger = console) {
           keyPair,
           publicKeyBytes,
           payloadKind,
+          /**
+           * The kind this drop was *minted* as, which `payloadKind` stops being the
+           * moment a universal drop's submission fixes one. Retained because how a
+           * link reads an absent declaration is a fact about the link, not about
+           * whether it has been submitted to yet.
+           */
+          mintedKind: payloadKind,
           fileLimits: limits,
           maxPayloadBytes,
           envelopeVersion,
           reservedBytes,
+          /**
+           * The provisional reservation one in-flight file submission holds, or
+           * null. Only a universal drop ever has one, and it stops being
+           * provisional — without moving a byte of the counter — the moment that
+           * submission wins.
+           */
+          submitLease: null,
           bodySlotBusy: false,
           /** The one live transfer lease, or null. See `clearLease` above. */
           transfer: null,
@@ -569,13 +795,19 @@ export function createBroker(config, logger = console) {
           ttl_seconds: ttlSeconds,
           payload_kind: payloadKind,
         };
-        if (!isFiles) return { ...created, max_plaintext_bytes: config.maxPlaintextBytes };
-        return {
-          ...created,
-          max_files: limits.maxFiles,
-          max_file_bytes: limits.maxFileBytes,
-          max_total_bytes: limits.maxTotalBytes,
-        };
+        const fileCaps = isFiles || isUniversal
+          ? {
+              max_files: limits.maxFiles,
+              max_file_bytes: limits.maxFileBytes,
+              max_total_bytes: limits.maxTotalBytes,
+            }
+          : {};
+        // A universal link quotes both caps, because the requester chose neither
+        // lane and may not be told about only one of them. A typed drop quotes only
+        // its own: the secret cap says nothing about a container, and the file caps
+        // say nothing about a secret.
+        if (isFiles) return { ...created, ...fileCaps };
+        return { ...created, max_plaintext_bytes: config.maxPlaintextBytes, ...fileCaps };
       } catch (error) {
         // Key generation is the only thing here that can fail, and a reservation
         // for a drop that never existed would never be released by anything.
@@ -601,7 +833,10 @@ export function createBroker(config, logger = console) {
       if (!record || record.state !== 'pending') return UNAVAILABLE;
       const common = {
         ok: true,
-        v: record.envelopeVersion,
+        // The version a submission must seal with when it declares nothing. For a
+        // typed drop that is the drop's only version; for a universal one it is the
+        // text lane, which is exactly what silence resolves to.
+        v: record.envelopeVersion ?? ENVELOPE_VERSION,
         hid: record.handoffId,
         suite: SUITE_ID,
         pk: bytesToBase64Url(record.publicKeyBytes),
@@ -612,14 +847,27 @@ export function createBroker(config, logger = console) {
         // the page needs time *left*, and that is expiry minus a time base.
         now,
       };
-      if (record.payloadKind !== PAYLOAD_KIND_FILES) {
+      if (record.payloadKind === PAYLOAD_KIND_TEXT) {
         return { ...common, max_plaintext_bytes: config.maxPlaintextBytes };
       }
-      return {
-        ...common,
+      const fileCaps = {
         max_files: record.fileLimits.maxFiles,
         max_total_bytes: record.fileLimits.maxTotalBytes,
         max_file_bytes: record.fileLimits.maxFileBytes,
+      };
+      if (record.payloadKind === PAYLOAD_KIND_FILES) return { ...common, ...fileCaps };
+
+      // A universal link: one response, both lanes, and the three facts a page
+      // cannot be asked to infer — which lanes it may choose between, which version
+      // each lane must be sealed with, and the header the choice travels in. A page
+      // that guessed any of them would be guessing at what the AEAD binds.
+      return {
+        ...common,
+        accepts: [...PAYLOAD_DECLARATIONS],
+        envelope_versions: { text: ENVELOPE_VERSION, files: FILE_ENVELOPE_VERSION },
+        payload_declaration: PAYLOAD_DECLARATION_HEADER,
+        max_plaintext_bytes: config.maxPlaintextBytes,
+        ...fileCaps,
       };
     },
 
@@ -636,8 +884,16 @@ export function createBroker(config, logger = console) {
      * Pure: it admits nothing and takes nothing. `acquireSubmitSlot` is what a
      * request goes through; this is what tests and operators can ask.
      */
-    submitBodyCeiling(capability) {
-      return bodyCeilingFor(widenableRecord(capability));
+    submitBodyCeiling(capability, { declaration } = {}) {
+      const record = pendingRecord(capability);
+      if (record === null) return config.maxBodyBytes;
+      // A declaration this record cannot honour gets the text ceiling rather than a
+      // refusal: this function is pure and has no refusal channel. The refusal is
+      // `acquireSubmitSlot`'s, which is what a request actually goes through.
+      if (resolveSubmitKind(record, declaration) !== PAYLOAD_KIND_FILES) {
+        return config.maxBodyBytes;
+      }
+      return fileBodyCeiling(record);
     },
 
     /**
@@ -663,16 +919,52 @@ export function createBroker(config, logger = console) {
      * timed out, errored or aborted mid-body — or the drop is locked out of its
      * own submission for the rest of its TTL. It is idempotent.
      */
-    acquireSubmitSlot(capability) {
+    acquireSubmitSlot(capability, { declaration } = {}) {
       // Resolved once, so the record the ceiling was computed from is the record
       // the slot is taken on — no second lookup that could disagree with the first.
-      const record = widenableRecord(capability);
-      const ceiling = bodyCeilingFor(record);
+      const record = fileSubmitRecord(capability, declaration);
+      const textCeiling = config.maxBodyBytes;
       if (record === null) {
-        return { ok: true, ceiling, widened: false, release: () => {} };
+        return { ok: true, ceiling: textCeiling, widened: false, release: () => {} };
       }
+
+      // The lane, before a byte is read. A declaration this drop cannot honour is
+      // refused here rather than at the far end of a 56 MiB upload — and refused
+      // with the uniform `unavailable`, having consumed nothing.
+      const kind = resolveSubmitKind(record, declaration);
+      if (kind === null) {
+        logger.warn?.(
+          `handoff submit refused hid=${record.handoffId} reason=payload_declaration_refused`,
+        );
+        return { ok: false, ceiling: textCeiling, widened: false, release: () => {} };
+      }
+      if (kind !== PAYLOAD_KIND_FILES) {
+        // The text lane, gated by nothing, exactly as text always was: its ceiling
+        // was always small enough to buffer freely and the seam-3 concurrency
+        // behaviour depends on the losers reaching the broker.
+        return { ok: true, ceiling: textCeiling, widened: false, release: () => {} };
+      }
+
+      const ceiling = fileBodyCeiling(record);
       if (record.bodySlotBusy) {
         logger.warn?.(`handoff submit refused hid=${record.handoffId} reason=submit_slot_busy`);
+        return { ok: false, ceiling, widened: true, release: () => {} };
+      }
+      // Checked after the busy gate, so a refused admission never reserves and then
+      // gives back. A universal drop borrows here; a drop minted `files` reserved at
+      // creation and its lease holds nothing.
+      // A submitted file record already owns its payload reservation. Its exact
+      // retry needs only this bounded body slot, never a second reservation.
+      const lease =
+        record.state === 'submitted'
+          ? { bytes: 0, held: false }
+          : takeFileSubmitLease(record);
+      if (lease === null) {
+        logger.warn?.(
+          `handoff submit refused hid=${record.handoffId} reason=live_file_budget ` +
+            `wanted=${fileContainerCeiling(record.fileLimits)} reserved=${reservedFileBytes} ` +
+            `limit=${config.maxLiveFileBytes}`,
+        );
         return { ok: false, ceiling, widened: true, release: () => {} };
       }
       record.bodySlotBusy = true;
@@ -685,20 +977,41 @@ export function createBroker(config, logger = console) {
           if (released) return;
           released = true;
           record.bodySlotBusy = false;
+          // A no-op once the submission won and the lease became the record's own
+          // reservation, and a no-op again if a destroy took it back first.
+          releaseFileSubmitLease(record, lease);
         },
       };
     },
 
-    /** Seam 3: accept exactly one HPKE envelope. */
-    async submit(capability, envelope) {
+    /**
+     * Seam 3: accept exactly one HPKE envelope.
+     *
+     * `declaration` is the sender's pre-body choice of lane, and it decides the
+     * version `info` is rebuilt with and the ceiling the ciphertext is measured
+     * against. It is resolved against the record's own kind first, so it can only
+     * ever *choose* where a universal drop left a choice — never override a kind
+     * that is already fixed. A declaration that contradicts one is the uniform
+     * refusal, before any crypto and without touching the AEAD budget.
+     */
+    async submit(capability, envelope, { declaration } = {}) {
       // Everything from here to registering the attempt is synchronous, so two
       // concurrent duplicates cannot both start decrypting.
       const record = resolve(capability);
       if (!record) return UNAVAILABLE;
 
+      const kind = resolveSubmitKind(record, declaration);
+      if (kind === null) return UNAVAILABLE;
+      const shape = payloadShapeFor(kind, record.fileLimits);
+      const submission = { kind, ...shape };
+
       // Idempotency key over the envelope bytes, per the accepted crypto model.
-      const envelopeKeyHex = isEnvelopeShapeValid(envelope, record)
-        ? sha256HexSync(`${envelope.enc}.${envelope.ct}`)
+      // Measured against the *declared* lane's version and ceiling, which is what
+      // makes an exact retry have to carry its declaration too: the same bytes with
+      // the other declaration are not a shape this drop can be submitted to, so
+      // they are refused rather than answered with a receipt.
+      const envelopeKeyHex = isEnvelopeShapeValid(envelope, shape)
+        ? envelopeIdentity(envelope, kind)
         : null;
 
       // Idempotent replay of the winning envelope (mobile retry, double tap, lost
@@ -718,7 +1031,7 @@ export function createBroker(config, logger = console) {
           : UNAVAILABLE;
       }
 
-      const attempt = acceptEnvelope(record, envelope, envelopeKeyHex);
+      const attempt = acceptEnvelope(record, envelope, envelopeKeyHex, submission);
       record.inFlight = { envelopeKeyHex, promise: attempt };
       try {
         return await attempt;
@@ -817,6 +1130,7 @@ export function createBroker(config, logger = console) {
       for (const record of [...byHandoffId.values()]) destroy(record, 'shutdown');
     },
 
+
     /**
      * The live-file budget, as numbers. Not test-only and not secret: it is a
      * count and three byte totals, with nothing in it derived from a payload, a
@@ -827,10 +1141,16 @@ export function createBroker(config, logger = console) {
     fileBudget() {
       let reservations = 0;
       let reservedBytesFromRecords = 0;
+      let submitLeases = 0;
+      let leasedBytes = 0;
       for (const record of byHandoffId.values()) {
         if (record.reservedBytes > 0) {
           reservations += 1;
           reservedBytesFromRecords += record.reservedBytes;
+        }
+        if (record.submitLease?.held) {
+          submitLeases += 1;
+          leasedBytes += record.submitLease.bytes;
         }
       }
       return {
@@ -845,6 +1165,13 @@ export function createBroker(config, logger = console) {
         reservedBytesFromRecords,
         availableBytes: config.maxLiveFileBytes - reservedFileBytes,
         reservations,
+        // How much of `reservedBytes` is still an unread body's rather than a
+        // payload the broker is really holding — a subset of the reservations above,
+        // not an addition to them. It is the one thing the totals cannot show on
+        // their own, and it is what tells an operator whether the budget is full of
+        // drops or full of uploads that never arrived.
+        submitLeases,
+        leasedBytes,
         reservationBytes: config.fileReservationBytes,
       };
     },
@@ -1176,6 +1503,7 @@ export function createBroker(config, logger = console) {
       return {
         state: record.state,
         payloadKind: record.payloadKind,
+        mintedKind: record.mintedKind,
         hasPrivateKey: record.keyPair !== null,
         hasPlaintext: record.plaintext !== null,
         plaintextBytes: record.plaintext ? record.plaintext.length : 0,
@@ -1187,6 +1515,11 @@ export function createBroker(config, logger = console) {
         fileCount: record.fileCount,
         fileTotalBytes: record.fileTotalBytes,
         reservedBytes: record.reservedBytes,
+        // Whether the reservation above is still an in-flight submission's, as a
+        // byte count and nothing else — the lease object itself is two numbers, but
+        // reporting it as a shape a test can print keeps it symmetrical with
+        // `transfer` below.
+        submitLease: record.submitLease ? { bytes: record.submitLease.bytes } : null,
         bodySlotBusy: record.bodySlotBusy,
         // The live transfer lease as four numbers and an id. Deliberately not the
         // lease object: that one holds the manifest's digests and a callback into
@@ -1206,6 +1539,7 @@ export function createBroker(config, logger = console) {
         waiters: record.waiters.length,
         serialized: JSON.stringify(record, (key, value) => {
           if (key === 'plaintext') return value ? '[redacted]' : null;
+          if (key === 'submitLease') return value ? `[lease ${value.bytes}]` : null;
           // Same reasoning as above, and it matters more here: this string is what
           // the invariant tests grep for leaked payloads.
           if (key === 'transfer') return value ? `[lease ${value.transferId}]` : null;
@@ -1221,10 +1555,12 @@ export function createBroker(config, logger = console) {
 }
 
 /**
- * Shape only, and always against the version and ceiling the *record's own*
- * payload kind requires — never against whatever the envelope claims. A text
- * drop therefore still refuses `v: 2` here, before any crypto and without
- * spending a byte of the AEAD budget, exactly as it always did.
+ * Shape only, and always against the version and ceiling of the lane this
+ * submission was *resolved* to — the record's fixed kind, or the declaration that
+ * chose one on a universal link — never against whatever the envelope claims. A
+ * text drop therefore still refuses `v: 2` here, before any crypto and without
+ * spending a byte of the AEAD budget, exactly as it always did, and a container
+ * declared as text is refused on the same line.
  */
 function isEnvelopeShapeValid(envelope, { envelopeVersion, maxPayloadBytes }) {
   if (!envelope || typeof envelope !== 'object') return false;

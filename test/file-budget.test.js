@@ -50,6 +50,25 @@ const SAMPLE_FILES = [{ name: 'note.txt', type: 'text/plain', bytes: utf8('a sma
 const DEFAULT_DROP_BYTES = fileContainerCeiling(DEFAULT_FILE_LIMITS);
 const DEFAULT_BUDGET_BYTES = 4 * DEFAULT_DROP_BYTES;
 
+/**
+ * The whole report on a broker holding nothing, spelled out once. Asserted as a
+ * *complete* object rather than field by field, so a counter added later has to be
+ * accounted for here — which is how `submitLeases`/`leasedBytes` arrived: a
+ * universal drop's file lane reserves per submission
+ * (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md, U1), and a reservation held by an unread
+ * body is the one thing the totals cannot distinguish on their own.
+ */
+const EMPTY_BUDGET = {
+  limitBytes: DEFAULT_BUDGET_BYTES,
+  reservedBytes: 0,
+  reservedBytesFromRecords: 0,
+  availableBytes: DEFAULT_BUDGET_BYTES,
+  reservations: 0,
+  submitLeases: 0,
+  leasedBytes: 0,
+  reservationBytes: DEFAULT_DROP_BYTES,
+};
+
 function testBroker(overrides = {}) {
   return startTestBroker({ sweepIntervalMs: 3_600_000, ...overrides });
 }
@@ -98,14 +117,7 @@ describe('the live-file budget', () => {
   }
 
   it('reports the shipped budget and nothing reserved on a fresh broker', () => {
-    assert.deepEqual(budget(), {
-      limitBytes: DEFAULT_BUDGET_BYTES,
-      reservedBytes: 0,
-      reservedBytesFromRecords: 0,
-      availableBytes: DEFAULT_BUDGET_BYTES,
-      reservations: 0,
-      reservationBytes: DEFAULT_DROP_BYTES,
-    });
+    assert.deepEqual(budget(), EMPTY_BUDGET);
     assert.equal(DEFAULTS.maxLiveFileBytes, DEFAULT_BUDGET_BYTES, 'and it is the shipped default');
   });
 
@@ -184,14 +196,7 @@ describe('the live-file budget', () => {
     core.sweep(Date.now() + TTL_SECONDS * 1000 + 1);
 
     assert.equal(broker.testSnapshot(drop.id), null);
-    assert.deepEqual(budget(), {
-      limitBytes: DEFAULT_BUDGET_BYTES,
-      reservedBytes: 0,
-      reservedBytesFromRecords: 0,
-      availableBytes: DEFAULT_BUDGET_BYTES,
-      reservations: 0,
-      reservationBytes: DEFAULT_DROP_BYTES,
-    });
+    assert.deepEqual(budget(), EMPTY_BUDGET);
   });
 
   it('releases the reservation when a submitted drop expires', async () => {

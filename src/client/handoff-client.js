@@ -13,6 +13,7 @@ import {
   FILE_ENVELOPE_VERSION,
   PAYLOAD_KIND_FILES,
   PAYLOAD_KIND_TEXT,
+  PAYLOAD_KIND_UNIVERSAL,
 } from '../file-container.js';
 import {
   CAPABILITY_LENGTH,
@@ -28,8 +29,26 @@ import {
 } from '../hpke-suite.js';
 
 export const CAPABILITY_HEADER = 'X-Handoff-Capability';
+
+/**
+ * The lane one submission declares before its body, on a link that accepts either
+ * (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md, U1). Stated here in its canonical casing,
+ * the way the capability header already is; the broker advertises the same name in
+ * a universal link's metadata and test/universal-drop.test.js holds the two
+ * together.
+ */
+export const PAYLOAD_DECLARATION_HEADER = 'X-Handoff-Payload';
 export const METADATA_PATH = '/api/metadata';
 export const SUBMIT_PATH = '/api/submit';
+
+/**
+ * The declaration a sealed envelope implies — derived from it rather than chosen
+ * next to it, so the two can never disagree and a retry of the exact same bytes
+ * cannot accidentally declare the other lane.
+ */
+export function declarationForEnvelope(envelope) {
+  return envelope?.v === FILE_ENVELOPE_VERSION ? PAYLOAD_KIND_FILES : PAYLOAD_KIND_TEXT;
+}
 
 /** Reads the capability out of a `#fragment`. Anything malformed is treated as absent. */
 export function readCapability(hash) {
@@ -55,6 +74,26 @@ export async function fetchMetadata({ capability, fetchImpl = fetch, origin = ''
   const expectedVersion =
     metadata.payload_kind === PAYLOAD_KIND_FILES ? FILE_ENVELOPE_VERSION : ENVELOPE_VERSION;
   if (metadata.v !== expectedVersion || metadata.suite !== SUITE_ID) return null;
+  // A universal link is checked harder, not less: it is the one response that
+  // leaves this page a choice, so every part of the choice has to be the one this
+  // page can actually make. A broker that offered a third lane, a version pair
+  // this bundle cannot seal, or a declaration header it does not send is a broker
+  // it must not submit into — and the honest reading of that is `unavailable`,
+  // taken before anything has been sealed.
+  if (metadata.payload_kind === PAYLOAD_KIND_UNIVERSAL) {
+    const lanes = metadata.accepts;
+    if (!Array.isArray(lanes) || lanes.length !== 2) return null;
+    if (lanes[0] !== PAYLOAD_KIND_TEXT || lanes[1] !== PAYLOAD_KIND_FILES) return null;
+    const versions = metadata.envelope_versions;
+    if (!versions || typeof versions !== 'object') return null;
+    if (versions.text !== ENVELOPE_VERSION || versions.files !== FILE_ENVELOPE_VERSION) return null;
+    if (
+      typeof metadata.payload_declaration !== 'string' ||
+      metadata.payload_declaration.toLowerCase() !== PAYLOAD_DECLARATION_HEADER.toLowerCase()
+    ) {
+      return null;
+    }
+  }
   if (!isBase64Url(metadata.hid) || !isBase64Url(metadata.pk)) return null;
   if (base64UrlToBytes(metadata.pk).length !== PUBLIC_KEY_BYTES) return null;
   return metadata;
@@ -129,6 +168,7 @@ export async function submitEnvelope({
   origin = '',
   retries = 1,
   retryDelayMs = 250,
+  declaration = declarationForEnvelope(envelope),
 }) {
   const body = JSON.stringify(envelope);
 
@@ -139,6 +179,11 @@ export async function submitEnvelope({
         method: 'POST',
         headers: {
           [CAPABILITY_HEADER]: capability,
+          // Sent on every submission, not only into a universal link: the same
+          // bytes and the same headers on the retry as on the first attempt is what
+          // makes the retry *identical*, and a declaration that agrees with a typed
+          // drop's own kind is accepted there.
+          [PAYLOAD_DECLARATION_HEADER]: declaration,
           'content-type': 'application/json',
         },
         body,
@@ -177,10 +222,17 @@ export async function sendSecret({ capability, plaintext, fetchImpl = fetch, ori
     return { status: 'unreachable' };
   }
   if (!metadata) return { status: 'unavailable' };
-  // This flow seals one UTF-8 secret. A drop that wants files is not something to
+  // This flow seals one UTF-8 secret, which is the text lane of a universal link
+  // as much as it is the whole of a text drop — both advertise `max_plaintext_bytes`
+  // and both open a v1 envelope. A drop that wants *only* files is not something to
   // fall back on: sealing text into it would be refused by the broker anyway, and
   // stopping here keeps the page from asking for the wrong thing in the meantime.
-  if (metadata.payload_kind !== PAYLOAD_KIND_TEXT) return { status: 'unavailable' };
+  if (
+    metadata.payload_kind !== PAYLOAD_KIND_TEXT &&
+    metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL
+  ) {
+    return { status: 'unavailable' };
+  }
 
   if (plaintextByteLength(plaintext) > metadata.max_plaintext_bytes) {
     return { status: 'too_large', limit: metadata.max_plaintext_bytes };

@@ -7,7 +7,7 @@ import { createServer } from 'node:net';
 import { dirname } from 'node:path';
 
 import { PAYLOAD_KINDS } from './broker.js';
-import { PAYLOAD_KIND_FILES } from './file-container.js';
+import { PAYLOAD_KIND_FILES, PAYLOAD_KIND_UNIVERSAL } from './file-container.js';
 import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
 
 const MAX_CONTROL_LINE_BYTES = 4096;
@@ -562,6 +562,20 @@ function claimPayloadBudget(handoffId, maxResponseBytes) {
   return Math.floor(forBase64 / 4) * 3;
 }
 
+/**
+ * Canonical base64, or null. Strict on three counts Node's decoder is not: the
+ * alphabet, the padded length, and that re-encoding reproduces the input exactly —
+ * so `AA==` and `AA=` cannot both mean the same byte, and a value with trailing
+ * junk is refused rather than silently truncated.
+ */
+function decodeBase64Strict(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length === 0 || bytes.toString('base64') !== value) return null;
+  return bytes;
+}
+
 async function handleControlRequest(request, broker) {
   if (!request || typeof request !== 'object') return { ok: false, error: 'invalid_request' };
 
@@ -591,8 +605,11 @@ async function handleControlRequest(request, broker) {
       const maxFiles = request.max_files;
       if (maxFiles !== undefined) {
         // Meaningless on a text drop, so it is refused rather than ignored: a
-        // caller that asked for a file count and got a text drop was misheard.
-        if (payloadKind !== PAYLOAD_KIND_FILES) return { ok: false, error: 'invalid_request' };
+        // caller that asked for a file count and got a text drop was misheard. A
+        // universal drop has a file lane, so it narrows like a files drop does.
+        if (payloadKind !== PAYLOAD_KIND_FILES && payloadKind !== PAYLOAD_KIND_UNIVERSAL) {
+          return { ok: false, error: 'invalid_request' };
+        }
         if (!Number.isInteger(maxFiles) || maxFiles < 1) {
           return { ok: false, error: 'invalid_request' };
         }
@@ -636,6 +653,7 @@ async function handleControlRequest(request, broker) {
         notice_expired: expiredNotice(),
       };
     }
+
 
     // Subscribe to the submission event. Blocks on the broker's own waiter, so
     // no caller ever polls, and answers with a status and an id — never with

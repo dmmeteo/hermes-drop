@@ -179,7 +179,10 @@ describe('file mode: minting and advertised limits', () => {
 
   it('advertises which payload kinds this broker speaks, so a plugin need not guess', async () => {
     const created = await broker.control({ op: 'create', ttl_seconds: TTL_SECONDS });
-    assert.deepEqual(created.payload_kinds, ['text', 'files']);
+    // `universal` joined the list in slice U1 (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md)
+    // on the same terms: a kind is advertised so a plugin can refuse before posting
+    // a link it cannot claim, and adding one is additive rather than a version bump.
+    assert.deepEqual(created.payload_kinds, ['text', 'files', 'universal']);
     assert.equal(created.protocol_version, 2, 'file mode is additive; the protocol did not move');
   });
 

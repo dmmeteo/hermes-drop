@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 import { startHandoffBroker } from '../../src/main.js';
 import { controlRequest } from '../../src/control-client.js';
-import { fetchMetadata, sealBytesEnvelope } from '../../src/client/handoff-client.js';
+import { fetchMetadata, sealBytesEnvelope, sealEnvelope } from '../../src/client/handoff-client.js';
 import { receiveFileClaim } from '../../src/file-claim-client.js';
 import { FILE_ENVELOPE_VERSION, encodeFileContainer } from '../../src/file-container.js';
 
@@ -77,6 +77,64 @@ export async function createFileDrop(broker, { ttlSeconds = 120, maxFiles } = {}
 }
 
 /**
+ * The pre-body payload declaration, as the browser sends it. Derived from the
+ * sealed envelope's own version rather than chosen next to it, so a test — like
+ * the client it stands in for — cannot accidentally declare one lane and seal the
+ * other. A test that wants that mismatch has to ask for it.
+ */
+export const PAYLOAD_DECLARATION_HEADER = 'x-handoff-payload';
+
+export function declarationFor(envelope) {
+  return envelope?.v === FILE_ENVELOPE_VERSION ? 'files' : 'text';
+}
+
+/**
+ * Mints one **universal** drop — the `pending(choice)` link of
+ * docs/UNIVERSAL_DROP_DELIVERY_PLAN.md — and hands back both lanes: the metadata
+ * the page would have fetched, a text sealer, a container sealer, and a `send`
+ * that carries the declaration its envelope's version implies.
+ *
+ * Everything goes through the production paths, so nothing here agrees with the
+ * broker by construction.
+ */
+export async function createUniversalDrop(broker, { ttlSeconds = 120, maxFiles } = {}) {
+  const request = { op: 'create', payload_kind: 'universal', ttl_seconds: ttlSeconds };
+  if (maxFiles !== undefined) request.max_files = maxFiles;
+  const created = await broker.control(request);
+  if (!created.ok) return { created, capability: null, metadata: null };
+
+  const capability = splitHandoffUrl(created.url).capability;
+  const metadata = await fetchMetadata({ capability, origin: broker.baseUrl });
+  return {
+    created,
+    id: created.handoff_id,
+    capability,
+    metadata,
+    expiresAt: created.expires_at,
+    sealText: (plaintext) => sealEnvelope({ capability, metadata, plaintext }),
+    sealFiles: (files) => sealFileEnvelope({ capability, metadata, files }),
+    /**
+     * One submission. `declaration` defaults to the one the envelope implies, may
+     * be any string, and may be `null` for the omitted-header case a client from
+     * before the declaration produces.
+     */
+    send: async (envelope, { declaration = declarationFor(envelope) } = {}) => {
+      const headers = {
+        'x-handoff-capability': capability,
+        'content-type': 'application/json',
+      };
+      if (declaration !== null) headers[PAYLOAD_DECLARATION_HEADER] = declaration;
+      const response = await fetch(`${broker.baseUrl}/api/submit`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(envelope),
+      });
+      return response.ok ? 'received' : 'unavailable';
+    },
+  };
+}
+
+/**
  * Claims a file drop the way the plugin will: `begin_file_claim` over the real
  * control socket, the real length-framed stream, and a commit carrying digests
  * the receiver computed itself (src/file-claim-client.js).
@@ -105,6 +163,7 @@ export async function sealFileEnvelope({ capability, metadata, files }) {
     version: FILE_ENVELOPE_VERSION,
   });
 }
+
 
 /** Splits a handoff URL into its request target and its `#fragment` capability. */
 export function splitHandoffUrl(url) {
