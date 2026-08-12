@@ -24,9 +24,27 @@ Those ideas may be considered independently later and must not enlarge this impl
 
 ## Invocation model
 
-The primary interface is natural language, not a slash command. When the user asks Hermes to provide, reveal, return, or generate a secret, Hermes should use the outbound-drop tool automatically instead of placing plaintext in chat.
+The primary interface remains natural language. When the user asks Hermes to provide, reveal, return, or generate a secret, Hermes should use the outbound-drop tool automatically instead of placing plaintext in chat.
 
-The model-facing tool exists because Hermes needs a safe execution boundary, but it exposes no destination fields and always delivers back to the authoritative origin conversation. The MVP does **not** add a public slash command. A deterministic command may be reconsidered later only if a real non-model workflow appears; it is not part of this implementation.
+The existing `/drop` command remains one shared entry point for both directions; do not add a second outbound-specific command:
+
+- `/drop` with no arguments creates the ordinary inbound form so the user can privately send text or files to Hermes.
+- `/drop <free-text request>` sends that request through the normal authenticated Hermes turn. Hermes interprets whether the user is asking to receive a secret or announcing that they intend to send something.
+- A request such as `/drop дай мені ключ OpenRouter` therefore causes Hermes to obtain or generate the requested value and return it through an outbound secret drop.
+- A phrase such as `/drop я зараз закину секрет` remains an inbound request and creates the ordinary form.
+
+The argument is free text, not a TTL parser. Direction is determined from the user's meaning, not merely from whether arguments are present. An ambiguous request must not cause Hermes to disclose a secret; Hermes should ask a brief clarification or choose the safe inbound form.
+
+The model-facing outbound tool exists because Hermes needs a safe execution boundary, but it exposes no destination fields and always delivers back to the authoritative origin conversation. The slash command is only a natural-language invocation surface; it must not accept a model- or user-selected destination.
+
+## Expiry configuration
+
+Expiry is an operator/user default in plugin configuration rather than a routine `/drop` argument. Most people will choose one policy and rarely vary it per request.
+
+- Inbound and outbound defaults may be configured separately because receiving private input and revealing an already-held secret have different risk/UX trade-offs.
+- This deployment's desired outbound default is **30 minutes**.
+- A deployment may choose a shorter default such as 5 or 10 minutes.
+- Per-request TTL syntax is not part of the normal `/drop` UX. Natural-language requests for exceptional lifetimes may be considered later, subject to configured hard bounds; they are not required for this MVP.
 
 ## Approved UX
 
@@ -35,7 +53,7 @@ Hermes posts an origin-bound message containing:
 - a safe non-secret label;
 - a link to the private drop;
 - a separate **3-digit temporary code**;
-- an indication that the drop expires in **10 minutes** and can be revealed once.
+- an indication of the configured expiry (30 minutes on this deployment) and that the drop can be revealed once.
 
 The user opens the link, explicitly enters the code, and chooses to reveal the value. After the first successful reveal, the value cannot be opened again.
 
@@ -43,7 +61,7 @@ The user opens the link, explicitly enters the code, and chooses to reveal the v
 
 - Code length: **3 decimal digits**.
 - Maximum incorrect code attempts: **3**.
-- TTL: **10 minutes**.
+- Default TTL: configurable; **30 minutes for this deployment**.
 - Successful claims: **one**.
 - A normal `GET` or `HEAD` never consumes or claims a drop.
 - Claiming requires explicit user interaction and a state-changing request.
