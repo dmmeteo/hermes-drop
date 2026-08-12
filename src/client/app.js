@@ -1,6 +1,6 @@
 // DOM wiring for the accepted Variant A page. All crypto and transport lives in
 // handoff-client.js; this file only moves between the three screens.
-import { PAYLOAD_KIND_TEXT } from '../file-container.js';
+import { PAYLOAD_KIND_TEXT, PAYLOAD_KIND_UNIVERSAL } from '../file-container.js';
 import { createDeadline, formatRemaining } from './countdown.js';
 import {
   fetchMetadata,
@@ -78,16 +78,23 @@ async function start() {
   metadata = await fetchMetadata({ capability, origin });
   if (!metadata) return show('unavailable');
 
-  // This page is a text page: one textarea, one Send, one UTF-8 secret sealed
-  // under envelope v1. A file drop advertises `payload_kind: "files"` and, with
-  // it, no `max_plaintext_bytes` at all — which is the field both size guards
-  // below read. Rendering the form anyway would leave them comparing against
-  // `undefined`, i.e. never firing, so an arbitrarily large secret would be
-  // sealed and posted into a body ceiling widened for containers, to be refused
-  // on the version mismatch at the far end. Refusing the link is the honest
-  // answer until the picker lands (docs/FILE_TRANSFER_MVP.md, slice 6), and it
-  // keeps `metadata` null so no later handler can act on it.
-  if (metadata.payload_kind !== PAYLOAD_KIND_TEXT) {
+  // This page is a text page today: one textarea, one Send, one UTF-8 secret
+  // sealed under envelope v1. It serves a *universal* link on those terms too —
+  // that link's text lane is this exact flow, and its metadata carries the
+  // `max_plaintext_bytes` both size guards below read — so the sender gets the form
+  // they were sent to, and gets the file picker in the same form once slice U3
+  // lands (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md).
+  //
+  // A files-*only* drop is different and is refused: it advertises no
+  // `max_plaintext_bytes` at all, so rendering the form would leave those guards
+  // comparing against `undefined`, i.e. never firing, and an arbitrarily large
+  // secret would be sealed and posted into a body ceiling widened for containers,
+  // to be refused on the version mismatch at the far end. Refusing keeps `metadata`
+  // null so no later handler can act on it.
+  if (
+    metadata.payload_kind !== PAYLOAD_KIND_TEXT &&
+    metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL
+  ) {
     metadata = null;
     return show('unavailable');
   }

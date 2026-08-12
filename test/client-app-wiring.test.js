@@ -152,6 +152,30 @@ describe('the page script wiring', () => {
     assert.equal(broker.testSnapshot(created.handoff_id).state, 'pending', 'nothing submitted');
   });
 
+  // A universal link is the one this page will grow a file picker for (slice U3).
+  // Until then it renders exactly the text form it always did and sends the text
+  // lane, which is what `max_plaintext_bytes` on universal metadata is for: the
+  // size guards below have a real number to compare against, so nothing is sealed
+  // that the broker would refuse. Refusing the link instead — the honest answer for
+  // a files-only drop — would mean a link the sender was told to use shows as dead.
+  it('offers the text form for a universal drop and sends that lane', async () => {
+    const created = await broker.control({ op: 'create', payload_kind: 'universal' });
+    const { capability } = splitHandoffUrl(created.url);
+    const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
+
+    assert.equal(dom.elements.get('form').hidden, false, 'the text form is offered');
+    assert.equal(dom.elements.get('unavailable').hidden, true);
+    assert.equal(dom.elements.get('app').dataset.state, 'form');
+
+    dom.elements.get('secret').value = 'a secret sent through the universal form';
+    await dom.elements.get('send').handlers.get('click')();
+
+    assert.equal(dom.elements.get('success').hidden, false, 'and lands on the receipt');
+    const snapshot = broker.testSnapshot(created.handoff_id);
+    assert.equal(snapshot.state, 'submitted');
+    assert.equal(snapshot.payloadKind, 'text', 'the sender chose the text lane');
+  });
+
   it('renders the form, sends once, and lands on the receipt', async () => {
     const created = await broker.control({ op: 'create' });
     const { capability } = splitHandoffUrl(created.url);

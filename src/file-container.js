@@ -49,6 +49,19 @@ export const FILE_ENVELOPE_VERSION = 2;
 export const PAYLOAD_KIND_TEXT = 'text';
 export const PAYLOAD_KIND_FILES = 'files';
 
+/**
+ * The kind of a drop that has not been told which of the two it is yet: one link
+ * whose sender chooses text or files in the browser at submit time
+ * (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md).
+ *
+ * It lives here with the other two because this module is the payload vocabulary
+ * both sides import, but it is a *lifecycle* kind and nothing else: no container
+ * manifest ever carries it, `decodeFileContainer` refuses it like any other
+ * unknown `kind`, and a record stops being universal the moment one submission
+ * wins.
+ */
+export const PAYLOAD_KIND_UNIVERSAL = 'universal';
+
 /** Display names are capped in UTF-8 bytes, per the MVP's filename rules. */
 export const MAX_FILE_NAME_BYTES = 255;
 

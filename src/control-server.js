@@ -7,7 +7,7 @@ import { createServer } from 'node:net';
 import { dirname } from 'node:path';
 
 import { PAYLOAD_KINDS } from './broker.js';
-import { PAYLOAD_KIND_FILES } from './file-container.js';
+import { PAYLOAD_KIND_FILES, PAYLOAD_KIND_UNIVERSAL } from './file-container.js';
 import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
 import { OUTBOUND_PROTOCOL } from './outbound-drop.js';
 
@@ -618,8 +618,11 @@ async function handleControlRequest(request, broker) {
       const maxFiles = request.max_files;
       if (maxFiles !== undefined) {
         // Meaningless on a text drop, so it is refused rather than ignored: a
-        // caller that asked for a file count and got a text drop was misheard.
-        if (payloadKind !== PAYLOAD_KIND_FILES) return { ok: false, error: 'invalid_request' };
+        // caller that asked for a file count and got a text drop was misheard. A
+        // universal drop has a file lane, so it narrows like a files drop does.
+        if (payloadKind !== PAYLOAD_KIND_FILES && payloadKind !== PAYLOAD_KIND_UNIVERSAL) {
+          return { ok: false, error: 'invalid_request' };
+        }
         if (!Number.isInteger(maxFiles) || maxFiles < 1) {
           return { ok: false, error: 'invalid_request' };
         }
