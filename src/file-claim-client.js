@@ -185,15 +185,37 @@ export async function receiveFileClaim(
     if (!Array.isArray(metadata.files)) {
       return { ok: false, error: 'transfer_failed', reason: 'malformed_metadata', phase: 'begin' };
     }
+    if (metadata.private_text !== undefined) {
+      const descriptor = metadata.private_text;
+      if (
+        descriptor === null
+        || typeof descriptor !== 'object'
+        || Array.isArray(descriptor)
+        || !Object.hasOwn(descriptor, 'size')
+        || !Object.hasOwn(descriptor, 'sha256')
+        || Object.keys(descriptor).length !== 2
+        || !Number.isInteger(descriptor.size)
+        || descriptor.size < 0
+        || descriptor.size > 65_536
+        || typeof descriptor.sha256 !== 'string'
+        || !/^[0-9a-f]{64}$/.test(descriptor.sha256)
+      ) {
+        return { ok: false, error: 'transfer_failed', reason: 'malformed_metadata', phase: 'begin' };
+      }
+    }
 
     const files = [];
+    const digests = [];
+    let privateInput;
     let received = 0;
     // One frame at a time, each acked before the next is written. The broker will not
     // send frame i+1 until it has checked this receiver's digest for frame i against
     // the manifest, which is what makes "the receiver has the bytes" independent of
     // the socket send buffer — see `file_claim.receipt` in the contract.
     for (let index = 0; index !== null; ) {
-      const entry = metadata.files[index];
+      const privateFrame = metadata.private_text !== undefined && index === 0;
+      const fileIndex = index - (metadata.private_text !== undefined ? 1 : 0);
+      const entry = privateFrame ? metadata.private_text : metadata.files[fileIndex];
       if (!entry || !Number.isSafeInteger(entry.size) || entry.size < 0) {
         return { ok: false, error: 'transfer_failed', reason: 'malformed_metadata', phase: 'frames' };
       }
@@ -228,19 +250,31 @@ export async function receiveFileClaim(
         hash.update(chunk);
         // Streamed, not accumulated: this is the callback a spool writes from, and
         // it sees every byte whether or not anything is retained afterwards.
-        if (onChunk) onChunk(chunk, { index, entry });
-        if (collectBytes) parts.push(Buffer.from(chunk));
+        if (onChunk && !privateFrame) onChunk(chunk, { index: fileIndex, entry });
+        if (collectBytes || privateFrame) parts.push(Buffer.from(chunk));
       });
       received += got;
       const digest = hash.digest('hex');
-      files.push({
-        name: entry.name,
-        type: entry.type,
-        size: entry.size,
-        frameLength,
-        sha256: digest,
-        ...(collectBytes ? { bytes: Buffer.concat(parts) } : {}),
-      });
+      if (privateFrame) {
+        if (digest !== entry.sha256) {
+          return { ok: false, error: 'transfer_failed', reason: 'digest_mismatch', phase: 'frames' };
+        }
+        try {
+          privateInput = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(parts));
+        } catch {
+          return { ok: false, error: 'transfer_failed', reason: 'invalid_utf8', phase: 'frames' };
+        }
+      } else {
+        files.push({
+          name: entry.name,
+          type: entry.type,
+          size: entry.size,
+          frameLength,
+          sha256: digest,
+          ...(collectBytes ? { bytes: Buffer.concat(parts) } : {}),
+        });
+      }
+      digests.push(digest);
       if (got < frameLength) {
         return { ok: false, error: 'transfer_failed', reason: 'truncated', phase: 'frames', index };
       }
@@ -272,7 +306,7 @@ export async function receiveFileClaim(
       handoff_id: handoffId,
       transfer_id: metadata.transfer_id,
       received_bytes: received,
-      digests: files.map((file) => file.sha256),
+      digests,
     });
     commitWritten = true;
 
@@ -292,6 +326,7 @@ export async function receiveFileClaim(
       leaseExpiresAt: metadata.lease_expires_at,
       totalBytes: metadata.total_bytes,
       files,
+      ...(privateInput === undefined ? {} : { privateInput }),
     };
   } catch (error) {
     const detail = (socketError ?? error).message;

@@ -68,6 +68,9 @@ export const MAX_FILE_NAME_BYTES = 255;
 /** The MIME hint is untrusted display text; the same cap keeps it bounded. */
 export const MAX_FILE_TYPE_BYTES = 255;
 
+/** Optional private UTF-8 text carried by HDROP2; aligned with the v1 cap. */
+export const MAX_PRIVATE_TEXT_BYTES = 65536;
+
 /** What a sanitized name collapses to when nothing usable survives. */
 export const FALLBACK_FILE_NAME = 'unnamed';
 
@@ -103,7 +106,7 @@ export const DEFAULT_FILE_LIMITS = Object.freeze({
  */
 const MANIFEST_ENTRY_CEILING_BYTES = 1280;
 
-/** `{"kind":"files","files":[]}` is 27 bytes; 32 covers it with slack. */
+/** Fixed ceiling retained for the reviewed file-only reservation. */
 const MANIFEST_ENVELOPE_BYTES = 32;
 
 /** The largest manifest `maxFiles` entries can produce, separators included. */
@@ -355,13 +358,15 @@ async function sha256Hex(bytes) {
  * Names and MIME hints are sanitized here, so the manifest only ever carries
  * canonical values — which is exactly what `decodeFileContainer` re-checks.
  */
-export async function encodeFileContainer(files, { limits = DEFAULT_FILE_LIMITS } = {}) {
+export async function encodeFileContainer(files, { limits = DEFAULT_FILE_LIMITS, text } = {}) {
   const resolved = resolveFileLimits(limits);
   if (!Array.isArray(files)) refuse('input_shape');
   for (const file of files) {
     if (!isPlainObject(file) || !(file.bytes instanceof Uint8Array)) refuse('input_shape');
   }
 
+  if (text !== undefined && typeof text !== 'string') refuse('input_shape');
+  if (text !== undefined && utf8Length(text) > MAX_PRIVATE_TEXT_BYTES) refuse('text_size');
   // Empty files are allowed; an empty submission is not.
   if (files.length === 0 || files.length > resolved.maxFiles) refuse('file_count');
 
@@ -388,10 +393,16 @@ export async function encodeFileContainer(files, { limits = DEFAULT_FILE_LIMITS 
     offset += file.bytes.length;
   }
 
-  const manifest = encoder.encode(JSON.stringify({ kind: PAYLOAD_KIND_FILES, files: entries }));
+  const textBytes = text === undefined ? null : encoder.encode(text);
+  // The reservation is unchanged: combined private bytes share the 42 MiB
+  // plaintext budget rather than silently widening the reviewed live budget.
+  if (total + (textBytes?.length ?? 0) > resolved.maxTotalBytes) refuse('total_size');
+  const manifestObject = { kind: PAYLOAD_KIND_FILES, files: entries };
+  if (textBytes !== null) manifestObject.text = { offset: total, size: textBytes.length };
+  const manifest = encoder.encode(JSON.stringify(manifestObject));
   if (manifest.length > MAX_MANIFEST_BYTES) refuse('manifest_length_out_of_range');
 
-  const container = new Uint8Array(CONTAINER_HEADER_BYTES + manifest.length + total);
+  const container = new Uint8Array(CONTAINER_HEADER_BYTES + manifest.length + total + (textBytes?.length ?? 0));
   container.set(MAGIC_BYTES, 0);
   new DataView(container.buffer, container.byteOffset, container.byteLength).setUint32(
     MAGIC_BYTES.length,
@@ -405,6 +416,7 @@ export async function encodeFileContainer(files, { limits = DEFAULT_FILE_LIMITS 
     container.set(file.bytes, cursor);
     cursor += file.bytes.length;
   }
+  if (textBytes !== null) container.set(textBytes, cursor);
   return container;
 }
 
@@ -440,9 +452,14 @@ function readManifest(bytes, limits) {
 }
 
 function validateManifest(manifest, payloadLength, limits) {
-  if (!hasExactKeys(manifest, ['kind', 'files'])) refuse('manifest_shape');
+  const oldShape = hasExactKeys(manifest, ['kind', 'files']);
+  const combinedShape = hasExactKeys(manifest, ['kind', 'files', 'text']);
+  if (!oldShape && !combinedShape) refuse('manifest_shape');
   if (manifest.kind !== PAYLOAD_KIND_FILES) refuse('manifest_shape');
   if (!Array.isArray(manifest.files)) refuse('manifest_shape');
+  if (combinedShape && (!hasExactKeys(manifest.text, ['offset', 'size']) ||
+      !isByteCount(manifest.text.offset, limits.maxTotalBytes) ||
+      !isByteCount(manifest.text.size, MAX_PRIVATE_TEXT_BYTES))) refuse('text_metadata');
   if (manifest.files.length === 0 || manifest.files.length > limits.maxFiles) refuse('file_count');
 
   let running = 0;
@@ -473,8 +490,10 @@ function validateManifest(manifest, payloadLength, limits) {
 
   // ...and the files together consume the payload exactly, so no byte is
   // unaccounted for and none is claimed twice.
-  if (running !== payloadLength) refuse('offsets');
-  return entries;
+  if (combinedShape) {
+    if (manifest.text.offset !== running || running + manifest.text.size !== payloadLength) refuse('text_metadata');
+  } else if (running !== payloadLength) refuse('offsets');
+  return { entries, textMetadata: combinedShape ? manifest.text : undefined };
 }
 
 /**
@@ -506,7 +525,7 @@ export async function decodeFileContainer(container, { limits = DEFAULT_FILE_LIM
   if (!(container instanceof Uint8Array)) refuse('not_bytes');
 
   const { manifest, payloadStart } = readManifest(container, resolved);
-  const entries = validateManifest(manifest, container.length - payloadStart, resolved);
+  const { entries, textMetadata } = validateManifest(manifest, container.length - payloadStart, resolved);
 
   const files = [];
   for (const file of entries) {
@@ -525,5 +544,21 @@ export async function decodeFileContainer(container, { limits = DEFAULT_FILE_LIM
     });
   }
 
-  return { kind: PAYLOAD_KIND_FILES, files, totalBytes: container.length - payloadStart };
+  let text;
+  let textBytes;
+  if (textMetadata !== undefined) {
+    textBytes = container.subarray(
+      payloadStart + textMetadata.offset,
+      payloadStart + textMetadata.offset + textMetadata.size,
+    );
+    try {
+      text = strictDecoder.decode(textBytes);
+    } catch { refuse('text_not_utf8'); }
+  }
+  return {
+    kind: PAYLOAD_KIND_FILES,
+    files,
+    totalBytes: entries.reduce((sum, file) => sum + file.size, 0),
+    ...(text === undefined ? {} : { text, textBytes }),
+  };
 }

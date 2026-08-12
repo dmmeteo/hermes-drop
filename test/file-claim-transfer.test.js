@@ -129,6 +129,32 @@ describe('file claim: the framed transfer', () => {
 
   // ── the happy path ───────────────────────────────────────────────────────
 
+  it('pins the contract combined frame indexes, totals and digests to the actual wire', async () => {
+    const text = 'wire-private-canary';
+    const textBytes = utf8(text);
+    const files = [
+      { name: 'wire.bin', type: '', bytes: Uint8Array.from([0, 255, 17]) },
+      { name: 'empty', type: '', bytes: new Uint8Array() },
+    ];
+    const drop = await createFileDrop(broker, { ttlSeconds: TTL_SECONDS });
+    const envelope = await (await import('./helpers/harness.js')).sealFileEnvelope({
+      capability: drop.capability, metadata: drop.metadata, files, text,
+    });
+    assert.equal(await drop.send(envelope), 'received');
+    const acks = [];
+    const result = await hostile(drop.id, { mutateAck: (ack) => { acks.push({ ...ack }); return ack; } });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.deepEqual(acks.map(({ index, size, sha256 }) => ({ index, size, sha256 })), [
+      { index: 0, size: textBytes.length, sha256: sha256Hex(textBytes) },
+      { index: 1, size: 3, sha256: sha256Hex(files[0].bytes) },
+      { index: 2, size: 0, sha256: sha256Hex(files[1].bytes) },
+    ]);
+    assert.equal(result.bytes, textBytes.length + 3);
+    assert.match(CONTRACT.file_claim.conversation[3], /File 0 has frame index 0.*frame index 1/);
+    assert.match(CONTRACT.file_claim.conversation[6], /all frames.*private_text.*first/);
+    assert.match(CONTRACT.file_claim.digests_are_not_echoed, /sole digest exception is private_text\.sha256/);
+  });
+
   it('streams every file, in order, and retires the drop exactly once', async () => {
     const drop = await submitted();
     const result = await claim(drop.id);
@@ -1215,6 +1241,52 @@ describe('file claim: the framed transfer', () => {
     assert.ok(chunks[0] > 1, `a 2 MiB file must arrive in pieces, not one buffer (${chunks[0]})`);
     for (const file of result.files) {
       assert.ok(!('bytes' in file), 'and nothing was retained after the callback');
+    }
+  });
+
+  it('rejects every malformed private descriptor before reading a frame or sending an ACK', async () => {
+    const digest = 'a'.repeat(64);
+    const malformed = [
+      { size: 65_537, sha256: digest },
+      { size: -1, sha256: digest },
+      { size: true, sha256: digest },
+      { size: 1.5, sha256: digest },
+      { size: '1', sha256: digest },
+      { size: 1 },
+      { sha256: digest },
+      { size: 1, sha256: digest, extra: true },
+      { size: 1, sha256: 'A'.repeat(64) },
+      { size: 1, sha256: 'g'.repeat(64) },
+      { size: 1, sha256: 'a'.repeat(63) },
+    ];
+
+    for (const privateText of malformed) {
+      let bytesAfterBegin = 0;
+      const server = createServer((socket) => {
+        socket.once('data', () => {
+          socket.on('data', (chunk) => { bytesAfterBegin += chunk.length; });
+          socket.write(`${JSON.stringify({
+            ok: true,
+            transfer_id: 'AAAAAAAAAAAAAAAAAAAAAA',
+            total_bytes: 1,
+            private_text: privateText,
+            files: [],
+          })}\n`);
+        });
+      });
+      const socketPath = join(await mkdtemp(join(tmpdir(), 'handoff-bad-private-')), 'control.sock');
+      await new Promise((resolve) => server.listen(socketPath, resolve));
+      try {
+        const result = await receiveFileClaim(socketPath, 'abcdefghijklmnopqrstuv', { timeoutMs: 500 });
+        assert.deepEqual(
+          { ok: result.ok, reason: result.reason, phase: result.phase },
+          { ok: false, reason: 'malformed_metadata', phase: 'begin' },
+        );
+        await sleep(5);
+        assert.equal(bytesAfterBegin, 0, `no frame read/ACK for ${JSON.stringify(privateText)}`);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
     }
   });
 

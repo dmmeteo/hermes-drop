@@ -1357,9 +1357,16 @@ export function createBroker(config, logger = console) {
         transferId,
         owner,
         onLeaseLost,
-        totalBytes: decoded.totalBytes,
-        expectedDigests: decoded.files.map((file) => file.sha256),
-        expectedSizes: decoded.files.map((file) => file.size),
+        totalBytes: decoded.totalBytes + (decoded.textBytes?.length ?? 0),
+        expectedDigests: [
+          ...(decoded.textBytes ? [sha256HexSync(decoded.textBytes)] : []),
+          ...decoded.files.map((file) => file.sha256),
+        ],
+        expectedSizes: [
+          ...(decoded.textBytes ? [decoded.textBytes.length] : []),
+          ...decoded.files.map((file) => file.size),
+        ],
+        hasPrivateText: decoded.textBytes !== undefined,
         /** The frame the receiver must ack next; `files.length` means all are in. */
         nextFrame: 0,
         /** Bytes the receiver proved it hashed, one validated ack at a time. */
@@ -1389,7 +1396,11 @@ export function createBroker(config, logger = console) {
         handoff_id: handoffId,
         transfer_id: transferId,
         lease_expires_at: lease.expiresAt,
-        total_bytes: decoded.totalBytes,
+        total_bytes: decoded.totalBytes + (decoded.textBytes?.length ?? 0),
+        ...(decoded.textBytes === undefined ? {} : {
+          private_text: { size: decoded.textBytes.length, sha256: sha256HexSync(decoded.textBytes) },
+          private_text_bytes: decoded.textBytes,
+        }),
         files: decoded.files.map((file) => ({
           name: file.name,
           type: file.type,
@@ -1529,7 +1540,7 @@ export function createBroker(config, logger = console) {
         return transferFailed('digest_mismatch');
       }
 
-      const files = lease.expectedDigests.length;
+      const files = lease.expectedDigests.length - (lease.hasPrivateText ? 1 : 0);
       const bytes = lease.totalBytes;
       clearLease(record, 'committed');
       retire(record);

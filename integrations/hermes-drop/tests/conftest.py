@@ -271,6 +271,17 @@ class BrokerHandle:
         assert self.proc.stdout is not None
         return self.proc.stdout.readline().strip()
 
+    def submit_combined(self, url: str, text: str, files: "list[tuple[str, bytes]]") -> str:
+        parts = [base64.b64encode(text.encode("utf-8")).decode("ascii"), *[
+            f"{base64.b64encode(name.encode('utf-8')).decode('ascii')}:"
+            f"{base64.b64encode(content).decode('ascii')}" for name, content in files
+        ]]
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(f"SUBMIT_COMBINED {url} {' '.join(parts)}\n")
+        self.proc.stdin.flush()
+        assert self.proc.stdout is not None
+        return self.proc.stdout.readline().strip()
+
     def stop(self) -> None:
         if self.proc.poll() is None:
             self.proc.terminate()

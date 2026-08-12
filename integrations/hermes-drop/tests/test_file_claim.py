@@ -127,6 +127,66 @@ async def test_a_python_receiver_transfers_every_byte_and_retires_the_drop(
 
 
 @pytest.mark.asyncio
+async def test_malformed_private_descriptors_are_rejected_before_frame_read_or_ack(
+    tmp_path, file_claim
+) -> None:
+    digest = "a" * 64
+    malformed = [
+        {"size": 65537, "sha256": digest}, {"size": -1, "sha256": digest},
+        {"size": True, "sha256": digest}, {"size": 1.5, "sha256": digest},
+        {"size": "1", "sha256": digest}, {"size": 1}, {"sha256": digest},
+        {"size": 1, "sha256": digest, "extra": True},
+        {"size": 1, "sha256": "A" * 64}, {"size": 1, "sha256": "g" * 64},
+        {"size": 1, "sha256": "a" * 63},
+    ]
+    for case, descriptor in enumerate(malformed):
+        socket_path = tmp_path / f"bad-private-{case}.sock"
+        received_after_begin = bytearray()
+
+        async def serve(reader, writer, descriptor=descriptor):
+            await reader.readline()
+            writer.write(json.dumps({"ok": True, "transfer_id": "A" * 22,
+                                     "total_bytes": 1, "private_text": descriptor,
+                                     "files": []}).encode() + b"\n")
+            await writer.drain()
+            try:
+                received_after_begin.extend(await asyncio.wait_for(reader.read(1), 0.1))
+            except asyncio.TimeoutError:
+                pass
+            writer.close()
+
+        server = await asyncio.start_unix_server(serve, path=socket_path)
+        try:
+            result = await file_claim.receive_file_claim(
+                "abcdefghijklmnopqrstuv", socket_path=socket_path, timeout=1.0)
+            await asyncio.sleep(0)
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert result["ok"] is False and result["reason"] == "malformed_metadata", descriptor
+        assert received_after_begin == b"", f"frame read/ACK occurred for {descriptor!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text", ["a" * 65536, ('"\\\x00' * 21845) + 'x', "🙂" * 16384],
+    ids=["ascii-max", "escaping-max", "unicode-max"],
+)
+async def test_combined_private_text_is_a_bounded_verified_frame(
+    text, control_client, file_claim, real_public_broker
+) -> None:
+    created = await control_client.control_request(
+        {"op": "create", "ttl_seconds": 120, "payload_kind": "files"},
+        socket_path=real_public_broker.socket_path,
+    )
+    assert real_public_broker.submit_combined(created["url"], text, [("safe.txt", b"file")]) == "SUBMITTED received"
+    result = await file_claim.receive_file_claim(created["handoff_id"], socket_path=real_public_broker.socket_path)
+    assert result["ok"] is True, result
+    assert result["private_text"] == text
+    assert result["files"][0]["bytes"] == b"file"
+
+
+@pytest.mark.asyncio
 async def test_the_streaming_path_delivers_real_bytes_with_nothing_retained(
     control_client, file_claim, real_public_broker
 ) -> None:

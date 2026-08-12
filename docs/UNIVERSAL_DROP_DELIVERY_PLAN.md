@@ -1,6 +1,10 @@
-# Universal text-or-files drop — delivery package
+- The browser always shows the private-text area and file picker together. Send may contain text only, files only, or both atomically; there are no mode switches.
+- Text-only submissions remain HPKE envelope v1. Any submission with files uses HPKE v2 and HDROP2.
+- HDROP2 accepts the original canonical `{kind,files}` manifest and the additive canonical `{kind,files,text}` form. Optional `text` is strict UTF-8 JSON text capped at **65,536 UTF-8 bytes**, matching the existing text ceiling.
+- The container/HTTP/live-memory reservation ceiling includes the worst-case JSON escaping of that optional text. File/operator limits remain decrease-only; increasing any reviewed hard cap requires a code change and review.
+- Combined text is exposed only on the private framed file-claim metadata line, then returned as `private_input` so the existing in-memory vault replaces it with a durable placeholder. Public metadata, wakes, journals and logs never carry it; file results contain paths and safe metadata, never binary bytes.
 
-Status: **approved product direction; implementation plan**
+
 
 ## Product decision
 

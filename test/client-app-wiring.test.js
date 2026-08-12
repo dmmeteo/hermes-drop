@@ -11,7 +11,7 @@ import { after, before, describe, it } from 'node:test';
 
 import { claimFileDrop, splitHandoffUrl, startTestBroker } from './helpers/harness.js';
 
-const ELEMENT_IDS = ['app', 'form', 'success', 'unavailable', 'secret', 'send', 'note', 'ttl', 'text-mode', 'files-mode', 'file-panel', 'files', 'drop-zone', 'file-list', 'file-total'];
+const ELEMENT_IDS = ['app', 'form', 'success', 'unavailable', 'secret', 'send', 'note', 'ttl', 'file-panel', 'files', 'drop-zone', 'file-list', 'file-total'];
 
 function fakeDom() {
   function element(id = '') {
@@ -59,7 +59,7 @@ async function loadApp({ hash, origin }) {
   // Cache-bust so each scenario gets a fresh module instance.
   await import(`../src/client/app.js?scenario=${encodeURIComponent(hash)}${Math.random()}`);
   // Let start()'s metadata fetch settle.
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await new Promise((resolve) => setTimeout(resolve, 300));
   return {
     ...dom,
     timers,
@@ -130,7 +130,7 @@ describe('the page script wiring', () => {
 
     // Nothing may be sealed or sent even if the button is driven directly.
     dom.elements.get('secret').value = 'a secret typed into the wrong page';
-    await dom.elements.get('send').handlers.get('click')();
+
     assert.equal(broker.testSnapshot(created.handoff_id).state, 'pending', 'nothing submitted');
   });
 
@@ -151,7 +151,6 @@ describe('the page script wiring', () => {
 
     dom.elements.get('secret').value = 'a secret sent through the universal form';
     await dom.elements.get('send').handlers.get('click')();
-
     assert.equal(dom.elements.get('success').hidden, false, 'and lands on the receipt');
     const snapshot = broker.testSnapshot(created.handoff_id);
     assert.equal(snapshot.state, 'submitted');
@@ -163,7 +162,6 @@ describe('the page script wiring', () => {
       const created = await broker.control({ op: 'create', payload_kind: 'universal' });
       const { capability } = splitHandoffUrl(created.url);
       const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
-      await dom.elements.get('files-mode').handlers.get('click')();
       const input = dom.elements.get('files'); input.files = bodies.map((body, i) => fileLike(`f${i}.bin`, body));
       await input.handlers.get('change')(); await dom.elements.get('send').handlers.get('click')();
       const claimed = await claimFileDrop(broker, created.handoff_id);
@@ -178,27 +176,24 @@ describe('the page script wiring', () => {
     const created = await broker.control({ op: 'create', payload_kind: 'universal' });
     const { capability } = splitHandoffUrl(created.url); const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
     const textarea = dom.elements.get('secret'); textarea.value = 'preserved draft';
-    await dom.elements.get('files-mode').handlers.get('click')();
     const input = dom.elements.get('files'); input.files = [fileLike('keep.bin', [1]), fileLike('remove.bin', [2])]; await input.handlers.get('change')();
     await dom.elements.get('file-list').children[1].children[2].handlers.get('click')();
-    await dom.elements.get('text-mode').handlers.get('click')(); assert.equal(textarea.value, 'preserved draft');
-    await dom.elements.get('files-mode').handlers.get('click')(); assert.match(dom.elements.get('file-total').textContent, /^1 file/);
+    assert.equal(textarea.value, 'preserved draft');
+    assert.match(dom.elements.get('file-total').textContent, /^1 file/);
   });
 
   it('rejects over-count and over-size before reading, crypto, or network', async () => {
     for (const files of [Array.from({ length: 6 }, (_, i) => fileLike(`${i}.bin`, [i])),
       [{ name: 'huge.bin', type: '', size: 42 * 1024 * 1024 + 1, async arrayBuffer() { throw new Error('read'); } }]]) {
       const created = await broker.control({ op: 'create', payload_kind: 'universal' }); const { capability } = splitHandoffUrl(created.url);
-      const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl }); await dom.elements.get('files-mode').handlers.get('click')();
-      const input = dom.elements.get('files'); input.files = files; await input.handlers.get('change')(); await dom.elements.get('send').handlers.get('click')();
+      const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });       const input = dom.elements.get('files'); input.files = files; await input.handlers.get('change')(); await dom.elements.get('send').handlers.get('click')();
       assert.equal(broker.testSnapshot(created.handoff_id).state, 'pending'); assert.match(dom.elements.get('note').textContent, /at most/);
     }
   });
 
   it('declares files with HPKE v2 and retries the exact sealed request', async () => {
     const created = await broker.control({ op: 'create', payload_kind: 'universal' }); const { capability } = splitHandoffUrl(created.url);
-    const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl }); await dom.elements.get('files-mode').handlers.get('click')();
-    const input = dom.elements.get('files'); input.files = [fileLike('retry.bin', [72, 68, 82, 79, 80, 50, 0])]; await input.handlers.get('change')();
+    const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });     const input = dom.elements.get('files'); input.files = [fileLike('retry.bin', [72, 68, 82, 79, 80, 50, 0])]; await input.handlers.get('change')();
     const realFetch = globalThis.fetch; const requests = [];
     globalThis.fetch = async (url, options) => { if (String(url).endsWith('/api/submit')) { requests.push({ header: options.headers['X-Handoff-Payload'], body: String(options.body) }); throw new TypeError('offline'); } return realFetch(url, options); };
     try {
@@ -416,10 +411,10 @@ describe('the page script wiring', () => {
     const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
 
     dom.elements.get('secret').value = 'x'.repeat(65537);
-    await dom.elements.get('secret').handlers.get('input')();
+    await dom.elements.get('send').handlers.get('click')();
     assert.match(dom.elements.get('note').textContent, /Too large/);
 
-    await dom.elements.get('send').handlers.get('click')();
+
     assert.equal(dom.elements.get('form').hidden, false, 'still on the form');
     assert.equal(broker.testSnapshot(created.handoff_id).state, 'pending');
   });

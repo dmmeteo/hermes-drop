@@ -37,6 +37,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Union
 
 from .config import control_socket_path
@@ -55,7 +56,8 @@ FRAME_HEADER_BYTES = 4
 #: handed on in pieces rather than assembled twice in memory.
 CHUNK_BYTES = 256 * 1024
 
-#: The metadata line is bounded by the container's manifest ceiling — 6437 bytes
+#: The metadata line is bounded by the manifest ceiling; private text is a separate
+#: binary frame represented here only by a fixed-size length/digest descriptor —
 #: at five files (``docs/FILE_TRANSFER_MVP.md``) plus the transfer id, the deadline
 #: and the byte count — so 64 KiB is an order of magnitude of headroom rather than
 #: the two orders 1 MiB was. Sized from the thing it bounds, because the length of
@@ -217,15 +219,33 @@ async def _claim(
         if not isinstance(entries, list):
             return _err(TRANSFER_FAILED, "metadata carried no file list",
                         reason="malformed_metadata")
+        private_meta = metadata.get("private_text")
+        if private_meta is not None and (
+            not isinstance(private_meta, dict)
+            or set(private_meta) != {"size", "sha256"}
+            or isinstance(private_meta.get("size"), bool)
+            or not isinstance(private_meta.get("size"), int)
+            or private_meta["size"] < 0 or private_meta["size"] > 65536
+            or not isinstance(private_meta.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", private_meta["sha256"]) is None
+        ):
+            return _err(TRANSFER_FAILED, "metadata carried malformed private text",
+                        reason="malformed_metadata")
 
         files: List[Dict[str, Any]] = []
         received = 0
+        digests: List[str] = []
+        private_text = None
         # One frame at a time, each acked before the broker sends the next. The ack is
         # what makes receipt size-independent: the broker stops and waits, so no socket
         # buffer can answer on this receiver's behalf (contract, ``file_claim.receipt``).
         index: Optional[int] = 0
         while index is not None:
-            entry = entries[index] if 0 <= index < len(entries) else None
+            private_frame = private_meta is not None and index == 0
+            file_index = index - (1 if private_meta is not None else 0)
+            entry = private_meta if private_frame else (
+                entries[file_index] if 0 <= file_index < len(entries) else None
+            )
             if not isinstance(entry, dict) or not isinstance(entry.get("size"), int):
                 return _err(TRANSFER_FAILED, "metadata entry is not a file",
                             reason="malformed_metadata")
@@ -243,15 +263,15 @@ async def _claim(
                             reason="frame_length_mismatch")
 
             digest = hashlib.sha256()
-            collected = bytearray() if keep_bytes else None
+            collected = bytearray() if (keep_bytes or private_frame) else None
             remaining = frame_length
             # An empty file is one call with `b""`, so a consumer that creates files
             # in the callback creates that one too. Everything else is one call per
             # chunk, and the digest and the sink see the *same* bytes on the same
             # pass — there is no accumulator that can be filled for one and not the
             # other.
-            if frame_length == 0 and on_chunk is not None:
-                await _deliver(on_chunk, index, entry, b"", True)
+            if frame_length == 0 and on_chunk is not None and not private_frame:
+                await _deliver(on_chunk, file_index, entry, b"", True)
             while remaining > 0:
                 chunk = await _read_exactly(reader, min(CHUNK_BYTES, remaining))
                 if not chunk:
@@ -262,18 +282,28 @@ async def _claim(
                     collected.extend(chunk)
                 remaining -= len(chunk)
                 received += len(chunk)
-                if on_chunk is not None:
-                    await _deliver(on_chunk, index, entry, chunk, remaining == 0)
+                if on_chunk is not None and not private_frame:
+                    await _deliver(on_chunk, file_index, entry, chunk, remaining == 0)
 
-            files.append(
-                {
+            digest_hex = digest.hexdigest()
+            if private_frame:
+                if digest_hex != private_meta["sha256"]:
+                    return _err(TRANSFER_FAILED, "private text digest mismatch",
+                                reason="digest_mismatch")
+                try:
+                    private_text = bytes(collected).decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    return _err(TRANSFER_FAILED, "private text is not valid UTF-8",
+                                reason="invalid_utf8")
+            else:
+                files.append({
                     "name": entry.get("name"),
                     "type": entry.get("type"),
                     "size": frame_length,
-                    "sha256": digest.hexdigest(),
+                    "sha256": digest_hex,
                     **({"bytes": bytes(collected)} if collected is not None else {}),
-                }
-            )
+                })
+            digests.append(digest_hex)
 
             # The ack, over the bytes that actually arrived. The broker checks it
             # against the manifest — which it holds and this client was never given —
@@ -283,7 +313,7 @@ async def _claim(
                 "transfer_id": metadata.get("transfer_id"),
                 "index": index,
                 "size": frame_length,
-                "sha256": digest.hexdigest(),
+                "sha256": digest_hex,
             }
             writer.write(json.dumps(ack, separators=(",", ":")).encode("utf-8") + b"\n")
             await writer.drain()
@@ -316,7 +346,7 @@ async def _claim(
             "received_bytes": received,
             # Computed here, over what arrived. The broker never sent these, which
             # is what makes the commit evidence rather than an echo.
-            "digests": [file["sha256"] for file in files],
+            "digests": digests,
         }
         # Set BEFORE the write, deliberately. ``transport.close()`` flushes what is
         # already buffered, so a cancellation landing between the write and the flag
@@ -360,6 +390,7 @@ async def _claim(
             "bytes": answer.get("bytes"),
             "file_count": answer.get("files"),
             "files": files,
+            **({"private_text": private_text} if private_text is not None else {}),
         }
     finally:
         writer.close()

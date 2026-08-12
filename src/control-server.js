@@ -273,7 +273,15 @@ function serveConnection({ socket, broker, logger }) {
     // `next_index` each ack answers with. Kept in this closure rather than on the
     // broker's record so the record retains no filename and no second reference to
     // the payload between submit and claim.
-    session.frames = begun.files;
+    session.frames = [
+      ...(begun.private_text_bytes === undefined ? [] : [{
+        name: null,
+        type: null,
+        size: begun.private_text.size,
+        bytes: begun.private_text_bytes,
+      }]),
+      ...begun.files,
+    ];
 
     // Metadata carries the name, the size and the untrusted MIME hint, and
     // deliberately no digest: the receiver has to compute what it acks.
@@ -285,6 +293,7 @@ function serveConnection({ socket, broker, logger }) {
           transfer_id: begun.transfer_id,
           lease_expires_at: begun.lease_expires_at,
           total_bytes: begun.total_bytes,
+          ...(begun.private_text === undefined ? {} : { private_text: begun.private_text }),
           files: begun.files.map((file) => ({
             name: file.name,
             size: file.size,

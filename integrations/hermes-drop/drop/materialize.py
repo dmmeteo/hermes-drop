@@ -431,6 +431,7 @@ async def _publish(
         "claim_id": published["claim_id"],
         "expires_at": published["expires_at"],
         "files": published["files"],
+        **({"private_input": result["private_text"]} if "private_text" in result else {}),
     }
 
 

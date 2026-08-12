@@ -8,14 +8,11 @@ const textarea = $('secret');
 const sendButton = $('send');
 const note = $('note');
 const ttlNote = $('ttl');
-const textMode = $('text-mode');
-const filesMode = $('files-mode');
 const filePanel = $('file-panel');
 const fileInput = $('files');
 const dropZone = $('drop-zone');
 const fileList = $('file-list');
 const fileTotal = $('file-total');
-let mode = 'text';
 let selectedFiles = [];
 let metadata = null;
 let deadline = null;
@@ -46,17 +43,6 @@ function formatBytes(bytes) {
 function limits() {
   return { maxFiles: metadata?.max_files ?? DEFAULT_FILE_LIMITS.maxFiles, maxFileBytes: metadata?.max_file_bytes ?? DEFAULT_FILE_LIMITS.maxFileBytes, maxTotalBytes: metadata?.max_total_bytes ?? DEFAULT_FILE_LIMITS.maxTotalBytes };
 }
-function setMode(next) {
-  if (pending) return;
-  mode = next;
-  textMode.setAttribute('aria-pressed', String(next === 'text'));
-  filesMode.setAttribute('aria-pressed', String(next === 'files'));
-  textarea.hidden = next !== 'text';
-  textarea.disabled = next !== 'text';
-  filePanel.hidden = next !== 'files';
-  note.textContent = next === 'text' ? 'Text mode · your file draft is preserved' : 'File mode · your text draft is preserved';
-  (next === 'text' ? textarea : fileInput).focus();
-}
 function renderFiles() {
   if (!fileList || !fileTotal) return;
   fileList.textContent = '';
@@ -81,8 +67,6 @@ function addFiles(files) {
   if (total > cap.maxTotalBytes) { note.textContent = `Files must total at most ${formatBytes(cap.maxTotalBytes)}`; return; }
   selectedFiles = candidate; renderFiles(); note.textContent = 'Files ready · one secure send';
 }
-textMode?.addEventListener('click', () => setMode('text'));
-filesMode?.addEventListener('click', () => setMode('files'));
 fileInput?.addEventListener('change', () => { addFiles([...fileInput.files]); fileInput.value = ''; });
 if (dropZone) for (const type of ['dragenter', 'dragover']) dropZone.addEventListener(type, (event) => { event.preventDefault(); dropZone.classList.add('drag'); });
 if (dropZone) for (const type of ['dragleave', 'drop']) dropZone.addEventListener(type, (event) => { event.preventDefault(); dropZone.classList.remove('drag'); if (type === 'drop') addFiles([...event.dataTransfer.files]); });
@@ -92,7 +76,6 @@ async function start() {
   const askedAt = performance.now();
   metadata = await fetchMetadata({ capability, origin });
   if (!metadata || (metadata.payload_kind !== PAYLOAD_KIND_TEXT && metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL)) return show('unavailable');
-  if (metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL && textMode && filesMode) { textMode.hidden = true; filesMode.hidden = true; }
   deadline = createDeadline({ expiresAt: metadata.expires_at, now: metadata.now, elapsedSinceAnswerMs: performance.now() - askedAt });
   renderRemaining(); if (!deadline) return;
   show('form'); textarea.focus(); ticker = window.setInterval(renderRemaining, 1000);
@@ -101,16 +84,15 @@ async function start() {
 
 sendButton.addEventListener('click', async () => {
   if (!metadata || sendButton.disabled) return;
-  if (!pending && mode === 'text' && textarea.value.length === 0) { textarea.focus(); return; }
-  if (!pending && mode === 'files' && selectedFiles.length === 0) { fileInput.focus(); return; }
-  if (!pending && mode === 'text' && plaintextByteLength(textarea.value) > metadata.max_plaintext_bytes) { note.textContent = `Too large — keep it under ${metadata.max_plaintext_bytes} bytes`; return; }
+  if (!pending && textarea.value.length === 0 && selectedFiles.length === 0) { textarea.focus(); return; }
+  if (!pending && plaintextByteLength(textarea.value) > metadata.max_plaintext_bytes) { note.textContent = `Too large — keep it under ${metadata.max_plaintext_bytes} bytes`; return; }
   sendButton.disabled = true; sendButton.textContent = 'Sending…'; textarea.readOnly = true; if (fileInput) fileInput.disabled = true;
   try {
     if (!pending) {
-      if (mode === 'text') pending = { declaration: 'text', envelope: await sealEnvelope({ capability, metadata, plaintext: textarea.value }) };
+      if (selectedFiles.length === 0) pending = { declaration: 'text', envelope: await sealEnvelope({ capability, metadata, plaintext: textarea.value }) };
       else {
         const files = await Promise.all(selectedFiles.map(async (file) => ({ name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) })));
-        const container = await encodeFileContainer(files, { limits: limits() });
+        const container = await encodeFileContainer(files, { limits: limits(), ...(textarea.value.length === 0 ? {} : { text: textarea.value }) });
         try { pending = { declaration: 'files', envelope: await sealBytesEnvelope({ capability, metadata, bytes: container, version: FILE_ENVELOPE_VERSION }) }; }
         finally { container.fill(0); for (const file of files) file.bytes.fill(0); }
       }

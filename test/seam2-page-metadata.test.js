@@ -78,11 +78,11 @@ describe('seam 2: page delivery and capability-authorized metadata', () => {
       }
     });
 
-    it('is one form with text/files mode controls and one send button', () => {
+    it('is one always-visible composer with textarea, file picker and one send button', () => {
       assert.equal(html.match(/<textarea/g).length, 1);
-      assert.equal(html.match(/<button/g).length, 3);
-      assert.match(html, /id="text-mode"/);
-      assert.match(html, /id="files-mode"/);
+      assert.equal(html.match(/<button/g).length, 1);
+      assert.doesNotMatch(html, /id="(?:text|files)-mode"/);
+      assert.match(html, /id="files"/);
       assert.match(html, /id="send"/);
       assert.ok(!/<img|<svg|<header|<nav/.test(html), 'no logo or header chrome');
     });

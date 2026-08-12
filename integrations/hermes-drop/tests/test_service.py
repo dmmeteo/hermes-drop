@@ -22,7 +22,9 @@ not that a live platform accepted an edit.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -441,6 +443,68 @@ async def test_the_full_loop_runs_against_the_real_broker(
 
     second = await service.claim(origin, receipt["drop_id"])
     assert second["error"] == "unavailable"
+
+
+async def test_combined_files_full_loop_materializes_privately_and_leaks_only_to_model_result(
+    plugin, journal, lane, real_public_broker, tmp_path, caplog
+) -> None:
+    canary = "combined-private-canary-4f9182"
+    binary = bytes([0, 255, 1, 128, 42])
+    origin, adapter = lane()
+    spool_root = tmp_path / "private-spool"
+    spool_root.mkdir(mode=0o700)
+    spool = plugin.drop.spool.Spool(root=spool_root)
+    service = plugin.drop.service.DropService(
+        journal=journal, control=plugin.drop.control_client,
+        socket_path=real_public_broker.socket_path, waiters=NullWaiters(), spool=spool)
+
+    receipt = await service.create(origin, ttl_seconds=300, purpose="combined e2e")
+    posted = adapter.sent[0].content
+    url = re.search(r'https?://[^\s"<>]+#[A-Za-z0-9_-]+', posted).group(0)
+    loop = asyncio.get_running_loop()
+    waiter = plugin.drop.waiter.DropWaiter(
+        journal=journal, control=plugin.drop.control_client,
+        socket_path=real_public_broker.socket_path, deliver=lambda *args, **kwargs: None)
+    parked = asyncio.create_task(waiter.run(drop_id=receipt["drop_id"], origin=origin))
+    await asyncio.sleep(0.1)
+    submitted = await loop.run_in_executor(None, real_public_broker.submit_combined, url, canary,
+                                           [("secret-original.bin", binary), ("empty-original", b"")])
+    assert submitted == "SUBMITTED received"
+    wake = await asyncio.wait_for(parked, 10)
+    assert wake["state"] == "received"
+
+    wrong_origin, _ = lane(chat_id="wrong-chat")
+    before = set(spool_root.iterdir())
+    refused = await service.claim_files(wrong_origin, receipt["drop_id"])
+    assert refused["ok"] is False
+    assert set(spool_root.iterdir()) == before, "wrong origin must not begin/stage a transfer"
+
+    result = await service.claim_files(origin, receipt["drop_id"])
+    assert result["ok"] is True and result["private_input"] == canary, result
+    assert len(result["files"]) == 2
+    claim_dir = Path(result["files"][0]["path"]).parent
+    assert claim_dir.stat().st_mode & 0o777 == 0o700
+    assert claim_dir.parent == spool_root
+    assert all(Path(item["path"]).stat().st_mode & 0o777 == 0o600 for item in result["files"])
+    assert all(Path(item["path"]).name not in {"secret-original.bin", "empty-original"}
+               for item in result["files"])
+    assert Path(result["files"][0]["path"]).read_bytes() == binary
+    assert Path(result["files"][1]["path"]).read_bytes() == b""
+    assert result["files"][0]["sha256"] == hashlib.sha256(binary).hexdigest()
+
+    second = await service.claim_files(origin, receipt["drop_id"])
+    assert second["ok"] is False
+    # The model result legitimately contains private_input. Every serialized/logged/
+    # durable surface must not; file bytes exist only at the randomized safe paths.
+    safe_paths = {item["path"] for item in result["files"]}
+    surfaces = [caplog.text, json.dumps(journal.entries()), posted,
+                json.dumps([e.content for e in adapter.edited]), json.dumps(refused), json.dumps(second),
+                "\n".join(str(path) for path in spool_root.rglob("*"))]
+    for surface in surfaces:
+        assert canary not in surface and "secret-original.bin" not in surface
+    for path in spool_root.rglob("*"):
+        if path.is_file() and str(path) not in safe_paths:
+            assert canary.encode() not in path.read_bytes()
 
 
 async def test_a_real_expiry_wakes_the_parked_waiter_without_polling(

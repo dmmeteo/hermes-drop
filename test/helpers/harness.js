@@ -157,13 +157,14 @@ export function claimFileDrop(broker, handoffId, options) {
 }
 
 /** One HDROP2 container, sealed under the metadata's own advertised limits. */
-export async function sealFileEnvelope({ capability, metadata, files }) {
+export async function sealFileEnvelope({ capability, metadata, files, text }) {
   const container = await encodeFileContainer(files, {
     limits: {
       maxFiles: metadata.max_files,
       maxFileBytes: metadata.max_file_bytes,
       maxTotalBytes: metadata.max_total_bytes,
     },
+    ...(text === undefined ? {} : { text }),
   });
   return sealBytesEnvelope({
     capability,

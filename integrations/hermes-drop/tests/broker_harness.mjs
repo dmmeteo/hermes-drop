@@ -96,7 +96,7 @@ if (wantsPublic) {
    * Python receiver under test therefore meets bytes the production encoder
    * produced rather than a fixture written to agree with it.
    */
-  const submitFiles = async (url, specs) => {
+  const submitFiles = async (url, specs, text) => {
     const capability = capabilityOf(url);
     const metadata = await fetchMetadata({ capability, origin: baseUrl });
     const files = specs.map((spec) => {
@@ -113,6 +113,7 @@ if (wantsPublic) {
         maxFileBytes: metadata.max_file_bytes,
         maxTotalBytes: metadata.max_total_bytes,
       },
+      ...(text === undefined ? {} : { text }),
     });
     const envelope = await sealBytesEnvelope({
       capability,
@@ -122,7 +123,11 @@ if (wantsPublic) {
     });
     const response = await fetch(`${baseUrl}/api/submit`, {
       method: 'POST',
-      headers: { 'x-handoff-capability': capability, 'content-type': 'application/json' },
+      headers: {
+        'x-handoff-capability': capability,
+        'x-handoff-payload': 'files',
+        'content-type': 'application/json',
+      },
       body: JSON.stringify(envelope),
     });
     return response.ok ? 'received' : 'unavailable';
@@ -144,6 +149,11 @@ if (wantsPublic) {
       }
       if (command === 'SUBMIT_FILES') {
         process.stdout.write(`SUBMITTED ${await submitFiles(url, rest)}\n`);
+        return;
+      }
+      if (command === 'SUBMIT_COMBINED') {
+        const text = Buffer.from(rest.shift(), 'base64').toString('utf8');
+        process.stdout.write(`SUBMITTED ${await submitFiles(url, rest, text)}\n`);
         return;
       }
       process.stdout.write('SUBMIT_ERROR unknown-command\n');

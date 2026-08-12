@@ -24,6 +24,7 @@ import {
   MAX_FILE_NAME_BYTES,
   MAX_FILE_TYPE_BYTES,
   MAX_MANIFEST_BYTES,
+  MAX_PRIVATE_TEXT_BYTES,
   PAYLOAD_KIND_FILES,
   decodeFileContainer,
   encodeFileContainer,
@@ -227,6 +228,28 @@ describe('HDROP2 framing', () => {
       decoded.files.map((file) => file.name),
       ['report.pdf', 'report.pdf'],
     );
+  });
+
+  it('keeps the legacy file-only pinned vector unchanged', async () => {
+    assert.deepEqual(await encodeFileContainer(vectorInputs()), vectorContainerBytes());
+  });
+
+  it('round-trips Unicode private text with binary and empty files', async () => {
+    const text = 'пароль 🔐 e\u0301';
+    const decoded = await decodeFileContainer(await encodeFileContainer([
+      { name: 'binary.bin', type: 'application/octet-stream', bytes: Uint8Array.from([0, 255, 128]) },
+      { name: 'empty', type: '', bytes: new Uint8Array() },
+    ], { text }));
+    assert.equal(decoded.text, text);
+    assert.deepEqual(decoded.files.map((file) => [...file.bytes]), [[0, 255, 128], []]);
+    assert.equal(decoded.totalBytes, 3);
+  });
+
+  it('rejects private text above 65536 UTF-8 bytes', async () => {
+    const error = await encodeFailure([{ name: 'x', type: '', bytes: new Uint8Array() }], {
+      text: 'é'.repeat(MAX_PRIVATE_TEXT_BYTES / 2 + 1),
+    });
+    assert.equal(error.code, 'text_size');
   });
 });
 
