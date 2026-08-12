@@ -34,6 +34,8 @@ export async function startHandoffBroker(overrides = {}) {
     port: publicServer.port,
     controlSocketPath: controlServer.socketPath,
     testSnapshot: (handoffId) => broker.testSnapshot(handoffId),
+    testOutboundSnapshot: (dropId) => broker.testOutboundSnapshot(dropId),
+    testSetOutboundExpiry: (dropId, expiresAt) => broker.testSetOutboundExpiry(dropId, expiresAt),
     async close() {
       clearInterval(sweeper);
       // Destroy first. That releases every blocked `await` subscription with a

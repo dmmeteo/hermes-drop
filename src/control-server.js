@@ -9,6 +9,7 @@ import { dirname } from 'node:path';
 import { PAYLOAD_KINDS } from './broker.js';
 import { PAYLOAD_KIND_FILES } from './file-container.js';
 import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
+import { OUTBOUND_PROTOCOL } from './outbound-drop.js';
 
 const MAX_CONTROL_LINE_BYTES = 4096;
 
@@ -419,8 +420,14 @@ function serveConnection({ socket, broker, logger }) {
     let request;
     try {
       request = JSON.parse(line);
-    } catch (error) {
-      logger.warn?.(`control request rejected: ${error.message}`);
+    } catch {
+      // The class, never the message. V8 embeds a ~10-character window of the offending
+      // input in a `JSON.parse` error, and since `create_outbound_drop` this socket
+      // carries plaintext inbound — so that window can be a piece of a secret's base64,
+      // in the artifact most likely to be pasted into an issue or shipped to a log
+      // aggregator. The byte offset was the only diagnostic value in the message and it
+      // is not in the snippet.
+      logger.warn?.('control request rejected: malformed json');
       return answerAndClose(INVALID_REQUEST);
     }
     if (!request || typeof request !== 'object') return answerAndClose(INVALID_REQUEST);
@@ -458,7 +465,13 @@ function serveConnection({ socket, broker, logger }) {
         try {
           response = await handleControlRequest(request, broker);
         } catch (error) {
-          logger.warn?.(`control request rejected: ${error.message}`);
+          // The error's *name* and the op, not its message. A thrown message can quote
+          // its input, and one op's input is now a secret; the name and the op are what
+          // an operator needs to find the bug, and neither can carry a payload.
+          logger.warn?.(
+            `control request rejected: op=${typeof request.op === 'string' ? request.op : 'unknown'} ` +
+              `error=${error?.name ?? 'Error'}`,
+          );
           response = INVALID_REQUEST;
         }
         return answerAndClose(response);
@@ -562,6 +575,20 @@ function claimPayloadBudget(handoffId, maxResponseBytes) {
   return Math.floor(forBase64 / 4) * 3;
 }
 
+/**
+ * Canonical base64, or null. Strict on three counts Node's decoder is not: the
+ * alphabet, the padded length, and that re-encoding reproduces the input exactly —
+ * so `AA==` and `AA=` cannot both mean the same byte, and a value with trailing
+ * junk is refused rather than silently truncated.
+ */
+function decodeBase64Strict(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length === 0 || bytes.toString('base64') !== value) return null;
+  return bytes;
+}
+
 async function handleControlRequest(request, broker) {
   if (!request || typeof request !== 'object') return { ok: false, error: 'invalid_request' };
 
@@ -621,6 +648,12 @@ async function handleControlRequest(request, broker) {
         // were separate capabilities for one release and a client cannot assume
         // the pair, so both are advertised.
         file_claim_protocol: FILE_CLAIM_PROTOCOL,
+        // The outbound direction, advertised on the response every *inbound* drop
+        // starts with as well as on its own, for the same pre-flight reason as
+        // `file_claim_protocol`: a plugin learns whether this broker can hand a
+        // secret *out* from the first call it makes, rather than from the call it
+        // makes after deciding to post one.
+        outbound_protocol: OUTBOUND_PROTOCOL,
       };
       if (!wantsNotice) return answer;
 
@@ -635,6 +668,50 @@ async function handleControlRequest(request, broker) {
         notice_received: receivedNotice(),
         notice_expired: expiredNotice(),
       };
+    }
+
+    // The outbound direction (docs/OUTBOUND_SECRET_DROP_MVP.md): the caller already
+    // holds the secret and wants the *user* to receive it, so this is the one op on
+    // this socket that carries plaintext inbound. Everything about it is arranged so
+    // that the plaintext's life is this call: it is decoded, handed to the store,
+    // encrypted and wiped, and what comes back is a link, a code and no payload.
+    case 'create_outbound_drop': {
+      // Decoded strictly and canonically. A lenient decode would let two different
+      // request lines mean the same secret, and this op is the one place where what
+      // arrives on the socket *is* the payload.
+      const plaintext = decodeBase64Strict(request.plaintext_b64);
+      if (plaintext === null) return { ok: false, error: 'invalid_request' };
+
+      // One `finally` for every exit below, because this function owns the buffer and
+      // the paths out of it are a refused TTL, a refused ceiling, a thrown AEAD and a
+      // receipt. The store wipes it too — on its own success and refusal paths — and
+      // wiping an already-zeroed buffer costs nothing, which is the right price for
+      // not having to prove that the two agree on every future branch.
+      try {
+        const ttlSeconds = request.ttl_seconds;
+        // Type-checked, not coerced. Every other numeric field on this socket is
+        // (`max_files`, `lease_ms`, `index`, `size`, `received_bytes`), the fixture
+        // says `"type": "number"`, and coercion here is not harmless: `true` becomes a
+        // one-second drop and `"1800"` becomes a value the fixture says was refused.
+        // A foreign client with a type slip would get a link and a code for a drop
+        // that is already dead, which the user cannot tell from a stolen secret.
+        if (ttlSeconds !== undefined && typeof ttlSeconds !== 'number') {
+          return { ok: false, error: 'invalid_request' };
+        }
+
+        const created = await broker.createOutboundDrop({
+          plaintext,
+          ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+        });
+        if (!created.ok) return created;
+        return {
+          ...created,
+          protocol_version: PROTOCOL_VERSION,
+          outbound_protocol: OUTBOUND_PROTOCOL,
+        };
+      } finally {
+        plaintext.fill(0);
+      }
     }
 
     // Subscribe to the submission event. Blocks on the broker's own waiter, so

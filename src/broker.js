@@ -101,6 +101,7 @@ import {
   fileContainerCeiling,
   narrowFileLimits,
 } from './file-container.js';
+import { createOutboundDrops } from './outbound-drop.js';
 import {
   AEAD_TAG_BYTES,
   CAPABILITY_BYTES,
@@ -184,6 +185,18 @@ export function createBroker(config, logger = console) {
   /** handoffId -> record */
   const byHandoffId = new Map();
   let baseUrl = config.baseUrl;
+
+  /**
+   * Outbound drops (docs/OUTBOUND_SECRET_DROP_MVP.md) live in their own store, with
+   * their own records, ids, capabilities and lifecycle — nothing above is reused,
+   * because an outbound drop holds ciphertext the broker cannot read and never holds
+   * the key material or the state machine a handoff does. What is shared is exactly
+   * the two things an operator and a shutdown must not have to know about twice:
+   * `sweep` and `destroyAll` reach both stores, so a lapsed outbound payload is
+   * destroyed by the same timer that destroys a lapsed handoff and a shutdown
+   * destroys both.
+   */
+  const outbound = createOutboundDrops(config, logger);
 
   /** The operator's validated per-drop file caps; narrow-only, checked at startup. */
   const fileLimits = config.fileLimits;
@@ -806,15 +819,68 @@ export function createBroker(config, logger = console) {
       return { ok: true, handoff_id: handoffId, plaintext };
     },
 
+    /**
+     * Seam 1, outbound: mint an encrypted outbound drop and return its link, its
+     * code and nothing else (docs/OUTBOUND_SECRET_DROP_MVP.md).
+     *
+     * `plaintext` is a buffer this call consumes and wipes. The store encrypts it
+     * before storing anything and keeps neither the key nor the code — see the
+     * module header in src/outbound-drop.js for what that buys and what it does not.
+     */
+    createOutboundDrop({ plaintext, ttlSeconds } = {}) {
+      if (!baseUrl) throw new Error('broker baseUrl is not resolved yet');
+      return outbound.create({
+        plaintext,
+        ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+        baseUrl,
+      });
+    },
+
+    /**
+     * Seam 2, outbound: non-secret status for a live outbound capability. Holds
+     * nothing open and consumes nothing — a page may fetch it as often as it likes.
+     */
+    outboundMetadata(capability) {
+      return outbound.metadata(capability);
+    },
+
+    /**
+     * Seam 3, outbound: the code gate and the one claimant reservation. The only
+     * operation that can hand out ciphertext, and the only one that spends an attempt.
+     */
+    claimOutboundDrop(capability, options) {
+      return outbound.claim(capability, options);
+    },
+
+    /** Seam 4, outbound: the acknowledgement that destroys the payload. */
+    acknowledgeOutboundDrop(capability, options) {
+      return outbound.acknowledge(capability, options);
+    },
+
     /** Expiry sweeper: drops key material and payloads as soon as a TTL lapses. */
     sweep(now = Date.now()) {
       for (const record of [...byHandoffId.values()]) {
         if (now >= record.expiresAt) destroy(record, 'expired');
       }
+      // Both directions on one timer. An outbound drop has a second deadline the
+      // sweeper has to reach — the bounded ack window — and the store enforces it
+      // here as well as lazily, for the same reason a TTL is enforced twice.
+      outbound.sweep(now);
     },
 
     destroyAll() {
       for (const record of [...byHandoffId.values()]) destroy(record, 'shutdown');
+      outbound.destroyAll();
+    },
+
+    /** Test-only introspection for an outbound drop. No ciphertext, key or code. */
+    testOutboundSnapshot(dropId) {
+      return outbound.testSnapshot(dropId);
+    },
+
+    /** Test-only: move an outbound drop's deadline, like `testSetExpiry` does inbound. */
+    testSetOutboundExpiry(dropId, expiresAt) {
+      return outbound.testSetExpiry(dropId, expiresAt);
     },
 
     /**

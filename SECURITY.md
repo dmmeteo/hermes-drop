@@ -52,7 +52,13 @@ a schedule, and please give a reasonable window before disclosing publicly.
 
 - The broker holds the decryption key. This is **not** end-to-end encryption, and
   a compromise of the broker host, the Hermes host or the model exposes the
-  plaintext. All are trusted principals in the threat model.
+  plaintext. All are trusted principals in the threat model. **One exception, in
+  the other direction:** an *outbound* drop's key is generated per drop, used
+  once, handed back inside the URL fragment and then dropped, so the broker holds
+  ciphertext it cannot open. That narrows what a later compromise of the broker
+  yields for outbound drops only, and changes nothing else — the plaintext passed
+  through this process to be encrypted, and the Hermes host and the model are
+  trusted principals exactly as before. See the outbound lifecycle below.
 - The claimed plaintext enters the model's context, and it is on the wire to your
   model provider. The model is a trusted principal: if it echoes the secret into a
   reply or passes it as an argument to another tool, that output is persisted like
@@ -69,9 +75,26 @@ a schedule, and please give a reasonable window before disclosing publicly.
   — it authenticates the JavaScript that performs the encryption, and
   `crypto.subtle` only exists in a secure context.
 
+## Two directions, two state machines
+
+The broker runs two record spaces, and they share nothing but a sweep timer and a
+shutdown:
+
+- **Inbound handoffs** — the user sends a secret in. Documented immediately below,
+  and pinned by `test/lifecycle-fsm.test.js`.
+- **Outbound drops** — Hermes hands a secret out. Documented in *Outbound drop
+  lifecycle and deletion guarantees* further down, and pinned by
+  `test/outbound-drop.test.js`.
+
+An outbound drop is not a payload kind of a handoff. It has its own ids, its own
+capabilities, its own states and its own seams: `await`, `claim`,
+`begin_file_claim` and `commit_file_claim` answer the uniform `unavailable` for an
+outbound drop id, and the outbound endpoints answer it for an inbound capability.
+Nothing in the next section applies to an outbound drop, and vice versa.
+
 ## Handoff lifecycle and deletion guarantees
 
-This is the authoritative statement of the broker's state machine and of what
+This is the authoritative statement of the *inbound* state machine and of what
 "destroyed" is worth. Everything in it is pinned by `test/lifecycle-fsm.test.js`,
 which drives the machine through its real seams — the browser client for
 `/api/metadata` and `/api/submit`, the `0600` control socket for `await` and
@@ -315,6 +338,127 @@ Three properties hold across that whole table:
 - **Nothing about what the claimant does next.** Once the bytes are on the socket
   they are the local caller's, and the limitations below govern where they go.
 
+## Outbound drop lifecycle and deletion guarantees
+
+The authoritative statement for the other direction: Hermes holds a short secret
+and the broker hands it to exactly one browser, behind a code the user types
+(`docs/OUTBOUND_SECRET_DROP_MVP.md`). Everything here is pinned by
+`test/outbound-drop.test.js` at the two seams the parties actually reach — the
+`0600` control socket for `create_outbound_drop`, and `POST /api/reveal/metadata`,
+`/api/reveal/claim` and `/api/reveal/ack` for the browser.
+
+### What the broker keeps, and what it deliberately does not
+
+| | Kept | Why |
+| --- | --- | --- |
+| Ciphertext + IV | yes | AES-256-GCM, with the drop id as additional authenticated data, so one drop's ciphertext cannot be opened as another's. |
+| The AES key | **no** | Generated per drop, used for exactly one encryption, returned inside the URL fragment, then zero-filled. Browsers never send a fragment, so it reaches no request, no access log and no unfurl. |
+| The plaintext | **no** | Encrypted before the record exists; the buffer it arrived in is zero-filled on every path out of `create`, refusals included. |
+| The code | **no** | What is stored is HMAC-SHA256 over the code under a per-record random key, compared in constant time. Never logged, never in metadata, never in a refusal. |
+
+The key caveat that applies to `claim` applies here in mirror image: the base64 the
+secret arrived as is an immutable V8 string until it is collected, and so is the
+fragment string the key is handed back in. "Zero-filled" is about buffers.
+
+### The three states, and there are no others
+
+```
+available ──correct code, one claim id──► reserved ──ack──► destroyed
+    │                                        │
+    │  three incorrect codes                 │  ack window lapses
+    └──────────────────┬─────────────────────┘
+                       ▼
+                   destroyed        (also: TTL lapse from either state, shutdown)
+```
+
+- **`available → reserved`** — one correct code and one browser-drawn claim id. The
+  verification and the reservation are synchronous with no `await` between them, so
+  two browsers arriving together with the same correct code cannot both win. The
+  loser gets the uniform refusal: it may not be told that someone else is revealing
+  the drop.
+- **`reserved → destroyed`, the acknowledgement** — the claimant reports that it
+  decrypted the payload. The claim id alone authorizes this; the code is not
+  re-checked. One-shot: the record is gone, so a second ack is the uniform refusal.
+- **`reserved → destroyed`, the window** — a bounded ack window
+  (`HANDOFF_OUTBOUND_ACK_WINDOW_MS`, 60 s, clamped inside the drop's own expiry)
+  destroys the payload whether or not anyone acknowledged it. This is what makes
+  "destroyed after reveal" true for a browser that reveals and then vanishes.
+- **`available → destroyed`, the code budget** — three incorrect codes. At three
+  digits the attempt budget *is* the rate limit, and the MVP states the trade:
+  denial of delivery is preferred over allowing online brute force. The correct code
+  buys nothing afterwards.
+- **`available | reserved → destroyed`, the TTL** — enforced by the sweeper and
+  lazily on the next touch, so a parked sweeper cannot extend a lifetime.
+- **shutdown** destroys every outbound payload, like every other state.
+
+There is no edge back. Nothing re-arms a destroyed drop, nothing returns a reserved
+one to `available`, and no control op reports what happened to one.
+
+### What each seam answers, in each state
+
+| | `available` | `reserved` | destroyed / unknown |
+| --- | --- | --- | --- |
+| `POST /api/reveal/metadata` | the gate's non-secret status | unavailable | unavailable |
+| `POST /api/reveal/claim`, correct code, the reserving claim id | **the ciphertext** | **the same ciphertext, again** | unavailable |
+| `POST /api/reveal/claim`, correct code, any other claim id | reserves it | unavailable | unavailable |
+| `POST /api/reveal/claim`, wrong code | `code_incorrect` with the count, or unavailable on the third | unavailable | unavailable |
+| `POST /api/reveal/ack`, the reserving claim id | unavailable | **destroys the payload** | unavailable |
+| `GET` / `HEAD`, any of the three | unavailable, and nothing changes | unavailable, and nothing changes | unavailable |
+
+`code_incorrect` (403) is the one public answer on this surface that is not the
+uniform 404, and it is deliberate: three attempts are worthless if a user cannot
+tell a mistyped code from a dead link. It carries the remaining count and nothing
+else, it is reachable only with a live capability — which whoever holds the link
+already has — and it collapses into the uniform refusal the moment the budget is
+spent.
+
+An attempt is spent only in `available`, and only by a well-formed wrong code. A
+malformed code, a malformed claim id, a missing or non-JSON body, an oversized body
+and a losing concurrent claimant all cost nothing.
+
+### What deletion guarantees
+
+- The payload is decryptable by **at most one** browser, and the ciphertext is
+  handed only to the claim id that reserved it.
+- The broker cannot read its own outbound payloads: it holds no key for them from
+  the moment `create` returns.
+- Once **reserved**, the payload is gone at the acknowledgement or at the end of the
+  bounded ack window, whichever comes first — never later. An **unclaimed** drop is
+  destroyed at its TTL, by the sweeper or on the next touch, whichever reaches it
+  first. So expiry alone destroys a payload nobody claimed, and it never *extends*
+  the life of one that was.
+- Destruction removes the record from both indexes, so a destroyed outbound drop
+  and one that never existed are the same thing to every seam.
+
+### What it does not guarantee
+
+- **Three digits is a human-presence gate, not authentication.** The link and the
+  code travel in the same conversation. A link-holder has ~3 chances in 1000 per
+  drop, bounded only by the attempt budget, and anyone who can read the conversation
+  is the intended audience anyway.
+- **The stored verifier is brute-forceable by someone who already holds the
+  record.** The HMAC key sits beside it, and 1000 candidates is not a search. The
+  key defends a verifier that has *escaped* the record — a log line, a heap dump, a
+  serialized snapshot — and nothing more.
+- **A page reload costs the secret.** The claim id lives in the page's memory, so a
+  reloaded page is a second claimant: metadata refuses a reserved drop, the new
+  claim id is refused however correct the code, and the payload lapses at the ack
+  window. There is no re-request path, because a drop is one-shot and no control op
+  reports its fate. This is the accepted cost of one-browser reservation in this
+  slice; the remedy is the browser slice's (persist the claim id in the page session
+  before claiming, and let metadata answer a reserved drop to a caller presenting
+  that drop's own id).
+- **Activity timing is disclosed to a link-holder.** `/api/reveal/metadata`
+  consumes nothing and is not rate-limited, and it flips from 200 to the uniform
+  refusal the instant a reservation is taken — so a poller learns *when* the correct
+  code was entered. They cannot separate that from a TTL lapse or a spent budget and
+  cannot act on it, and removing the distinction would cost the gate its countdown
+  and attempt display.
+- **HTTPS is load-bearing here too.** The decryption key reaches the browser through
+  a fragment and is used by page JavaScript, so plain HTTP cannot protect it against
+  an active network attacker, and `crypto.subtle` does not exist outside a secure
+  context.
+
 ## Known limitations tracked rather than fixed
 
 - **Durable sanitization is bounded at the wire, not at the model.** The claimed
@@ -410,6 +554,22 @@ Three properties hold across that whole table:
   every other announce, so it cannot loop. The model can therefore be told to
   claim a drop whose secret it already has; those claims answer `unavailable`, and
   the note on the original result is what tells it not to try.
+- **An outbound drop's fate is not reportable.** There is no control op that says
+  whether a drop was revealed, whether its code budget was spent, or whether it
+  lapsed — so a caller that posted a link and a code learns nothing, and a user who
+  meets the uniform refusal cannot be told which of "already revealed", "expired"
+  and "three wrong codes" they hit. Deliberate for this slice: every alternative
+  either discloses activity to the whole conversation or requires a status op the
+  Hermes side does not have yet. It is the reason the TTL floor and the type check
+  on `create_outbound_drop` matter — a drop that dies for a caller's mistake is
+  indistinguishable to the user from a stolen secret, and nothing on either side
+  would ever correct the impression.
+- **The shipped page cannot open an outbound link yet.** `src/client/reveal-client.js`
+  is not in the browser bundle and the page's fragment reader rejects an
+  `r.<capability>.<key>` fragment, so a minted outbound link answers `unavailable`
+  in a real browser. This fails safe — nothing is disclosed and nothing is consumed
+  — but a broker running this slice can mint links no browser can open. Do not put
+  the outbound op in front of users until the reveal UI ships.
 - **Adapter `send` and `edit_message` are not covered by automated tests.** Both
   need live platform credentials. The formatting boundary either side of them is
   tested with real adapter code; the calls themselves are exercised only by manual

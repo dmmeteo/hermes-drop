@@ -497,6 +497,14 @@ and restart the gateway.
 
 ### Broker
 
+> **Outbound drops are not user-ready in this build.** The broker can mint one
+> (`create_outbound_drop` on the control socket, and the `/api/reveal/*` endpoints),
+> but the browser page cannot open it yet: the reveal UI is not in the bundle, so a
+> minted outbound link answers the uniform `unavailable` in a real browser. It fails
+> safe — nothing is disclosed and nothing is consumed — but do not put the outbound
+> op in front of users until the reveal UI ships. The four `HANDOFF_OUTBOUND_*` /
+> `HANDOFF_MAX_OUTBOUND_*` keys below are live and validated at startup regardless.
+
 | Env var | Default | Notes |
 |---|---|---|
 | `HANDOFF_PORT` / `HANDOFF_HOST` | `8787` / `0.0.0.0` | `0` picks an ephemeral port. |
@@ -515,6 +523,10 @@ and restart the gateway.
 | `HANDOFF_BODY_OVERRUN_ALLOWANCE_BYTES` | `1048576` | How far past a body ceiling the server keeps reading so the client still gets the uniform refusal instead of a reset. Additive, so it does not scale with the file ceiling. |
 | `HANDOFF_MAX_TRANSFER_ATTEMPTS` | `8` | How many transfer leases one drop grants without a commit. Each costs a full SHA-256 pass over the container, and a failed transfer restores the drop for free, so the pass is otherwise repeatable for the whole TTL. Spending the budget refuses further transfers (`transfer_failed` / `attempt_budget_spent`) and does **not** destroy the payload — the container is known good and the failures are the receiver's. Minimum 2, so one crash is always retriable. |
 | `HANDOFF_FILE_CLAIM_LEASE_MS` | `60000` | How long one file-claim transfer lease may live. It bounds how long a crashed receiver can keep a submitted drop out of the next one's reach — and, because a leased drop still holds its live-file reservation, how long it can hold a quarter of the budget above without progress. A receiver may only *narrow* it, and it is clamped again to the handoff's own remaining time so an advertised deadline is always one the broker can honour. Raise it only for a genuinely slow spool disk; may not exceed `HANDOFF_MAX_TTL_SECONDS`, since a lease on a lapsed handoff could never be committed. |
+| `HANDOFF_OUTBOUND_TTL_SECONDS` | `1800` | Default lifetime of an **outbound** drop — a secret Hermes hands *to* the user behind a 3-digit code. A separate dial from `HANDOFF_TTL_SECONDS` even where the two agree: an outbound link and its code sit in a conversation everyone in it can read, so this is the window in which someone else could open it. Minimum 1 second (a shorter drop can lapse before the message carrying its link renders, which the user cannot tell from a stolen secret). Must not exceed `HANDOFF_MAX_OUTBOUND_TTL_SECONDS`, and must not be shorter than `HANDOFF_OUTBOUND_ACK_WINDOW_MS` — see the startup refusal below. |
+| `HANDOFF_MAX_OUTBOUND_TTL_SECONDS` | `3600` | The longest outbound drop a caller may *ask* for. Its own ceiling rather than the inbound `HANDOFF_MAX_TTL_SECONDS`, so you can shorten outbound exposure without shortening the window a user gets to compose an inbound secret. **May only be lowered** from 3600, may not exceed `HANDOFF_MAX_TTL_SECONDS`, and may not be below `HANDOFF_OUTBOUND_TTL_SECONDS`. A request above it is refused with `invalid_request`, never clamped. |
+| `HANDOFF_MAX_OUTBOUND_PLAINTEXT_BYTES` | `2048` | Largest outbound secret accepted. **May only be lowered**; a higher value is refused at startup, because this is what keeps a whole `create_outbound_drop` request inside the 4096-byte control-protocol request line. Outbound is for a short private value — outbound *file* sharing is out of scope. |
+| `HANDOFF_OUTBOUND_ACK_WINDOW_MS` | `60000` | How long a reserved outbound drop waits for its claimant's acknowledgement before destroying the payload anyway. It bounds the one window in which the payload is both decryptable by a browser and still resident here, so it is what makes "destroyed after reveal" true for a browser that reveals and then vanishes. Clamped at claim time to the drop's own remaining life, and the value published to the page is clamped the same way. **May not exceed `HANDOFF_OUTBOUND_TTL_SECONDS`** — lowering the outbound TTL under 60 s without lowering this too is refused at startup, which under `restart: unless-stopped` is a crash loop until you fix it; the error message names both keys. |
 | `HANDOFF_CONTROL_SOCKET` | `./run/control.sock` | `/run/handoff/control.sock` in the container. |
 | `HANDOFF_SOCKET_DIR` | *(required by compose)* | Host directory bind-mounted at `/run/handoff`. Mode `0700`, owned by `1000:1000`, created before first start. |
 | `HANDOFF_ENABLE_HSTS` | off | Enable only behind HTTPS. |

@@ -13,6 +13,27 @@ export const UNAVAILABLE_JSON = '{"status":"unavailable"}';
 
 export const CAPABILITY_HEADER = 'x-handoff-capability';
 
+/**
+ * The body ceiling for an outbound claim or acknowledgement: a 3-digit code, a
+ * 22-character claim id and the JSON around them is under 60 bytes. 512 is slack for
+ * a field growing later and still far too small to be anything but a claim, so this
+ * endpoint pair never buffers on a scale the submit path has to reason about.
+ */
+const REVEAL_BODY_BYTES = 512;
+
+/**
+ * How far past that ceiling the reveal endpoints keep reading, purely so an ordinary
+ * over-limit body still gets the uniform refusal instead of a reset.
+ *
+ * Deliberately *not* `config.bodyOverrunAllowanceBytes` (1 MiB), which is sized for the
+ * submit path: these two endpoints resolve the capability only *after* the body is read
+ * — on purpose, so that "this capability is valid" cannot be inferred from whether a
+ * body was drained — and an unauthenticated caller must therefore not be able to make
+ * the broker read a megabyte per request to be told no. One control line's worth keeps
+ * every plausible malformed claim polite while capping the junk at ~4.6 KiB.
+ */
+const REVEAL_BODY_OVERRUN_BYTES = 4096;
+
 const PUBLIC_DIR = fileURLToPath(new URL('./public/', import.meta.url));
 
 const ASSETS = new Map([
@@ -248,6 +269,104 @@ async function handle(request, response, context) {
       // However this ended — receipt, refusal, deadline, transport error or an
       // abort halfway through the body — the next attempt must be admissible.
       slot.release();
+    }
+  }
+
+  // The outbound direction (docs/OUTBOUND_SECRET_DROP_MVP.md): three POST endpoints
+  // that hand one browser a secret Hermes already had. All three are POST and none is
+  // reachable by GET or HEAD, which is not a convention but the requirement — the
+  // landing page has to survive being previewed by Telegram, Discord, Slack, an
+  // antivirus and a link checker, and a claim that a scanner could trigger would be a
+  // secret consumed by a preview.
+  if (request.method === 'POST' && path.startsWith('/api/reveal/')) {
+    const capability = request.headers[CAPABILITY_HEADER];
+    if (typeof capability !== 'string') {
+      sendUnavailable(response, config);
+      return log(404);
+    }
+
+    if (path === '/api/reveal/metadata') {
+      const result = broker.outboundMetadata(capability);
+      if (!result.ok) {
+        sendUnavailable(response, config);
+        return log(404);
+      }
+      const { ok, ...metadata } = result;
+      sendJson(response, 200, metadata, config);
+      return log(200);
+    }
+
+    // The two state-changing ops carry a small JSON body. The ceiling is fixed and
+    // tiny — a code, a claim id and the JSON around them — because nothing legitimate
+    // is larger and a body that is cannot be a claim.
+    if (path === '/api/reveal/claim' || path === '/api/reveal/ack') {
+      const body = await readBody(request, REVEAL_BODY_BYTES, {
+        ...config,
+        bodyOverrunAllowanceBytes: REVEAL_BODY_OVERRUN_BYTES,
+      });
+      let parsed = null;
+      if (body !== null) {
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = null;
+        }
+      }
+      if (!parsed || typeof parsed !== 'object') {
+        sendUnavailable(response, config);
+        return log(404);
+      }
+
+      if (path === '/api/reveal/ack') {
+        const acknowledged = broker.acknowledgeOutboundDrop(capability, {
+          claimId: parsed.claim_id,
+        });
+        if (!acknowledged.ok) {
+          sendUnavailable(response, config);
+          return log(404);
+        }
+        sendJson(response, 200, { status: 'acknowledged' }, config);
+        return log(200);
+      }
+
+      const claimed = broker.claimOutboundDrop(capability, {
+        code: parsed.code,
+        claimId: parsed.claim_id,
+      });
+      if (claimed.error === 'code_incorrect') {
+        // The one refusal on this surface that is not the uniform body, and the
+        // reason is the user rather than the caller: three attempts are worthless if
+        // a mistyped code is indistinguishable from a dead link. It says how many
+        // remain and nothing else — no state, no size, no hint about the code — and
+        // it is reachable only with a live capability, which whoever holds the link
+        // already has. The moment the budget runs out it collapses back into the
+        // uniform refusal, because from then on the drop really is over.
+        sendJson(
+          response,
+          403,
+          { status: 'code_incorrect', attempts_remaining: claimed.attempts_remaining },
+          config,
+        );
+        return log(403);
+      }
+      if (!claimed.ok) {
+        sendUnavailable(response, config);
+        return log(404);
+      }
+      sendJson(
+        response,
+        200,
+        {
+          status: 'revealed',
+          did: claimed.did,
+          alg: claimed.alg,
+          iv: claimed.iv,
+          ct: claimed.ct,
+          claim_expires_at: claimed.claim_expires_at,
+        },
+        config,
+      );
+      return log(200);
     }
   }
 

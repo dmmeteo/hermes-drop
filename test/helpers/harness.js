@@ -10,8 +10,17 @@ import { join } from 'node:path';
 import { startHandoffBroker } from '../../src/main.js';
 import { controlRequest } from '../../src/control-client.js';
 import { fetchMetadata, sealBytesEnvelope } from '../../src/client/handoff-client.js';
+import {
+  acknowledgeOutboundDrop,
+  claimOutboundDrop,
+  decryptOutboundPayload,
+  fetchOutboundMetadata,
+  newClaimId,
+  revealSecret,
+} from '../../src/client/reveal-client.js';
 import { receiveFileClaim } from '../../src/file-claim-client.js';
 import { FILE_ENVELOPE_VERSION, encodeFileContainer } from '../../src/file-container.js';
+import { parseOutboundFragment } from '../../src/outbound-envelope.js';
 
 export async function startTestBroker(overrides = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'handoff-test-'));
@@ -104,6 +113,49 @@ export async function sealFileEnvelope({ capability, metadata, files }) {
     bytes: container,
     version: FILE_ENVELOPE_VERSION,
   });
+}
+
+/**
+ * Mints one **outbound** drop — Hermes → the user
+ * (docs/OUTBOUND_SECRET_DROP_MVP.md) — and hands back everything a browser would
+ * have: the capability and the key out of the fragment, the code Hermes posts
+ * separately, and the four operations the page performs, all through the production
+ * client in src/client/reveal-client.js.
+ *
+ * `plaintext` goes in as a string because that is what the caller of the control op
+ * has; from the broker's side it is bytes on a request line and nothing else.
+ */
+export async function createOutboundDrop(broker, { plaintext, ttlSeconds } = {}) {
+  const request = {
+    op: 'create_outbound_drop',
+    plaintext_b64: Buffer.from(plaintext, 'utf8').toString('base64'),
+  };
+  if (ttlSeconds !== undefined) request.ttl_seconds = ttlSeconds;
+  const created = await broker.control(request);
+  if (!created.ok) return { created, capability: null, key: null };
+
+  const fragment = parseOutboundFragment(splitHandoffUrl(created.url).capability);
+  const { capability, key } = fragment;
+  const origin = broker.baseUrl;
+  return {
+    created,
+    id: created.drop_id,
+    capability,
+    key,
+    code: created.code,
+    expiresAt: created.expires_at,
+    metadata: () => fetchOutboundMetadata({ capability, origin }),
+    /** One claim. `code` defaults to the real one; `claimId` is the caller's choice. */
+    claim: ({ code = created.code, claimId = newClaimId() } = {}) =>
+      claimOutboundDrop({ capability, code, claimId, origin }),
+    ack: ({ claimId }) => acknowledgeOutboundDrop({ capability, claimId, origin }),
+    /** Decrypts a `revealed` answer with the fragment key, the way the page does. */
+    open: (claimed) =>
+      decryptOutboundPayload({ key, dropId: claimed.did, iv: claimed.iv, ct: claimed.ct }),
+    /** The whole flow: claim, decrypt, acknowledge. */
+    reveal: ({ code = created.code, claimId = newClaimId() } = {}) =>
+      revealSecret({ capability, key, code, claimId, origin }),
+  };
 }
 
 /** Splits a handoff URL into its request target and its `#fragment` capability. */

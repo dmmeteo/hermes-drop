@@ -6,6 +6,9 @@ import {
   fileContainerCeiling,
   resolveFileLimits,
 } from './file-container.js';
+// The outbound lifetime floor is the store's own rule (src/outbound-drop.js); it is
+// read here so a deployment cannot configure a default the store would refuse.
+import { MIN_OUTBOUND_TTL_SECONDS } from './outbound-drop.js';
 
 /**
  * What one file drop reserves: the largest plaintext it could ever hold, which is
@@ -103,6 +106,60 @@ const DEFAULT_FILE_CLAIM_LEASE_MS = 60_000;
  */
 const DEFAULT_MAX_TRANSFER_ATTEMPTS = 8;
 
+/**
+ * The outbound drop's own default TTL: thirty minutes for this deployment.
+ *
+ * Configurable, and deliberately a *separate* number from the inbound `ttlSeconds`
+ * even though the two currently agree: an inbound drop waits for a person to compose
+ * a secret, an outbound one waits for a person to open a link and type three digits,
+ * and those are different windows to reason about. The shorter it is the less of it
+ * there is for anyone else in the conversation to open the link in, which is the
+ * argument for lowering it — but it is a deployment policy, not a constant, so it is
+ * an operator's dial rather than a hard-coded number.
+ */
+const DEFAULT_OUTBOUND_TTL_SECONDS = 1800;
+
+/**
+ * The outbound hard maximum: the longest outbound drop a caller may *ask* for.
+ *
+ * Distinct from `maxTtlSeconds` because outbound exposure is a different risk from
+ * inbound: an outbound link and its code sit in a conversation everyone in it can
+ * read, so an operator has to be able to shorten the outbound ceiling without
+ * shortening the window a user gets to compose an inbound secret. It is narrow-only
+ * against `maxTtlSeconds` — no outbound drop may outlive the broker's own maximum —
+ * and it must not be below `outboundTtlSeconds`, or the default would not fit inside
+ * its own ceiling.
+ *
+ * Deliberately *not* equal to the default: an exceptional request above the default
+ * is legitimate (a secret handed to someone who has to walk to another machine), and
+ * capping requests at the default would refuse it with no dial to allow it.
+ */
+const DEFAULT_MAX_OUTBOUND_TTL_SECONDS = 3600;
+
+/**
+ * The largest outbound secret this broker will accept, and a narrow-only ceiling.
+ *
+ * It is small because of where the plaintext comes from: an outbound secret arrives
+ * on the control socket, inside one newline-delimited request line bounded at 4096
+ * bytes (`MAX_CONTROL_LINE_BYTES`, src/control-server.js). 2048 bytes of secret is
+ * 2732 characters of base64, which leaves the rest of the line to its own fields
+ * with room to spare — and the feature is a short private value, not a file
+ * (MVP, "Deliberate scope": outbound file sharing is out).
+ */
+export const MAX_OUTBOUND_PLAINTEXT_BYTES = 2048;
+
+/**
+ * How long a reserved outbound drop waits for its claimant's acknowledgement.
+ *
+ * It bounds the one window in which the payload is both decryptable by a browser
+ * and still resident here, so it is what makes "destroyed after reveal" true for a
+ * browser that reveals and then vanishes. A raise as well as a lower is an
+ * operator's call — it is a statement about how long a phone on a bad connection
+ * needs to retry the same claim — but it may not outlive the drop it is inside, and
+ * it is clamped to the record's own expiry at claim time regardless.
+ */
+const DEFAULT_OUTBOUND_ACK_WINDOW_MS = 60_000;
+
 export const DEFAULTS = Object.freeze({
   port: 8787,
   host: '0.0.0.0',
@@ -128,6 +185,12 @@ export const DEFAULTS = Object.freeze({
   bodyOverrunAllowanceBytes: DEFAULT_BODY_OVERRUN_ALLOWANCE_BYTES,
   fileClaimLeaseMs: DEFAULT_FILE_CLAIM_LEASE_MS,
   maxTransferAttempts: DEFAULT_MAX_TRANSFER_ATTEMPTS,
+  // Outbound drops. Separate from every number above because the direction is
+  // reversed: these bound a secret this broker was *given*, not one it was sent.
+  outboundTtlSeconds: DEFAULT_OUTBOUND_TTL_SECONDS,
+  maxOutboundTtlSeconds: DEFAULT_MAX_OUTBOUND_TTL_SECONDS,
+  maxOutboundPlaintextBytes: MAX_OUTBOUND_PLAINTEXT_BYTES,
+  outboundAckWindowMs: DEFAULT_OUTBOUND_ACK_WINDOW_MS,
 });
 
 const NUMERIC = new Set([
@@ -147,6 +210,10 @@ const NUMERIC = new Set([
   'bodyOverrunAllowanceBytes',
   'fileClaimLeaseMs',
   'maxTransferAttempts',
+  'outboundTtlSeconds',
+  'maxOutboundTtlSeconds',
+  'maxOutboundPlaintextBytes',
+  'outboundAckWindowMs',
 ]);
 
 const ENV_KEYS = {
@@ -169,6 +236,10 @@ const ENV_KEYS = {
   HANDOFF_BODY_OVERRUN_ALLOWANCE_BYTES: 'bodyOverrunAllowanceBytes',
   HANDOFF_FILE_CLAIM_LEASE_MS: 'fileClaimLeaseMs',
   HANDOFF_MAX_TRANSFER_ATTEMPTS: 'maxTransferAttempts',
+  HANDOFF_OUTBOUND_TTL_SECONDS: 'outboundTtlSeconds',
+  HANDOFF_MAX_OUTBOUND_TTL_SECONDS: 'maxOutboundTtlSeconds',
+  HANDOFF_MAX_OUTBOUND_PLAINTEXT_BYTES: 'maxOutboundPlaintextBytes',
+  HANDOFF_OUTBOUND_ACK_WINDOW_MS: 'outboundAckWindowMs',
 };
 
 /** The environment key an operator would have set to produce this config key. */
@@ -313,6 +384,69 @@ export function loadConfig(overrides = {}, env = process.env) {
       `${ENV_KEY_FOR.fileClaimLeaseMs} (${config.fileClaimLeaseMs}) exceeds the longest drop ` +
         `this broker will mint (${ENV_KEY_FOR.maxTtlSeconds}=${config.maxTtlSeconds}s): a lease ` +
         'on a handoff that has already lapsed could never be committed',
+    );
+  }
+
+  // Outbound drops. The ceiling is validated first, because it is what the default
+  // below is then checked against: an outbound drop is bounded by its *own* maximum,
+  // narrow-only against the broker-wide one, so shortening outbound exposure does not
+  // mean shortening the window an inbound drop gets.
+  if (
+    !Number.isSafeInteger(config.maxOutboundTtlSeconds) ||
+    config.maxOutboundTtlSeconds < MIN_OUTBOUND_TTL_SECONDS ||
+    // Narrow-only against this module's own constant, not only against the inbound
+    // maximum. `maxTtlSeconds` has no ceiling of its own — it is validated as the thing
+    // `ttlSeconds` must fit inside — so bounding the outbound ceiling by it alone means
+    // an operator who raises the inbound maximum for an inbound reason (a slow uplink
+    // and a 42 MiB file drop) silently raises how long an outbound secret and its
+    // 3-digit code stay readable in a chat conversation. That is precisely the exposure
+    // this dial exists to bound independently, and the README says in bold that it
+    // cannot happen. The sibling plaintext ceiling below is narrow-only the same way.
+    config.maxOutboundTtlSeconds > DEFAULT_MAX_OUTBOUND_TTL_SECONDS ||
+    config.maxOutboundTtlSeconds > config.maxTtlSeconds
+  ) {
+    throw new Error(
+      `${ENV_KEY_FOR.maxOutboundTtlSeconds} must be an integer between ` +
+        `${MIN_OUTBOUND_TTL_SECONDS} and ${ENV_KEY_FOR.maxTtlSeconds} ` +
+        `(${config.maxTtlSeconds}), and may only be lowered from ` +
+        `${DEFAULT_MAX_OUTBOUND_TTL_SECONDS} (got ${config.maxOutboundTtlSeconds})`,
+    );
+  }
+  // The floor is a second, not a positive float. Below that a drop can lapse before
+  // the message carrying its own link has rendered, which is indistinguishable to the
+  // user from a secret somebody else took — see the same floor in src/outbound-drop.js.
+  if (
+    !Number.isFinite(config.outboundTtlSeconds) ||
+    config.outboundTtlSeconds < MIN_OUTBOUND_TTL_SECONDS ||
+    config.outboundTtlSeconds > config.maxOutboundTtlSeconds
+  ) {
+    throw new Error(
+      `${ENV_KEY_FOR.outboundTtlSeconds} must be >= ${MIN_OUTBOUND_TTL_SECONDS} and <= ` +
+        `${ENV_KEY_FOR.maxOutboundTtlSeconds} (${config.maxOutboundTtlSeconds}): ` +
+        `got ${config.outboundTtlSeconds}`,
+    );
+  }
+  // Narrow-only, like the file caps and for the same class of reason: the ceiling is
+  // what keeps an outbound secret inside the control protocol's request line, so a
+  // raise would fail late — as a refused request on the socket — rather than here.
+  if (
+    !Number.isSafeInteger(config.maxOutboundPlaintextBytes) ||
+    config.maxOutboundPlaintextBytes < 1 ||
+    config.maxOutboundPlaintextBytes > MAX_OUTBOUND_PLAINTEXT_BYTES
+  ) {
+    throw new Error(
+      `${ENV_KEY_FOR.maxOutboundPlaintextBytes} must be a positive integer and may only be ` +
+        `lowered from ${MAX_OUTBOUND_PLAINTEXT_BYTES} (got ${config.maxOutboundPlaintextBytes})`,
+    );
+  }
+  if (!Number.isSafeInteger(config.outboundAckWindowMs) || config.outboundAckWindowMs < 1) {
+    throw new Error(`${ENV_KEY_FOR.outboundAckWindowMs} must be a positive integer`);
+  }
+  if (config.outboundAckWindowMs > config.outboundTtlSeconds * 1000) {
+    throw new Error(
+      `${ENV_KEY_FOR.outboundAckWindowMs} (${config.outboundAckWindowMs}) exceeds the drop it ` +
+        `sits inside (${ENV_KEY_FOR.outboundTtlSeconds}=${config.outboundTtlSeconds}s): a window ` +
+        'that outlives its own drop is one the broker cannot honour',
     );
   }
 
