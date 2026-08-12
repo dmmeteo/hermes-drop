@@ -1,182 +1,125 @@
-// DOM wiring for the accepted Variant A page. All crypto and transport lives in
-// handoff-client.js; this file only moves between the three screens.
-import { PAYLOAD_KIND_TEXT, PAYLOAD_KIND_UNIVERSAL } from '../file-container.js';
+import { DEFAULT_FILE_LIMITS, FILE_ENVELOPE_VERSION, PAYLOAD_KIND_TEXT, PAYLOAD_KIND_UNIVERSAL, encodeFileContainer } from '../file-container.js';
 import { createDeadline, formatRemaining } from './countdown.js';
-import {
-  fetchMetadata,
-  plaintextByteLength,
-  readCapability,
-  sealEnvelope,
-  submitEnvelope,
-} from './handoff-client.js';
+import { fetchMetadata, plaintextByteLength, readCapability, sealBytesEnvelope, sealEnvelope, submitEnvelope } from './handoff-client.js';
 
-const screens = {
-  form: document.getElementById('form'),
-  success: document.getElementById('success'),
-  unavailable: document.getElementById('unavailable'),
-};
-const textarea = document.getElementById('secret');
-const sendButton = document.getElementById('send');
-const note = document.getElementById('note');
-const ttlNote = document.getElementById('ttl');
-
-function show(name) {
-  // Leaving the form is final: a receipt or a refusal must never be repainted
-  // by a countdown that fires afterwards.
-  if (name !== 'form') stopCountdown();
-  for (const [key, section] of Object.entries(screens)) section.hidden = key !== name;
-  document.getElementById('app').dataset.state = name;
-}
-
-// The countdown owns the form screen only.
+const $ = (id) => document.getElementById(id);
+const screens = { form: $('form'), success: $('success'), unavailable: $('unavailable') };
+const textarea = $('secret');
+const sendButton = $('send');
+const note = $('note');
+const ttlNote = $('ttl');
+const textMode = $('text-mode');
+const filesMode = $('files-mode');
+const filePanel = $('file-panel');
+const fileInput = $('files');
+const dropZone = $('drop-zone');
+const fileList = $('file-list');
+const fileTotal = $('file-total');
+let mode = 'text';
+let selectedFiles = [];
+let metadata = null;
 let deadline = null;
 let ticker = null;
+let pending = null; // exact sealed envelope + declaration, retained for retry
+const capability = readCapability(window.location.hash);
+const origin = window.location.origin;
 
-/**
- * Detaching the deadline — not just clearing the interval — is what makes
- * leaving the form final. The `visibilitychange` listener registered in
- * `start()` is an anonymous closure that cannot be removed and outlives the
- * ticker, so clearing the interval alone still let a returning tab repaint a
- * delivered receipt as "this link is unavailable". Telling someone who *did*
- * hand over a credential that it failed invites them to resend it into the
- * chat channel, which is exactly what this system exists to prevent. With the
- * deadline gone, `renderRemaining` is a no-op from whichever path calls it.
- */
-function stopCountdown() {
-  deadline = null;
-  if (ticker === null) return;
-  window.clearInterval(ticker);
-  ticker = null;
+function show(name) {
+  if (name !== 'form') stopCountdown();
+  for (const [key, section] of Object.entries(screens)) section.hidden = key !== name;
+  $('app').dataset.state = name;
 }
-
+function stopCountdown() { deadline = null; if (ticker !== null) window.clearInterval(ticker); ticker = null; }
 function renderRemaining() {
   if (!deadline) return;
   const remaining = deadline.remaining();
   ttlNote.textContent = formatRemaining(remaining);
-  // `role="timer"` is not a live region, so the ticking digits are never
-  // announced. A whole-minute label is something assistive technology can read
-  // on demand without a per-second announcement nobody wants.
   const minutes = Math.ceil(remaining / 60000);
-  ttlNote.setAttribute(
-    'aria-label',
-    remaining <= 0 ? 'expired' : `${minutes} minute${minutes === 1 ? '' : 's'} left`,
-  );
-  // The broker expired it too; stop offering a Send that cannot succeed.
+  ttlNote.setAttribute('aria-label', remaining <= 0 ? 'expired' : `${minutes} minute${minutes === 1 ? '' : 's'} left`);
   if (remaining <= 0) show('unavailable');
 }
-
-const capability = readCapability(window.location.hash);
-// Pinned explicitly rather than left relative: same requests in the browser, and
-// it keeps this module drivable outside one.
-const origin = window.location.origin;
-let metadata = null;
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+function limits() {
+  return { maxFiles: metadata?.max_files ?? DEFAULT_FILE_LIMITS.maxFiles, maxFileBytes: metadata?.max_file_bytes ?? DEFAULT_FILE_LIMITS.maxFileBytes, maxTotalBytes: metadata?.max_total_bytes ?? DEFAULT_FILE_LIMITS.maxTotalBytes };
+}
+function setMode(next) {
+  if (pending) return;
+  mode = next;
+  textMode.setAttribute('aria-pressed', String(next === 'text'));
+  filesMode.setAttribute('aria-pressed', String(next === 'files'));
+  textarea.hidden = next !== 'text';
+  textarea.disabled = next !== 'text';
+  filePanel.hidden = next !== 'files';
+  note.textContent = next === 'text' ? 'Text mode · your file draft is preserved' : 'File mode · your text draft is preserved';
+  (next === 'text' ? textarea : fileInput).focus();
+}
+function renderFiles() {
+  if (!fileList || !fileTotal) return;
+  fileList.textContent = '';
+  selectedFiles.forEach((file, index) => {
+    const li = document.createElement('li');
+    const name = document.createElement('span'); name.className = 'name'; name.textContent = file.name;
+    const size = document.createElement('span'); size.className = 'meta'; size.textContent = formatBytes(file.size);
+    const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove'; remove.setAttribute('aria-label', `Remove ${file.name}`);
+    remove.addEventListener('click', () => { selectedFiles.splice(index, 1); renderFiles(); });
+    li.append(name, size, remove); fileList.append(li);
+  });
+  const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+  fileTotal.textContent = `${selectedFiles.length} file${selectedFiles.length === 1 ? '' : 's'} · ${formatBytes(total)}`;
+}
+function addFiles(files) {
+  if (pending) return;
+  const candidate = [...selectedFiles, ...files];
+  const cap = limits();
+  if (candidate.length > cap.maxFiles) { note.textContent = `Choose at most ${cap.maxFiles} files`; return; }
+  if (candidate.some((f) => f.size > cap.maxFileBytes)) { note.textContent = `Each file must be at most ${formatBytes(cap.maxFileBytes)}`; return; }
+  const total = candidate.reduce((sum, f) => sum + f.size, 0);
+  if (total > cap.maxTotalBytes) { note.textContent = `Files must total at most ${formatBytes(cap.maxTotalBytes)}`; return; }
+  selectedFiles = candidate; renderFiles(); note.textContent = 'Files ready · one secure send';
+}
+textMode?.addEventListener('click', () => setMode('text'));
+filesMode?.addEventListener('click', () => setMode('files'));
+fileInput?.addEventListener('change', () => { addFiles([...fileInput.files]); fileInput.value = ''; });
+if (dropZone) for (const type of ['dragenter', 'dragover']) dropZone.addEventListener(type, (event) => { event.preventDefault(); dropZone.classList.add('drag'); });
+if (dropZone) for (const type of ['dragleave', 'drop']) dropZone.addEventListener(type, (event) => { event.preventDefault(); dropZone.classList.remove('drag'); if (type === 'drop') addFiles([...event.dataTransfer.files]); });
 
 async function start() {
   if (!capability) return show('unavailable');
-
   const askedAt = performance.now();
   metadata = await fetchMetadata({ capability, origin });
-  if (!metadata) return show('unavailable');
-
-  // This page is a text page today: one textarea, one Send, one UTF-8 secret
-  // sealed under envelope v1. It serves a *universal* link on those terms too —
-  // that link's text lane is this exact flow, and its metadata carries the
-  // `max_plaintext_bytes` both size guards below read — so the sender gets the form
-  // they were sent to, and gets the file picker in the same form once slice U3
-  // lands (docs/UNIVERSAL_DROP_DELIVERY_PLAN.md).
-  //
-  // A files-*only* drop is different and is refused: it advertises no
-  // `max_plaintext_bytes` at all, so rendering the form would leave those guards
-  // comparing against `undefined`, i.e. never firing, and an arbitrarily large
-  // secret would be sealed and posted into a body ceiling widened for containers,
-  // to be refused on the version mismatch at the far end. Refusing keeps `metadata`
-  // null so no later handler can act on it.
-  if (
-    metadata.payload_kind !== PAYLOAD_KIND_TEXT &&
-    metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL
-  ) {
-    metadata = null;
-    return show('unavailable');
-  }
-
-  // Anchored on the broker's clock, not the device's — see countdown.js. The
-  // whole round trip is charged against the remaining span: that over-charges
-  // by the request leg, which is the safe direction.
-  deadline = createDeadline({
-    expiresAt: metadata.expires_at,
-    now: metadata.now,
-    elapsedSinceAnswerMs: performance.now() - askedAt,
-  });
-  // Already dead on arrival: this paints 0:00, shows the unavailable screen and
-  // detaches the deadline, which is the single signal that the countdown is over.
-  renderRemaining();
-  if (!deadline) return;
-
-  show('form');
-  textarea.focus();
-
-  ticker = window.setInterval(renderRemaining, 1000);
-  // A hidden tab has its timers throttled to as little as one tick a minute, so
-  // coming back has to resync from the deadline rather than trust the ticker.
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) renderRemaining();
-  });
+  if (!metadata || (metadata.payload_kind !== PAYLOAD_KIND_TEXT && metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL)) return show('unavailable');
+  if (metadata.payload_kind !== PAYLOAD_KIND_UNIVERSAL && textMode && filesMode) { textMode.hidden = true; filesMode.hidden = true; }
+  deadline = createDeadline({ expiresAt: metadata.expires_at, now: metadata.now, elapsedSinceAnswerMs: performance.now() - askedAt });
+  renderRemaining(); if (!deadline) return;
+  show('form'); textarea.focus(); ticker = window.setInterval(renderRemaining, 1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) renderRemaining(); });
 }
-
-// Survives a transient transport failure: pressing Send again resends these exact
-// bytes rather than sealing a second, different envelope the broker would refuse.
-let pendingEnvelope = null;
 
 sendButton.addEventListener('click', async () => {
   if (!metadata || sendButton.disabled) return;
-
-  const plaintext = textarea.value;
-  if (!pendingEnvelope && plaintext.length === 0) {
-    textarea.focus();
-    return;
-  }
-  if (!pendingEnvelope && plaintextByteLength(plaintext) > metadata.max_plaintext_bytes) {
-    note.textContent = `Too large — keep it under ${metadata.max_plaintext_bytes} bytes`;
-    return;
-  }
-
-  sendButton.disabled = true;
-  sendButton.textContent = 'Sending…';
-  textarea.readOnly = true;
-
+  if (!pending && mode === 'text' && textarea.value.length === 0) { textarea.focus(); return; }
+  if (!pending && mode === 'files' && selectedFiles.length === 0) { fileInput.focus(); return; }
+  if (!pending && mode === 'text' && plaintextByteLength(textarea.value) > metadata.max_plaintext_bytes) { note.textContent = `Too large — keep it under ${metadata.max_plaintext_bytes} bytes`; return; }
+  sendButton.disabled = true; sendButton.textContent = 'Sending…'; textarea.readOnly = true; if (fileInput) fileInput.disabled = true;
   try {
-    pendingEnvelope = pendingEnvelope ?? (await sealEnvelope({ capability, metadata, plaintext }));
-    const outcome = await submitEnvelope({ capability, envelope: pendingEnvelope, origin });
-
-    if (outcome === 'received') {
-      // Only a definitive receipt clears the visible copy.
-      pendingEnvelope = null;
-      textarea.value = '';
-      show('success');
-      return;
+    if (!pending) {
+      if (mode === 'text') pending = { declaration: 'text', envelope: await sealEnvelope({ capability, metadata, plaintext: textarea.value }) };
+      else {
+        const files = await Promise.all(selectedFiles.map(async (file) => ({ name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) })));
+        const container = await encodeFileContainer(files, { limits: limits() });
+        try { pending = { declaration: 'files', envelope: await sealBytesEnvelope({ capability, metadata, bytes: container, version: FILE_ENVELOPE_VERSION }) }; }
+        finally { container.fill(0); for (const file of files) file.bytes.fill(0); }
+      }
     }
-
-    if (outcome === 'unreachable') {
-      // Nothing definitive came back, so keep the text and the sealed envelope.
-      note.textContent = 'Could not reach Hermes — press Send to try again';
-      sendButton.disabled = false;
-      sendButton.textContent = 'Send to Hermes';
-      return;
-    }
-
+    const outcome = await submitEnvelope({ capability, envelope: pending.envelope, declaration: pending.declaration, origin });
+    if (outcome === 'received') { pending = null; textarea.value = ''; selectedFiles = []; renderFiles(); show('success'); return; }
+    if (outcome === 'unreachable') { note.textContent = 'Could not reach Hermes — press Send to try again'; sendButton.disabled = false; sendButton.textContent = 'Send to Hermes'; return; }
     show('unavailable');
-  } catch {
-    show('unavailable');
-  }
+  } catch { show('unavailable'); }
 });
-
-textarea.addEventListener('input', () => {
-  if (!metadata) return;
-  const size = plaintextByteLength(textarea.value);
-  note.textContent =
-    size > metadata.max_plaintext_bytes
-      ? `Too large — keep it under ${metadata.max_plaintext_bytes} bytes`
-      : 'One secure send · no edits';
-});
-
+textarea.addEventListener('input', () => { if (!metadata) return; const size = plaintextByteLength(textarea.value); note.textContent = size > metadata.max_plaintext_bytes ? `Too large — keep it under ${metadata.max_plaintext_bytes} bytes` : 'One secure send · no edits'; });
 start();

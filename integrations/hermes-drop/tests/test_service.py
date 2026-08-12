@@ -76,8 +76,8 @@ class FakeControl:
         self.await_answer = await_answer or {"ok": False, "error": "unavailable"}
         self.calls: list = []
 
-    async def create(self, *, ttl_seconds=None, notice_platform=None, socket_path=None, timeout=None):
-        self.calls.append({"op": "create", "ttl_seconds": ttl_seconds, "platform": notice_platform})
+    async def create(self, *, ttl_seconds=None, notice_platform=None, payload_kind=None, socket_path=None, timeout=None):
+        self.calls.append({"op": "create", "ttl_seconds": ttl_seconds, "platform": notice_platform, "payload_kind": payload_kind})
         if self.created is not None:
             return self.created
         expires = int(time.time() * 1000) + (ttl_seconds or 1800) * 1000
@@ -174,7 +174,7 @@ async def test_create_posts_the_link_journals_and_arms_a_waiter(
     assert receipt["ok"] is True
     assert receipt["drop_id"] == "H" * 22
     assert receipt["state"] == "waiting"
-    assert control.calls[0] == {"op": "create", "ttl_seconds": 600, "platform": "telegram"}
+    assert control.calls[0] == {"op": "create", "ttl_seconds": 600, "platform": "telegram", "payload_kind": "universal"}
 
     assert len(adapter.sent) == 1
     assert adapter.sent[0].chat_id == "tg-1"
@@ -856,3 +856,27 @@ async def test_every_refusal_this_task_adds_reaches_the_model_with_a_reason(plug
     too_large = safe_errors.SAFE_REASONS[service.ERROR_RESPONSE_TOO_LARGE]
     assert "shorter" in too_large
     assert "raise" not in too_large.lower(), too_large
+
+
+
+async def test_universal_files_claim_dispatches_internally_after_authorization(plugin, journal, lane, monkeypatch) -> None:
+    origin, _ = lane(); control = FakeControl(); await _received_entry(plugin, journal, origin, control)
+    journal.update("H" * 22, payload_kind="files")
+    calls = []
+    async def materialize(drop_id, claimed_origin, **kwargs):
+        calls.append((drop_id, claimed_origin)); return {"ok": True, "files": [{"path": "/safe/spool/f.bin", "name": "f.bin", "type": "", "size": 0, "sha256": "0" * 64, "expires_at": 1}], "mark_spent": True}
+    monkeypatch.setattr(plugin.drop.materialize, "materialize_file_claim", materialize)
+    result = await _service(plugin, journal, control).claim(origin, "H" * 22)
+    assert result["files"][0]["path"].startswith("/safe/spool/")
+    assert calls == [("H" * 22, origin)]
+    assert not [call for call in control.calls if call["op"] == "claim"]
+
+
+async def test_universal_files_wrong_origin_refuses_before_claim_or_staging(plugin, journal, lane, monkeypatch) -> None:
+    origin, _ = lane(); control = FakeControl(); await _received_entry(plugin, journal, origin, control); journal.update("H" * 22, payload_kind="files")
+    staged = []
+    async def materialize(*args, **kwargs): staged.append(args); raise AssertionError("must not stage")
+    monkeypatch.setattr(plugin.drop.materialize, "materialize_file_claim", materialize)
+    foreign, _ = lane(Platform.DISCORD, "foreign")
+    result = await _service(plugin, journal, control).claim(foreign, "H" * 22)
+    assert result == {"error": "not_authorized"}; assert staged == []; assert not [c for c in control.calls if c["op"] == "claim"]

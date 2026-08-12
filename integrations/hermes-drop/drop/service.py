@@ -190,6 +190,7 @@ class DropService:
         created = await self._control.create(
             ttl_seconds=int(ttl_seconds),
             notice_platform=render.renderer_for(origin.platform_name),
+            payload_kind="universal",
             socket_path=self._socket_path,
         )
         if not created.get("ok"):
@@ -371,6 +372,9 @@ class DropService:
         refusal = journal_mod.authorize_claim(entry, origin)
         if refusal is not None:
             return refusal
+
+        if entry.get("payload_kind") == "files":
+            return await self.claim_files(origin, drop_id)
 
         result = await self._control.claim(drop_id, socket_path=self._socket_path)
         if not result.get("ok"):

@@ -78,15 +78,18 @@ describe('seam 2: page delivery and capability-authorized metadata', () => {
       }
     });
 
-    it('is one textarea and one send button, with no logo or header chrome', () => {
+    it('is one form with text/files mode controls and one send button', () => {
       assert.equal(html.match(/<textarea/g).length, 1);
-      assert.equal(html.match(/<button/g).length, 1);
+      assert.equal(html.match(/<button/g).length, 3);
+      assert.match(html, /id="text-mode"/);
+      assert.match(html, /id="files-mode"/);
+      assert.match(html, /id="send"/);
       assert.ok(!/<img|<svg|<header|<nav/.test(html), 'no logo or header chrome');
     });
 
-    it('keeps the action region simple: no file control, Send spans the width', async () => {
-      assert.ok(!/<input/.test(html), 'no file control and no other input in the action region');
-      assert.ok(!/type="file"/.test(html));
+    it('has one multi-file picker and Send spans the width', async () => {
+      assert.equal((html.match(/<input/g) || []).length, 1);
+      assert.match(html, /<input[^>]+type="file"[^>]+multiple/);
 
       const css = await (await fetch(`${broker.baseUrl}/assets/app.css`)).text();
       const primary = css.match(/\.primary\s*\{[^}]*\}/)[0];

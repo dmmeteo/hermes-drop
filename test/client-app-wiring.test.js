@@ -9,47 +9,29 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { after, before, describe, it } from 'node:test';
 
-import { splitHandoffUrl, startTestBroker } from './helpers/harness.js';
+import { claimFileDrop, splitHandoffUrl, startTestBroker } from './helpers/harness.js';
 
-const ELEMENT_IDS = ['app', 'form', 'success', 'unavailable', 'secret', 'send', 'note', 'ttl'];
+const ELEMENT_IDS = ['app', 'form', 'success', 'unavailable', 'secret', 'send', 'note', 'ttl', 'text-mode', 'files-mode', 'file-panel', 'files', 'drop-zone', 'file-list', 'file-total'];
 
 function fakeDom() {
-  const elements = new Map();
-  for (const id of ELEMENT_IDS) {
-    elements.set(id, {
-      id,
-      hidden: false,
-      value: '',
-      textContent: '',
-      disabled: false,
-      readOnly: false,
-      dataset: {},
-      focused: false,
-      attributes: new Map(),
-      handlers: new Map(),
-      focus() {
-        this.focused = true;
-      },
-      setAttribute(name, value) {
-        this.attributes.set(name, value);
-      },
-      addEventListener(type, handler) {
-        this.handlers.set(type, handler);
-      },
-    });
+  function element(id = '') {
+    return { id, hidden: false, value: '', textContent: '', disabled: false, readOnly: false,
+      dataset: {}, focused: false, files: [], children: [], attributes: new Map(), handlers: new Map(),
+      classList: { add() {}, remove() {} }, focus() { this.focused = true; },
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      addEventListener(type, handler) { this.handlers.set(type, handler); },
+      append(...children) { this.children.push(...children); } };
   }
+  const elements = new Map(ELEMENT_IDS.map((id) => [id, element(id)]));
   const documentHandlers = new Map();
-  return {
-    elements,
-    documentHandlers,
-    document: {
-      hidden: false,
-      getElementById: (id) => elements.get(id) ?? null,
-      addEventListener(type, handler) {
-        documentHandlers.set(type, handler);
-      },
-    },
-  };
+  return { elements, documentHandlers, document: { hidden: false,
+    getElementById: (id) => elements.get(id) ?? null, createElement: () => element(),
+    addEventListener(type, handler) { documentHandlers.set(type, handler); } } };
+}
+
+function fileLike(name, bytes, type = '') {
+  const copy = Uint8Array.from(bytes);
+  return { name, type, size: copy.byteLength, async arrayBuffer() { return copy.slice().buffer; } };
 }
 
 /** Loads app.js afresh with the given fragment, since it runs on import. */
@@ -174,6 +156,56 @@ describe('the page script wiring', () => {
     const snapshot = broker.testSnapshot(created.handoff_id);
     assert.equal(snapshot.state, 'submitted');
     assert.equal(snapshot.payloadKind, 'text', 'the sender chose the text lane');
+  });
+
+  it('drives the one browser form file path with binary and five-file File-like inputs', async () => {
+    for (const bodies of [[[0, 255, 1, 128, 10]], [[], [0], [1, 2], [254, 255, 0], [9, 8, 7, 6]]]) {
+      const created = await broker.control({ op: 'create', payload_kind: 'universal' });
+      const { capability } = splitHandoffUrl(created.url);
+      const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
+      await dom.elements.get('files-mode').handlers.get('click')();
+      const input = dom.elements.get('files'); input.files = bodies.map((body, i) => fileLike(`f${i}.bin`, body));
+      await input.handlers.get('change')(); await dom.elements.get('send').handlers.get('click')();
+      const claimed = await claimFileDrop(broker, created.handoff_id);
+      assert.deepEqual(claimed.files.map((f) => f.size), bodies.map((b) => b.length));
+      for (let i = 0; i < bodies.length; i += 1) {
+        assert.deepEqual([...claimed.files[i].bytes], bodies[i]);
+      }
+    }
+  });
+
+  it('removes files and preserves text and file drafts across explicit mode switches', async () => {
+    const created = await broker.control({ op: 'create', payload_kind: 'universal' });
+    const { capability } = splitHandoffUrl(created.url); const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl });
+    const textarea = dom.elements.get('secret'); textarea.value = 'preserved draft';
+    await dom.elements.get('files-mode').handlers.get('click')();
+    const input = dom.elements.get('files'); input.files = [fileLike('keep.bin', [1]), fileLike('remove.bin', [2])]; await input.handlers.get('change')();
+    await dom.elements.get('file-list').children[1].children[2].handlers.get('click')();
+    await dom.elements.get('text-mode').handlers.get('click')(); assert.equal(textarea.value, 'preserved draft');
+    await dom.elements.get('files-mode').handlers.get('click')(); assert.match(dom.elements.get('file-total').textContent, /^1 file/);
+  });
+
+  it('rejects over-count and over-size before reading, crypto, or network', async () => {
+    for (const files of [Array.from({ length: 6 }, (_, i) => fileLike(`${i}.bin`, [i])),
+      [{ name: 'huge.bin', type: '', size: 42 * 1024 * 1024 + 1, async arrayBuffer() { throw new Error('read'); } }]]) {
+      const created = await broker.control({ op: 'create', payload_kind: 'universal' }); const { capability } = splitHandoffUrl(created.url);
+      const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl }); await dom.elements.get('files-mode').handlers.get('click')();
+      const input = dom.elements.get('files'); input.files = files; await input.handlers.get('change')(); await dom.elements.get('send').handlers.get('click')();
+      assert.equal(broker.testSnapshot(created.handoff_id).state, 'pending'); assert.match(dom.elements.get('note').textContent, /at most/);
+    }
+  });
+
+  it('declares files with HPKE v2 and retries the exact sealed request', async () => {
+    const created = await broker.control({ op: 'create', payload_kind: 'universal' }); const { capability } = splitHandoffUrl(created.url);
+    const dom = await loadApp({ hash: `#${capability}`, origin: broker.baseUrl }); await dom.elements.get('files-mode').handlers.get('click')();
+    const input = dom.elements.get('files'); input.files = [fileLike('retry.bin', [72, 68, 82, 79, 80, 50, 0])]; await input.handlers.get('change')();
+    const realFetch = globalThis.fetch; const requests = [];
+    globalThis.fetch = async (url, options) => { if (String(url).endsWith('/api/submit')) { requests.push({ header: options.headers['X-Handoff-Payload'], body: String(options.body) }); throw new TypeError('offline'); } return realFetch(url, options); };
+    try {
+      await dom.elements.get('send').handlers.get('click')(); assert.equal(requests.length, 2); assert.equal(requests[0].header, 'files'); assert.equal(JSON.parse(requests[0].body).v, 2); assert.deepEqual(requests[1], requests[0]);
+      globalThis.fetch = async (url, options) => { if (String(url).endsWith('/api/submit')) requests.push({ header: options.headers['X-Handoff-Payload'], body: String(options.body) }); return realFetch(url, options); };
+      await dom.elements.get('send').handlers.get('click')(); assert.deepEqual(requests[2], requests[0]);
+    } finally { globalThis.fetch = realFetch; }
   });
 
   it('renders the form, sends once, and lands on the receipt', async () => {

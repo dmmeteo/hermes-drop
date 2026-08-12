@@ -24,6 +24,11 @@ services:
       HANDOFF_TTL_SECONDS: "1800"
       HANDOFF_MAX_PLAINTEXT_BYTES: "65536"
       HANDOFF_MAX_BODY_BYTES: "131072"
+      HANDOFF_MAX_FILES: "5"
+      HANDOFF_MAX_FILE_BYTES: "44040192"
+      HANDOFF_MAX_FILE_TOTAL_BYTES: "44040192"
+      HANDOFF_MAX_LIVE_FILE_BYTES: "176186556"
+      HANDOFF_FILE_SUBMIT_TIMEOUT_MS: "600000"
       HANDOFF_ENABLE_HSTS: "1"
     # The uid/gid the broker runs as is *declared*, not inferred from the image,
     # because reachability of the bind-mounted control socket below depends on it
@@ -60,10 +65,11 @@ services:
       - traefik.http.routers.handoff.entrypoints=websecure
       - traefik.http.routers.handoff.tls.certresolver=letsencrypt
       - traefik.http.services.handoff.loadbalancer.server.port=8787
-      # Bound the payload at the proxy as well as in the broker.
-      - traefik.http.middlewares.handoff-body.buffering.maxRequestBodyBytes=131072
-      - traefik.http.middlewares.handoff-body.buffering.memRequestBodyBytes=131072
-      - traefik.http.routers.handoff.middlewares=handoff-body@docker
+      # Public submission admission is enforced by the broker after the
+      # capability and declared lane are verified. A static proxy buffering cap
+      # cannot distinguish 64 KiB text from a 42 MiB encrypted file envelope and
+      # would either reject valid files or pre-buffer them outside broker RAM
+      # accounting, so this router deliberately does not attach one.
     networks:
       - proxy
 

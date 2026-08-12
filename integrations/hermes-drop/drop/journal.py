@@ -97,6 +97,7 @@ ALLOWED_FIELDS = frozenset(
         "edit_failed",
         "notice_received",
         "notice_expired",
+        "payload_kind",
     }
 )
 
@@ -323,6 +324,9 @@ class DropJournal:
             "edit_failed": False,
             "notice_received": _text(notice_received),
             "notice_expired": _text(notice_expired),
+            # Filled by the authorized await response. Empty means a legacy text
+            # broker until that response arrives; it is routing metadata only.
+            "payload_kind": "",
         }
         return self.put(entry)
 

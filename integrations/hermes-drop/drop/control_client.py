@@ -291,6 +291,7 @@ async def create(
     *,
     ttl_seconds: Optional[int] = None,
     notice_platform: Optional[str] = None,
+    payload_kind: Optional[str] = None,
     socket_path: Optional[PathLike] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
@@ -302,6 +303,8 @@ async def create(
         request["ttl_seconds"] = int(ttl_seconds)
     if notice_platform is not None:
         request["notice_platform"] = notice_platform
+    if payload_kind is not None:
+        request["payload_kind"] = payload_kind
     return await control_request(request, socket_path=socket_path, timeout=timeout)
 
 
@@ -319,7 +322,12 @@ async def await_submission(
     only a backstop against a wedged socket.
     """
     return await control_request(
-        {"op": "await", "handoff_id": handoff_id, "wait_ms": int(wait_ms)},
+        {
+            "op": "await",
+            "handoff_id": handoff_id,
+            "wait_ms": int(wait_ms),
+            "include_payload_kind": True,
+        },
         socket_path=socket_path,
         timeout=timeout,
     )

@@ -524,3 +524,17 @@ async def test_deliver_wake_import_shape_is_pinned() -> None:
     assert params["text"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["source"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["source"].default is None
+
+
+
+async def test_universal_wait_records_only_payload_kind_in_journal_and_wake(plugin, journal, lane) -> None:
+    origin, _ = lane(); entry = _waiting(journal, origin); deliver = FakeDeliver()
+    canary = "FILE-BYTES-CANARY-91f2"
+    answer = {"ok": True, "handoff_id": entry["drop_id"], "status": "submitted", "payload_kind": "files"}
+    await _waiter(plugin, journal, FakeControl(answer=answer), deliver).run(drop_id=entry["drop_id"], origin=origin)
+    stored = journal.get(entry["drop_id"])
+    assert stored["payload_kind"] == "files"
+    assert set(stored) == set(entry), "payload_kind is the only schema addition and was present blank"
+    assert stored["payload_kind"] != entry["payload_kind"]
+    representations = repr(stored) + repr(deliver.calls) + repr(answer)
+    assert canary not in representations

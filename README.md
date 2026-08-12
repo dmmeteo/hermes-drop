@@ -3,10 +3,11 @@
 Ask for a secret without putting it in the chat.
 
 Hermes Drop gives a [Hermes](https://github.com/NousResearch/hermes-agent) agent a
-way to request a password, token or key from the person it is talking to: it posts
-a short-lived link into **the conversation it is already in**, the user pastes the
-secret into a one-page web form, the browser encrypts it, and the agent is woken
-when it arrives. The plaintext never appears in a chat message.
+way to request private text or up to five files from the person it is talking to:
+it posts a short-lived link into **the conversation it is already in**, the user
+chooses text or files in one web form, the browser encrypts the payload, and the
+agent is woken when it arrives. The plaintext and file bytes never appear in a chat
+message.
 
 Two pieces, both self-hosted by you:
 
@@ -62,6 +63,13 @@ Without patch `0001`, the plugin still loads and refuses safely — `/drop` retu
   interpretation of what the user asked for.
 - **`request_private_input`** and **`claim_private_input`** — the same operation,
   reached from a model turn instead.
+- **One universal form.** The existing `/drop` and `request_private_input` flow
+  creates one link where the sender chooses either private text or up to 5 files
+  totaling 42 MiB. There is no separate file command or file-only link.
+- **Private file spool.** Files are encrypted together in one HDROP2 container,
+  claimed over the private framed socket, and atomically published as `0600` files
+  beneath a `0700` spool. Hermes receives sanitized metadata and local paths only;
+  file bytes never enter the model context, `state.db`, FTS or session logs.
 - **Origin-bound by construction.** Neither the command nor the tool schema has a
   destination field — no `platform`, `chat_id`, `channel`, `thread_id` or `target`
   at any depth. A model that cannot express a destination cannot pick the wrong

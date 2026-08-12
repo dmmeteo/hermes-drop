@@ -734,7 +734,15 @@ async function handleControlRequest(request, broker) {
       // broker.js: the caller here is local, trusted with plaintext, and the
       // handoff id it is probing with was never secret.
       if (outcome !== 'submitted') return { ok: false, error: 'unavailable' };
-      return { ok: true, handoff_id: request.handoff_id, status: 'submitted' };
+      const answer = { ok: true, handoff_id: request.handoff_id, status: 'submitted' };
+      if (request.include_payload_kind === true) {
+        const kind = broker.payloadKind(request.handoff_id);
+        if (!kind) return { ok: false, error: 'unavailable' };
+        answer.payload_kind = kind;
+      } else if (request.include_payload_kind !== undefined) {
+        return { ok: false, error: 'invalid_request' };
+      }
+      return answer;
     }
 
     case 'claim': {

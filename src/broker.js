@@ -1561,6 +1561,14 @@ export function createBroker(config, logger = console) {
       return true;
     },
 
+    /** Non-secret local routing metadata for the universal Hermes dispatcher. */
+    payloadKind(handoffId) {
+      const record = live(byHandoffId.get(handoffId), Date.now());
+      return record && (record.state === 'submitted' || record.state === 'transferring')
+        ? record.payloadKind
+        : null;
+    },
+
     /** Test-only introspection. Returns no plaintext and no key material. */
     testSnapshot(handoffId) {
       const record = byHandoffId.get(handoffId);

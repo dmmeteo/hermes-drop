@@ -194,7 +194,9 @@ class DropWaiter:
         if remaining_ms <= 0:
             state = journal_mod.STATE_EXPIRED
         else:
-            state = await self._park(drop_id, remaining_ms)
+            state, payload_kind = await self._park(drop_id, remaining_ms)
+            if state == journal_mod.STATE_RECEIVED and payload_kind in ("text", "files"):
+                self._journal.update(drop_id, payload_kind=payload_kind)
 
         result = await reconciler_mod.finalize_terminal(
             journal=self._journal,
@@ -208,7 +210,7 @@ class DropWaiter:
         self._republish(origin)
         return result
 
-    async def _park(self, drop_id: str, remaining_ms: float) -> str:
+    async def _park(self, drop_id: str, remaining_ms: float) -> tuple[str, str]:
         wait_ms = int(remaining_ms) + PARK_GRACE_MS
         try:
             response = await self._control.await_submission(
@@ -219,16 +221,17 @@ class DropWaiter:
             )
         except Exception as exc:  # noqa: BLE001 - the client is supposed not to raise
             logger.warning("hermes-drop: await raised for %s: %s", drop_id, exc)
-            return journal_mod.STATE_TRANSPORT_FAILED
+            return journal_mod.STATE_TRANSPORT_FAILED, ""
 
         if response.get("ok") and response.get("status") == "submitted":
-            return journal_mod.STATE_RECEIVED
+            # Old/fake controls predate universal drops and therefore mean text.
+            return journal_mod.STATE_RECEIVED, str(response.get("payload_kind") or "text")
         if response.get("error") == "unavailable":
             # The broker's one body for expired, destroyed, consumed and lapsed.
-            return journal_mod.STATE_EXPIRED
+            return journal_mod.STATE_EXPIRED, ""
         # No answer *about this handoff*: broker_unavailable, invalid_request, a
         # malformed line. Unknown, and unknown never becomes a claim.
-        return journal_mod.STATE_TRANSPORT_FAILED
+        return journal_mod.STATE_TRANSPORT_FAILED, ""
 
     def _republish(self, origin: Any) -> None:
         try:

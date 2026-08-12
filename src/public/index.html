@@ -15,9 +15,20 @@
 <div class="copy">
 <p class="eyebrow">Private drop</p>
 <h1>Send privately to Hermes</h1>
-<p>Paste the private details for your current task. This page closes in <strong id="ttl" role="timer">–:––</strong>, and nothing you enter will be posted to chat.</p>
+<p>Send private text or files for your current task. This page closes in <strong id="ttl" role="timer">–:––</strong>, and nothing you enter will be posted to chat.</p>
+</div>
+<div class="mode-switch" role="group" aria-label="What to send">
+<button id="text-mode" type="button" aria-pressed="true">Text</button>
+<button id="files-mode" type="button" aria-pressed="false">Files</button>
 </div>
 <textarea id="secret" aria-label="Private details" placeholder="Password, token, credentials, or a small config…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="enter"></textarea>
+<section id="file-panel" class="file-panel" hidden aria-labelledby="files-label">
+<p id="files-label"><strong>Add files</strong> <span class="meta">Up to 5 files, 42 MiB total</span></p>
+<label id="drop-zone" class="drop-zone" for="files">Choose files or drag them here</label>
+<input id="files" type="file" multiple hidden>
+<ul id="file-list" class="file-list" aria-live="polite"></ul>
+<p id="file-total" class="meta">0 files · 0 B</p>
+</section>
 <div class="actions">
 <span class="meta privacy-note" id="note">One secure send · no edits</span>
 <button class="primary" id="send" type="button">Send to Hermes</button>

@@ -72,7 +72,15 @@ class FakeControl:
         self.claim_answer = claim_answer
         self.calls: list = []
 
-    async def create(self, *, ttl_seconds=None, notice_platform=None, socket_path=None, timeout=None):
+    async def create(
+        self,
+        *,
+        ttl_seconds=None,
+        notice_platform=None,
+        payload_kind=None,
+        socket_path=None,
+        timeout=None,
+    ):
         self.calls.append({"op": "create", "ttl_seconds": ttl_seconds})
         return {
             "ok": True,
