@@ -16,13 +16,18 @@ is worse than an error string: a raising slash-command handler is swallowed at
 ``gateway/run.py:14701-14702`` and *falls through to skill resolution*,
 resurrecting the ``/skill drop`` path this whole design exists to sever.
 
-**Carries no secret.** The one op that returns plaintext (``claim``) hands the
-caller a base64 line and nothing here logs, journals, or re-formats it.
+**Two ops carry a secret, in opposite directions, and neither is logged.**
+``claim`` returns plaintext and hands the caller a base64 line; ``create_outbound_drop``
+*sends* one. Nothing here logs, journals, or re-formats either — and the outbound
+direction adds a rule the inbound one did not need: the response holds a link and a
+code, and it is the caller's job to keep both out of everything except the chat
+message they are for.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
@@ -51,6 +56,19 @@ ERRORS: Sequence[str] = (
 #: revision *this client* implements; see :func:`supports_file_claim` for what the
 #: broker on the other end implements.
 FILE_CLAIM_PROTOCOL = 1
+
+#: contract/control-protocol.json -> outbound_drop.protocol. The outbound revision
+#: *this client* implements — the direction where Hermes hands the user a secret
+#: instead of asking for one. See :func:`supports_outbound_drop`.
+OUTBOUND_PROTOCOL = 1
+
+#: contract/control-protocol.json -> ops.create_outbound_drop.request.payload_format
+#:
+#: This client only ever sends ``structured``: the reveal page renders labelled
+#: fields, and an opaque blob would arrive there as one unnamed masked value. The
+#: other value exists on the wire for callers that predate the field, not for this
+#: one.
+OUTBOUND_PAYLOAD_FORMAT = "structured"
 
 #: A file transfer failed and **nothing was consumed**: the payload is untouched,
 #: still one-shot, and still claimable by the next ``begin_file_claim``. Named for
@@ -308,6 +326,69 @@ async def create(
     return await control_request(request, socket_path=socket_path, timeout=timeout)
 
 
+def supports_outbound_drop(created: Optional[Mapping[str, Any]]) -> bool:
+    """Can the broker that answered *created* hand a secret OUT?
+
+    Read off a response rather than assumed from this plugin's version, for the
+    reason :func:`supports_lossless_claim` gives at length: the two halves ship
+    together in this repo but a Hermes-side plugin does not — it is installed once
+    and upgraded on its own schedule, against whatever broker is deployed.
+
+    ``outbound_protocol`` is advertised on every ``create`` response as well as on
+    ``create_outbound_drop``'s own, precisely so this question can be answered
+    before anything is posted. Absence means "cannot", because a broker without the
+    capability publishes no field at all — and unknown is not "probably fine" when
+    the alternative is a model told it delivered a credential that never left.
+    """
+    if not isinstance(created, Mapping):
+        return False
+    revision = created.get("outbound_protocol")
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        return False
+    return revision >= OUTBOUND_PROTOCOL
+
+
+async def create_outbound_drop(
+    *,
+    payload_json: str,
+    ttl_seconds: Optional[int] = None,
+    notice_platform: Optional[str] = None,
+    socket_path: Optional[PathLike] = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Mint one outbound drop: the direction where the caller supplies the payload.
+
+    The **only** op this client sends that carries a secret *outbound*, and the
+    mirror image of :func:`claim`'s caveat: there the risk is a response this client
+    cannot read, here it is a request line the broker will not accept. The payload is
+    bounded to ``outbound_payload.max_payload_bytes`` (1536) by
+    ``drop/outbound_payload.py`` before it gets here, which is what keeps the base64
+    of it — ×4/3 — inside :data:`MAX_REQUEST_BYTES` with the envelope.
+
+    ``notice_platform`` asks the broker to render the chat message too, so posting a
+    link and a code costs one round trip and one implementation of a sentence that
+    has to be right on every platform.
+
+    Carries a secret and therefore logs nothing, journals nothing, and re-formats
+    nothing — the same rule the module header states for ``claim``, in the other
+    direction. The response holds a link, a code and a notice; the caller must keep
+    all three out of anything durable except the chat message itself.
+    """
+    request: Dict[str, Any] = {
+        "op": "create_outbound_drop",
+        # Encoded here rather than by the caller so the base64 discipline lives with
+        # the transport that requires it. Canonical base64 with padding, which is
+        # what the broker's strict decoder accepts.
+        "plaintext_b64": base64.b64encode(payload_json.encode("utf-8")).decode("ascii"),
+        "payload_format": OUTBOUND_PAYLOAD_FORMAT,
+    }
+    if ttl_seconds is not None:
+        request["ttl_seconds"] = int(ttl_seconds)
+    if notice_platform is not None:
+        request["notice_platform"] = notice_platform
+    return await control_request(request, socket_path=socket_path, timeout=timeout)
+
+
 async def await_submission(
     handoff_id: str,
     *,
@@ -362,6 +443,8 @@ async def claim(
 __all__ = [
     "BROKER_UNAVAILABLE",
     "FILE_CLAIM_PROTOCOL",
+    "OUTBOUND_PAYLOAD_FORMAT",
+    "OUTBOUND_PROTOCOL",
     "DEFAULT_CONTROL_SOCKET",
     "DEFAULT_TIMEOUT_SECONDS",
     "ERRORS",
@@ -378,6 +461,8 @@ __all__ = [
     "claim",
     "control_request",
     "create",
+    "create_outbound_drop",
     "supports_file_claim",
     "supports_lossless_claim",
+    "supports_outbound_drop",
 ]

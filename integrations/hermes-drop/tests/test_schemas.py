@@ -3,7 +3,13 @@
 "The model cannot express it" is the entire safety argument for initiation, so
 it is asserted structurally rather than by reading the schema and agreeing that
 it looks fine. The walk below descends through every dict key, every dict value,
-and every list element of both schemas.
+and every list element of every schema.
+
+Three schemas since the outbound direction landed, and the walk covers all three.
+The argument is not weaker on ``SEND_PRIVATE_OUTPUT`` — it is stronger. A misrouted
+inbound drop asks a stranger for a credential; a misrouted outbound one hands them
+one, so the schema that hands things out is the last place a destination field could
+be allowed to appear.
 
 The one field that *sounds* like a destination and legitimately is not is
 ``purpose`` — a non-secret audit label — and ``minutes``, whose 1..60 range sits
@@ -38,7 +44,9 @@ def walk(node: Any, path: str = "$") -> Iterator[tuple[str, Any]]:
         yield path, node
 
 
-@pytest.mark.parametrize("schema_name", ["REQUEST_PRIVATE_INPUT", "CLAIM_PRIVATE_INPUT"])
+@pytest.mark.parametrize(
+    "schema_name", ["REQUEST_PRIVATE_INPUT", "CLAIM_PRIVATE_INPUT", "SEND_PRIVATE_OUTPUT"]
+)
 def test_no_destination_field_at_any_depth(schemas, schema_name: str) -> None:
     schema = getattr(schemas, schema_name)
     offences = []
@@ -54,10 +62,19 @@ def test_no_destination_field_at_any_depth(schemas, schema_name: str) -> None:
     assert offences == [], f"{schema_name} exposes destination field(s): {offences}"
 
 
-@pytest.mark.parametrize("schema_name", ["REQUEST_PRIVATE_INPUT", "CLAIM_PRIVATE_INPUT"])
+@pytest.mark.parametrize(
+    "schema_name", ["REQUEST_PRIVATE_INPUT", "CLAIM_PRIVATE_INPUT", "SEND_PRIVATE_OUTPUT"]
+)
 def test_parameter_names_are_an_exact_allowlist(schemas, schema_name: str) -> None:
     """A blocklist can be walked around by a new synonym; the allowlist cannot."""
-    allowed = {"request_private_input": {"purpose", "minutes"}, "claim_private_input": {"drop_id"}}
+    allowed = {
+        "request_private_input": {"purpose", "minutes"},
+        "claim_private_input": {"drop_id"},
+        # No destination, and no free-text body either: the payload is a list of
+        # labelled fields so the page can render a Copy button per value and mask the
+        # sensitive ones (docs/OUTBOUND_SECRET_DROP_MVP.md and the reveal page).
+        "send_private_output": {"fields", "title", "minutes"},
+    }
     schema = getattr(schemas, schema_name)
     props = set(schema["parameters"]["properties"])
     assert props == allowed[schema["name"]]
@@ -91,12 +108,13 @@ def test_both_tools_share_one_toolset_key(schemas) -> None:
     assert schemas.TOOLSET == "hermes_drop"
 
 
-def test_the_plugin_registers_exactly_two_tools_one_command_and_no_send_message(
+def test_the_plugin_registers_exactly_three_tools_one_command_and_no_send_message(
     schemas,
 ) -> None:
     """``send_message`` is the tool whose home-channel default caused the
     incident (``tools/send_message_tool.py:446-465``). Drop must never register,
-    wrap, or re-export it.
+    wrap, or re-export it — least of all now that it has a tool of its own that
+    *sends* a credential, which is what ``send_message`` was doing when it went wrong.
 
     The list is asserted exactly, not by membership, so a third registration
     fails here on the way in rather than being discovered on a live surface. S8
@@ -124,6 +142,14 @@ def test_the_plugin_registers_exactly_two_tools_one_command_and_no_send_message(
             registered.append(f"/{name}")
 
     plugin.register(Ctx())
-    assert sorted(registered) == ["/drop", "claim_private_input", "request_private_input"]
+    # Three tools since the outbound direction landed, and the list is still asserted
+    # exactly rather than by membership: a fourth registration fails here on the way
+    # in rather than being discovered on a live surface.
+    assert sorted(registered) == [
+        "/drop",
+        "claim_private_input",
+        "request_private_input",
+        "send_private_output",
+    ]
     assert not any("send_message" in name for name in registered)
     assert registered.count("/drop") == 1, "one registration, or the last plugin loaded wins"

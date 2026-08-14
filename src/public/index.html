@@ -31,6 +31,40 @@
 </div>
 </section>
 
+<!-- The outbound direction (docs/OUTBOUND_SECRET_DROP_MVP.md): Hermes has something
+     for the user. Both sections are static markup in the shipped page — the payload
+     is written into #revealed-fields as text nodes by src/client/reveal-view.js and
+     never as markup, so nothing below is ever built from a string. -->
+<section id="reveal" hidden>
+<div class="copy">
+<p class="eyebrow">One-time Hermes Drop</p>
+<h1>Hermes has something private for you</h1>
+<p>It was not posted in the chat. This page holds an <strong>encrypted</strong> value that only this browser can open: the server stores the ciphertext, and the key to it is in the link you followed — the part after the <code>#</code>, which browsers never send to a server.</p>
+<ul class="explain">
+<li>Type the <strong>3-digit code</strong> from the message, then choose Reveal. The code stops link previews, scanners and antivirus from opening the drop for you.</li>
+<li><strong>You can reveal it once.</strong> After that it is destroyed on the server and this link cannot be opened again — not by you, not by anyone else who has it. So do not reload this page while you are reading it.</li>
+<li>It expires on its own in <strong id="reveal-ttl" role="timer">–:––</strong>, whether or not anyone opens it.</li>
+<li>Nothing on this page comes from another site, and nothing here is tracked or logged.</li>
+</ul>
+</div>
+<label class="field-label" for="reveal-code">3-digit code</label>
+<input id="reveal-code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-describedby="reveal-note">
+<div class="actions">
+<span class="meta privacy-note" id="reveal-note">3 tries · one reveal</span>
+<button class="primary" id="reveal-open" type="button">Reveal once</button>
+</div>
+</section>
+
+<section id="revealed" hidden>
+<div class="copy">
+<p class="eyebrow">Revealed — this was the one time</p>
+<h1 id="revealed-title">Your private values</h1>
+<p>Copy what you need now. The server has already destroyed its copy, so reloading this page will not bring it back and the link is spent. Sensitive values stay hidden until you ask — Copy works either way.</p>
+</div>
+<ul id="revealed-fields" class="field-list"></ul>
+<p class="meta" id="revealed-note" role="status" aria-live="polite"></p>
+</section>
+
 <section id="success" class="status" hidden>
 <p class="icon ok" aria-hidden="true">&check;</p>
 <p class="eyebrow">Received</p>

@@ -294,18 +294,37 @@
       }
     },
     "create_outbound_drop": {
-      "summary": "Mint one outbound drop: encrypt a short secret the caller already holds, store the ciphertext, and return the link, the code and nothing else. The only op on this socket that carries plaintext *in* — see `outbound_drop` for the lifecycle it starts.",
+      "summary": "Mint one outbound drop: encrypt a short secret the caller already holds, store the ciphertext, and return the link, the code and nothing else. The only op on this socket that carries plaintext *in* — see `outbound_drop` for the lifecycle it starts, and `outbound_payload` for the structured shape the reveal page renders.",
       "request": {
         "op": "create_outbound_drop",
         "plaintext_b64": {
           "type": "string",
           "optional": false,
-          "note": "The secret, as canonical base64 — strictly decoded, so a value with a wrong alphabet, wrong padding or trailing junk is refused rather than silently reinterpreted. At most HANDOFF_MAX_OUTBOUND_PLAINTEXT_BYTES (2048) bytes, which is what keeps a whole outbound request inside transport.max_request_bytes. This is a short private value, not a file: outbound file sharing is explicitly out of scope. It is decoded, encrypted and wiped within the call, and never echoed in the response."
+          "note": "The secret, as canonical base64 — strictly decoded, so a value with a wrong alphabet, wrong padding or trailing junk is refused rather than silently reinterpreted. At most HANDOFF_MAX_OUTBOUND_PLAINTEXT_BYTES (2048) bytes, which is what keeps a whole outbound request inside transport.max_request_bytes. This is a short private value, not a file: outbound file sharing is explicitly out of scope. It is decoded, encrypted and wiped within the call, and never echoed in the response. With payload_format `structured` these bytes are the payload JSON, bounded more tightly still by outbound_payload.max_payload_bytes, and what is stored is the schema's own canonical re-encoding rather than the caller's."
         },
         "ttl_seconds": {
           "type": "number",
           "optional": true,
           "note": "Defaults to HANDOFF_OUTBOUND_TTL_SECONDS (1800 for this deployment), which is a separate dial from the inbound HANDOFF_TTL_SECONDS even where the two agree. Bounded by the outbound ceiling HANDOFF_MAX_OUTBOUND_TTL_SECONDS (3600, itself narrow-only against HANDOFF_MAX_TTL_SECONDS) — NOT by the inbound maximum, so an operator can shorten outbound exposure without shortening the window an inbound drop gets. Floor: the effective lifetime must be at least 1000 ms. A shorter one is refused rather than minted, because a drop that lapses before the message carrying its link renders is answered with the uniform body, which is byte-identical to the one a secret somebody else took produces — the user could not tell the two apart, and no op reports which happened. Type-checked, not coerced: a boolean or a numeric string is invalid_request, never a silently accepted value."
+        },
+        "payload_format": {
+          "type": "string",
+          "enum": [
+            "opaque",
+            "structured"
+          ],
+          "optional": true,
+          "note": "What the decoded bytes ARE. Absent means `opaque`: bytes, unexamined, revealed to the browser as one masked value — which is what every caller predating this field meant, so nothing that worked before now refuses. `structured` means the bytes are JSON matching `outbound_payload`, and the broker validates them BEFORE minting anything: a malformed or oversized payload is `invalid_request` with a `reason` code, no drop, no link and no code. Only `undefined` is absence — an explicit null is a caller sending a field it does not understand and is refused as such. Any other value, including a differently-cased one, is invalid_request; the format is never guessed at."
+        },
+        "notice_platform": {
+          "type": "string",
+          "enum": [
+            "discord",
+            "telegram",
+            "plain"
+          ],
+          "optional": true,
+          "note": "Opt-in, and the same platform list `create` accepts. When given, the response carries a `notice`: one ready-to-post chat message holding the link, the code, the deadline in the form that platform can render, and what one reveal means. There is only ever ONE notice for an outbound drop and it is never edited — unlike the inbound direction there is no submission to report, and the reveal is deliberately not attributable to a conversation. Validated before minting: an unrenderable platform must not consume a drop on its way to being refused, and there is no destroy op to take one back. The notice quotes NOTHING from the payload except its field count — see outbound_payload.rendering."
         }
       },
       "response": {
@@ -319,11 +338,15 @@
         "max_code_attempts": "number: 3 — incorrect codes before the payload is destroyed",
         "ack_window_ms": "number: how long a reserved drop waits for its claimant's acknowledgement before destroying the payload anyway",
         "expires_at": "epoch milliseconds",
-        "ttl_seconds": "number: the lifetime actually granted, which is the value asked for or the configured default — never a clamp, because an out-of-range request is refused rather than adjusted"
+        "ttl_seconds": "number: the lifetime actually granted, which is the value asked for or the configured default — never a clamp, because an out-of-range request is refused rather than adjusted",
+        "payload_format": "string: the format the drop was minted under, echoed back so a caller can render its own receipt without holding the payload",
+        "field_count": "number: how many fields a `structured` payload holds. Absent for an `opaque` one, where the broker genuinely does not know. Deliberately a COUNT and not a label list — a label is a model-composed string and the caller's next move is to put this response on a platform that renders Markdown",
+        "notice": "string: present only when notice_platform was given. The one chat message this drop costs, carrying the link and the code. Never edited afterwards"
       },
       "errors": {
-        "invalid_request": "missing, ill-typed, non-canonical, empty or oversized plaintext_b64; a ttl_seconds that is not a number, is under the 1-second floor, or is above the outbound ceiling. Nothing is minted, and the decoded plaintext buffer is wiped on every one of these paths as well as on success",
-        "unavailable": "the uniform refusal, for the same reasons every other op can give it"
+        "invalid_request": "missing, ill-typed, non-canonical, empty or oversized plaintext_b64; a ttl_seconds that is not a number, is under the 1-second floor, or is above the outbound ceiling; a payload_format or notice_platform outside its enum; or, under `structured`, a payload the schema refuses — which comes back with a `reason` naming WHICH rule it broke. Nothing is minted on any of these paths, and the decoded plaintext buffer is wiped on every one of them as well as on success",
+        "unavailable": "the uniform refusal, for the same reasons every other op can give it",
+        "reason": "string, present only on a `structured` payload refusal: one of outbound_payload.reasons. It is a CODE and never prose containing the payload — a caller's tool results reach a model's context and from there durable session state, so a reason quoting the offending label or value would put the secret in the one place this design exists to keep it out of. Nothing about a refused payload is logged either"
       }
     }
   },
@@ -377,5 +400,50 @@
       "liveness_disclosure": "One qualification on the one-browser rule above, stated because it is true rather than because it is desirable. `POST /api/reveal/metadata` consumes nothing, spends no attempt and is not rate-limited, and it flips from 200 to the uniform body the instant a reservation is taken — so anyone holding the link can poll it and learn *when* the correct code was entered. They cannot separate that transition from a TTL lapse or a spent attempt budget, and they cannot act on it: the drop is reserved to a claim id they do not have. It is disclosure of activity timing to an audience that already holds the link, which on this platform is everyone who can read the conversation, i.e. the accepted audience. It is accepted rather than closed because removing the distinction would cost the gate its countdown and its attempt display for no attacker-relevant gain.",
       "decryption": "The browser decrypts locally with the key from the fragment. AES-256-GCM, with the drop id as additional authenticated data, so ciphertext sealed for one drop cannot be opened as another's even by a holder of both keys — a page served the wrong ciphertext gets an AEAD failure rather than a plausible string. Production is HTTPS-only: plain HTTP cannot protect browser-delivered decryption code from an active network attacker, and `crypto.subtle` does not exist outside a secure context."
     }
+  },
+  "outbound_payload": {
+    "summary": "The structured payload a `structured` outbound drop carries: what the reveal page renders. A credential is almost never one string — it is a login and a password, or a key and the console it belongs to — so the payload is JSON with a list of labelled fields and the page renders however many it finds.",
+    "version": 1,
+    "shape": "{\"v\":1,\"title\":\"<optional heading>\",\"fields\":[{\"label\":\"<heading>\",\"type\":\"<one of types>\",\"value\":\"<the value>\"}]}",
+    "canonical": "What is stored is the schema's canonical encoding, not the caller's: fixed key order (v, title, fields; then label, type, value), no whitespace, no keys the schema does not name, and an omitted type filled in. Two encodings of the same payload therefore produce the same bytes, and what the page reads is a function of the schema rather than of whoever composed the request.",
+    "types": {
+      "text": "shown normally. A login, an account id, a username",
+      "secret": "MASKED by default, with a reveal/hide control. A password, a token, a key",
+      "url": "shown normally, and as TEXT with a Copy button — never as a link. The scheme is validated http/https, which keeps a javascript: URI out, but a clickable link inside a page the user was told is their secure drop would lend that page's credibility to whatever it points at",
+      "note": "shown normally, and the one type that may contain newlines (at most max_note_lines)"
+    },
+    "default_type": "`secret`. A field with no type, or a type a renderer does not know, is treated as sensitive and masked. Showing a secret in the clear is the mistake that cannot be taken back, so the default has to be the mask.",
+    "bounds": {
+      "max_fields": 8,
+      "max_label_chars": 40,
+      "max_title_chars": 60,
+      "max_value_bytes": 512,
+      "max_payload_bytes": 1536,
+      "max_note_lines": 8,
+      "note": "The parts AND the canonical sum are bounded. Bounding only the parts is how a payload every field of which is legal gets minted and then cannot be sent, because the request line it has to fit inside is transport.max_request_bytes and base64 is ×4/3. max_payload_bytes is also inside HANDOFF_MAX_OUTBOUND_PLAINTEXT_BYTES, which the store enforces independently."
+    },
+    "text_rules": "Labels, titles and values carry no Unicode control or format character (\\p{C}), no line or paragraph separator, no whitespace other than a plain U+0020 space, and no leading or trailing whitespace. `note` may additionally contain newlines. A label or title must contain at least one letter or digit and no double space. The bidi overrides are the reason this is strict rather than cosmetic: a label that can reverse its own rendering can make `Note` read as `Password` beside a value the user is about to paste somewhere. Two fields whose labels differ only by case are refused, because two fields under one heading is a user copying the wrong one.",
+    "generate": "A field may carry `generate: {\"kind\": \"password\"|\"hex\"|\"base64url\", \"length\": 8..64}` INSTEAD of a value, and never as well as one. The broker draws the value with a CSPRNG inside the create call, so for the \"give me a new password\" case the requester never holds the secret at all — it cannot appear in a tool argument, a model turn or a durable transcript. A generated field is a `secret` and may not claim another type. The materialised payload is then run through the same validator, so generation cannot produce a payload the schema would have refused. The response reports a field count and never a generated value.",
+    "rendering": "The page writes textContent and builds elements one at a time; no payload string is ever interpolated into markup, so a value containing HTML renders as those characters. The chat notice is the stricter case and is stricter still: it quotes NOTHING from the payload except the field count, because it is Markdown going to a platform that renders links and a model-composed title of `x](https://evil.test) [click here` would forge one.",
+    "atomicity": "A payload is valid or it is nothing. There is no partial acceptance, no dropped field and no truncated value: a drop that silently delivered four of five credentials would be worse than one that refused, because the user cannot tell which happened.",
+    "reasons": [
+      "not_an_object",
+      "not_json",
+      "bad_version",
+      "unknown_key",
+      "no_fields",
+      "too_many_fields",
+      "bad_label",
+      "label_too_long",
+      "bad_title",
+      "title_too_long",
+      "bad_type",
+      "bad_value",
+      "value_too_long",
+      "bad_url",
+      "duplicate_label",
+      "payload_too_large",
+      "bad_generate"
+    ]
   }
 }

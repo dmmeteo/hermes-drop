@@ -57,6 +57,57 @@ Hermes posts an origin-bound message containing:
 
 The user opens the link, explicitly enters the code, and chooses to reveal the value. After the first successful reveal, the value cannot be opened again.
 
+## Approved reveal UX — the structured payload
+
+A credential is almost never one string. It is a login *and* a password, or a key
+*and* the console it belongs to, or a token *and* a note about rotating it. So the
+revealed payload is **structured JSON**, and the page renders however many fields it
+contains.
+
+- Examples of fields: login, password, API key, URL, note. One field is as valid as
+  five.
+- **Each field has a clear label and its own Copy button.** A user copying a password
+  must never have to select it out of a paragraph.
+- **Sensitive fields are masked by default**, with a reveal/hide control per field.
+  Non-sensitive fields — a login, a URL, a note — may display normally. A field whose
+  sensitivity is not stated, or is stated in terms the renderer does not know, is
+  treated as sensitive: showing a secret in the clear is the mistake that cannot be
+  taken back.
+- Copy copies the real value whether or not the field is currently revealed, so a
+  password can be pasted without ever being displayed on screen.
+
+The page must also **explain itself**, in the page and not in a footnote:
+
+- that this is a one-time, encrypted Hermes Drop, and what that means — the server
+  holds ciphertext, and the key is in the link's fragment, which browsers never send;
+- its TTL, as a live countdown rather than a duration baked into the copy;
+- that after a successful reveal it **cannot be opened again**, by anyone;
+- what the 3-digit code is for.
+
+### Bounded schema validation
+
+The payload is composed by a model and rendered to a person, so it is validated
+against a strict, bounded schema and a refusal is **atomic** — no drop, no link, no
+code, nothing partially delivered:
+
+- safe labels: bounded length, single line, no control or bidi-format characters, no
+  two fields under one label;
+- a closed set of field types, and a closed set of sizes: a bounded field count, a
+  bounded per-value size, and a bounded total;
+- values are refused, never repaired: a padded credential is a login failure whose
+  cause is invisible, so it is sent back to the composer rather than trimmed;
+- malformed or oversized JSON is rejected whole, and the refusal names a **code**
+  from a closed set — never prose quoting the payload, because a refusal reaches a
+  model's context and from there durable session state.
+
+The page renders **text only**. No payload string is ever interpolated into markup,
+and the chat message quotes nothing from the payload at all except how many fields it
+has — it is Markdown going to a platform that renders links, and a model-composed
+title could otherwise forge one.
+
+The page ships with no third-party assets and no analytics, and is served under
+HTTPS with the same security headers as the inbound form.
+
 ## Approved defaults
 
 - Code length: **3 decimal digits**.

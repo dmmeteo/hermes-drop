@@ -15,8 +15,11 @@ Two pieces, both self-hosted by you:
   mints links, receives sealed envelopes and hands the plaintext to exactly one
   local claim; and
 - a **Hermes plugin** — which provides the `/drop` command, the
-  `request_private_input` and `claim_private_input` tools, and the durable
-  bookkeeping that survives a restart.
+  `request_private_input`, `claim_private_input` and `send_private_output` tools, and
+  the durable bookkeeping that survives a restart.
+
+Both directions: the user can send Hermes a secret without typing it in the chat,
+and Hermes can hand the user one the same way.
 
 ---
 
@@ -63,6 +66,13 @@ Without patch `0001`, the plugin still loads and refuses safely — `/drop` retu
   interpretation of what the user asked for.
 - **`request_private_input`** and **`claim_private_input`** — the same operation,
   reached from a model turn instead.
+- **`send_private_output`** — the other direction. Hermes hands the user a secret it
+  holds through a one-time link and a 3-digit code instead of writing it in the chat.
+  The values arrive as **labelled fields** — login, password, API key, URL, note — and
+  the page renders however many there are, each with its own Copy button, with the
+  sensitive ones masked until the user asks. Ask it to `generate` a password and the
+  broker draws it: the value never enters a tool argument, a model turn or a
+  transcript at all.
 - **One universal form.** The existing `/drop` and `request_private_input` flow
   creates one link where the sender chooses either private text or up to 5 files
   totaling 42 MiB. There is no separate file command or file-only link.
@@ -90,8 +100,19 @@ Without patch `0001`, the plugin still loads and refuses safely — `/drop` retu
   timestamp.
 - **Discord and Telegram.** An unsupported platform is refused by name, never
   degraded to a plain notice and never redirected.
-- **64 KiB** maximum plaintext, **30 minutes** default lifetime (1–60 configurable
-  per drop).
+- **One reveal, and the page says so.** An outbound drop opens once: after a
+  successful reveal the payload is destroyed and the link is spent. The page explains
+  what it is, counts down its own expiry, and states plainly that it cannot be opened
+  again. A `GET` or `HEAD` never consumes it, so an unfurler, a scanner or an
+  antivirus fetching the link first costs nothing.
+- **Bounded, atomic payload validation.** The outbound payload is composed by a model
+  and rendered to a person, so it is checked against a strict schema — safe labels, a
+  closed type set, bounded field count, per-value and total sizes — and a refusal
+  mints nothing at all. The page writes text nodes only; no payload string is ever
+  interpolated into markup, and the chat message quotes nothing from the payload but
+  its field count.
+- **64 KiB** maximum plaintext inbound, **2 KiB** outbound, **30 minutes** default
+  lifetime (1–60 configurable per drop).
 
 ## How it works
 
@@ -150,6 +171,48 @@ The full machine — every state, every edge, what each seam answers in each sta
 and what deletion is and is not worth — is stated in
 [SECURITY.md](SECURITY.md#handoff-lifecycle-and-deletion-guarantees) and pinned by
 `test/lifecycle-fsm.test.js`.
+
+### The other direction: Hermes hands the user a secret
+
+```
+  the model calls send_private_output with labelled fields
+        │
+        ▼
+  plugin resolves and verifies the SAME origin, then validates the payload
+  against a bounded schema ──► refuse, and nothing is minted at all
+        │
+        ▼
+  broker encrypts the payload, stores the ciphertext, DROPS the AES key
+  (it is handed back inside the URL fragment and nowhere else),
+  and stores HMAC(random key, code) — never the code itself
+        │
+        ▼
+  plugin posts ONE message into that same conversation:
+        https://host/#r.<capability>.<key>   plus a 3-digit code on its own line
+        │
+        ▼
+  browser  GET / ──► one static page, and a preview consumes nothing
+           POST /api/reveal/metadata ──► deadline, attempts left
+           POST /api/reveal/claim    (the code the person typed, one claim id)
+           ── decrypt locally with the key from the fragment ──
+           POST /api/reveal/ack      ──► the broker destroys the payload
+        │
+        ▼
+  the page renders each field with its label, a Copy button, and a mask on
+  the sensitive ones. It cannot be opened again.
+```
+
+Three digits is a **human-presence and anti-preview gate**, not authentication: the
+link and the code travel in the same conversation. What it buys is that an unfurler,
+a scanner or an antivirus fetching the URL cannot spend the drop. Three wrong codes
+destroy the payload — denial of delivery is deliberately preferred over allowing
+online brute force.
+
+The broker is the one party that cannot read an outbound payload: it generates the
+AES key, uses it once, hands it back in the fragment and zero-fills it. Ask for a
+`generate`d value and the broker draws it too, so for a freshly created password the
+plaintext exists only between that call and the reveal — never in a tool argument, a
+model turn or a transcript.
 
 ### Durable sanitization
 
@@ -302,7 +365,8 @@ of those principals.
   across the gateway. The per-session cap means a busy conversation evicts its own
   oldest first, but the global one is shared: past it another session's secret can
   be evicted early, leaving its model with an unresolvable placeholder.
-- **No file transfer**, no reverse/outbound delivery, no multi-recipient drops.
+- **No outbound file transfer** and no multi-recipient drops. Outbound is for a
+  short private value; outbound file sharing is explicitly out of scope.
 - **A drop cannot be opened during a wake turn** if the conversation's lane was
   rewritten in between: the plugin refuses rather than guessing, and the user types
   `/drop`. Claiming is unaffected.
@@ -505,13 +569,13 @@ and restart the gateway.
 
 ### Broker
 
-> **Outbound drops are not user-ready in this build.** The broker can mint one
-> (`create_outbound_drop` on the control socket, and the `/api/reveal/*` endpoints),
-> but the browser page cannot open it yet: the reveal UI is not in the bundle, so a
-> minted outbound link answers the uniform `unavailable` in a real browser. It fails
-> safe — nothing is disclosed and nothing is consumed — but do not put the outbound
-> op in front of users until the reveal UI ships. The four `HANDOFF_OUTBOUND_*` /
-> `HANDOFF_MAX_OUTBOUND_*` keys below are live and validated at startup regardless.
+> **Outbound drops now work end to end.** The reveal page ships in the bundle, and
+> the Hermes plugin registers `send_private_output` alongside the two inbound tools:
+> Hermes posts a link and a 3-digit code into the conversation it was asked in, the
+> user types the code, and the page renders the labelled values with a Copy button on
+> each. What remains a real limitation is **a page reload between the code and the
+> copy costs the secret** — see "A page reload costs the secret" in `SECURITY.md`. The
+> four `HANDOFF_OUTBOUND_*` / `HANDOFF_MAX_OUTBOUND_*` keys below govern it.
 
 | Env var | Default | Notes |
 |---|---|---|

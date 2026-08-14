@@ -51,6 +51,92 @@ button, textarea, input { font: inherit; }
 .file-list .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .file-list button { border:0; background:transparent; color:var(--accent); cursor:pointer; }
 
+/* The outbound direction: the gate, then the revealed fields. Same quiet document,
+   and deliberately the same accent — a page that looked different from the inbound
+   form would be a page a user has to learn twice. */
+
+/* What a Hermes Drop is, above the code box. Not a footnote: it is the only place
+   the user is told the reveal is one-shot, so it reads as prose rather than as fine
+   print. */
+.explain { margin: 14px 0 0; padding-left: 20px; color: var(--muted); font-size: 14px; }
+.explain li { margin: 7px 0; }
+.explain strong { color: var(--ink); }
+
+/* The code box. Wide-spaced digits so three characters do not look like a typo, and
+   `text-align:center` because the field is exactly as long as its content. */
+#reveal-code {
+  display: block;
+  width: 100%;
+  max-width: 220px;
+  margin: 26px 0 18px;
+  padding: 12px 0;
+  color: var(--ink);
+  background: transparent;
+  border: 0 solid var(--line);
+  border-bottom-width: 1px;
+  border-radius: 0;
+  outline: none;
+  font-size: 32px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .32em;
+  text-align: center;
+}
+
+#reveal-code:focus { border-color: var(--accent); }
+
+.field-list { list-style: none; padding: 0; margin: 26px 0 14px; }
+
+.field {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.field-head { margin: 0 0 6px; }
+
+.field-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Monospaced because these are credentials: the difference between `l`, `1` and `I`
+   has to be visible even though the Copy button means nobody should be transcribing
+   one. `pre-wrap` so a note's lines are its lines, and `overflow-wrap` so a long key
+   wraps inside the page instead of widening it. */
+.field-value {
+  margin: 0;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The mask is not selectable: dragging across it and pasting would otherwise put
+   twelve dots where a password was meant to go. Copy is the way out. */
+.field-value.masked {
+  color: var(--muted);
+  letter-spacing: .18em;
+  user-select: none;
+}
+
+.field-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+.ghost {
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ghost:hover { border-color: var(--accent); }
+
 .eyebrow {
   margin: 0;
   font-size: 12px;

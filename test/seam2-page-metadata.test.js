@@ -58,7 +58,13 @@ describe('seam 2: page delivery and capability-authorized metadata', () => {
       );
       // Branding must not have smuggled chrome back in.
       assert.ok(!/<img|<svg|<header|<nav/.test(html), 'still no logo or header chrome');
-      assert.equal(html.match(/<h1/g).length, 3, 'one heading per screen, nothing added');
+      // One heading per screen and nothing added. Five since the outbound direction
+      // landed: the inbound form, its receipt, the uniform unavailable, and the
+      // reveal gate and its revealed values (docs/OUTBOUND_SECRET_DROP_MVP.md).
+      assert.equal(html.match(/<h1/g).length, 5, 'one heading per screen, nothing added');
+      for (const screen of ['form', 'success', 'unavailable', 'reveal', 'revealed']) {
+        assert.match(html, new RegExp(`<section id="${screen}"`), `the ${screen} screen`);
+      }
     });
 
     it('drops the prototype variant switcher and the losing variants', () => {
@@ -79,16 +85,30 @@ describe('seam 2: page delivery and capability-authorized metadata', () => {
     });
 
     it('is one always-visible composer with textarea, file picker and one send button', () => {
-      assert.equal(html.match(/<textarea/g).length, 1);
-      assert.equal(html.match(/<button/g).length, 1);
+      // Scoped to the inbound form, because the document also carries the outbound
+      // reveal gate now. What must stay true is that *this* screen is one composer:
+      // one textarea, one picker, one Send, and no mode switch.
+      const form = html.slice(html.indexOf('<section id="form"'), html.indexOf('<section id="reveal"'));
+      assert.equal(form.match(/<textarea/g).length, 1);
+      assert.equal(form.match(/<button/g).length, 1, 'one action on the composer');
+      assert.equal((form.match(/<input/g) || []).length, 1, 'and one input, the picker');
       assert.doesNotMatch(html, /id="(?:text|files)-mode"/);
-      assert.match(html, /id="files"/);
-      assert.match(html, /id="send"/);
+      assert.match(form, /id="files"/);
+      assert.match(form, /id="send"/);
       assert.ok(!/<img|<svg|<header|<nav/.test(html), 'no logo or header chrome');
+
+      // The reveal gate is the only other interactive screen, and it is exactly as
+      // narrow: one code box and one Reveal.
+      const gate = html.slice(html.indexOf('<section id="reveal"'), html.indexOf('<section id="revealed"'));
+      assert.equal(gate.match(/<button/g).length, 1, 'one action on the gate too');
+      assert.equal(gate.match(/<input/g).length, 1, 'and one code box');
+      assert.equal((html.match(/<button/g) || []).length, 2, 'two buttons in the whole document');
     });
 
     it('has one multi-file picker and Send spans the width', async () => {
-      assert.equal((html.match(/<input/g) || []).length, 1);
+      // Two inputs in the document: the inbound file picker and the outbound code
+      // box. Each is asserted where it belongs, above.
+      assert.equal((html.match(/<input/g) || []).length, 2);
       assert.match(html, /<input[^>]+type="file"[^>]+multiple/);
 
       const css = await (await fetch(`${broker.baseUrl}/assets/app.css`)).text();

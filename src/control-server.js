@@ -10,6 +10,12 @@ import { PAYLOAD_KINDS } from './broker.js';
 import { PAYLOAD_KIND_FILES, PAYLOAD_KIND_UNIVERSAL } from './file-container.js';
 import { expiredNotice, receivedNotice, waitingNotice } from './notice.js';
 import { OUTBOUND_PROTOCOL } from './outbound-drop.js';
+import { outboundNotice } from './outbound-notice.js';
+import {
+  MAX_PAYLOAD_BYTES,
+  buildOutboundPayload,
+  canonicalizeOutboundPayload,
+} from './outbound-payload.js';
 
 const MAX_CONTROL_LINE_BYTES = 4096;
 
@@ -52,6 +58,24 @@ const MIN_RESPONSE_BYTES = 1024;
 // against `contract/control-protocol.json` — the fixture both languages read — by
 // test/control-protocol.test.js.
 const ACCEPTED_NOTICE_PLATFORMS = Object.freeze(['discord', 'telegram', 'plain']);
+
+/**
+ * How a `create_outbound_drop` caller declares what its bytes *are*.
+ *
+ *   opaque      — the default, and what every caller before this field meant: bytes,
+ *                 unexamined. The reveal page renders them as one masked value.
+ *   structured  — the bytes are JSON matching src/outbound-payload.js, and the
+ *                 broker validates them before minting anything. The page renders a
+ *                 labelled field per entry, with a Copy button each and a mask on
+ *                 the sensitive ones.
+ *
+ * Defaulting to `opaque` is the fail-safe direction, and it is worth saying which
+ * way that runs: a caller that *meant* structured and forgot the field gets a drop
+ * that reveals its JSON as one opaque blob — ugly, and the secret is still delivered
+ * to the right person under the same code, TTL and one-shot rules. The other default
+ * would refuse every caller that predates the field.
+ */
+const OUTBOUND_PAYLOAD_FORMATS = Object.freeze(['opaque', 'structured']);
 
 /**
  * Makes the socket's directory safe to create the socket in, and says so.
@@ -598,6 +622,40 @@ function decodeBase64Strict(value) {
   return bytes;
 }
 
+/**
+ * Decodes payload bytes as strict UTF-8, or `''` if they are not.
+ *
+ * `fatal: true` rather than the replacement-character default: a structured payload
+ * that is not valid UTF-8 is a caller mistake, and silently substituting U+FFFD into
+ * a *credential* would produce a value that renders plausibly and does not
+ * authenticate. `''` then fails the JSON parse below, so the caller meets one
+ * refusal rather than two.
+ */
+function bytesToUtf8(bytes) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * `JSON.parse` with the error thrown away rather than reported.
+ *
+ * Deliberately silent, and for the reason `handleLine` states about its own parse
+ * failure: V8 fills a `SyntaxError` with a ~10-character window of the offending
+ * input, and on this path that window is a piece of a *secret*. So the exception is
+ * not logged, not attached to the refusal, and not re-thrown — the caller is told
+ * `not_json` by the schema and nothing else.
+ */
+function parseJsonOrNull(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 async function handleControlRequest(request, broker) {
   if (!request || typeof request !== 'object') return { ok: false, error: 'invalid_request' };
 
@@ -688,10 +746,29 @@ async function handleControlRequest(request, broker) {
     // that the plaintext's life is this call: it is decoded, handed to the store,
     // encrypted and wiped, and what comes back is a link, a code and no payload.
     case 'create_outbound_drop': {
+      // The two closed-set fields are checked *before* the payload is decoded, and
+      // that ordering is the atomicity this op promises: an unknown format or an
+      // unrendered platform must not be discovered after a drop exists, because there
+      // is no destroy op to take it back and the caller would be holding a link and a
+      // code for a secret it did not mean to mint.
+      const outboundPlatform = request.notice_platform;
+      const wantsOutboundNotice = outboundPlatform !== undefined;
+      if (wantsOutboundNotice && !ACCEPTED_NOTICE_PLATFORMS.includes(outboundPlatform)) {
+        return { ok: false, error: 'invalid_request' };
+      }
+      // `undefined` is the only absence. `??` would have let an explicit `null`
+      // through as "not declared", which is a caller sending a field it does not
+      // understand and being answered as though it had sent nothing.
+      const payloadFormat =
+        request.payload_format === undefined ? 'opaque' : request.payload_format;
+      if (!OUTBOUND_PAYLOAD_FORMATS.includes(payloadFormat)) {
+        return { ok: false, error: 'invalid_request' };
+      }
+
       // Decoded strictly and canonically. A lenient decode would let two different
       // request lines mean the same secret, and this op is the one place where what
       // arrives on the socket *is* the payload.
-      const plaintext = decodeBase64Strict(request.plaintext_b64);
+      let plaintext = decodeBase64Strict(request.plaintext_b64);
       if (plaintext === null) return { ok: false, error: 'invalid_request' };
 
       // One `finally` for every exit below, because this function owns the buffer and
@@ -699,7 +776,44 @@ async function handleControlRequest(request, broker) {
       // receipt. The store wipes it too — on its own success and refusal paths — and
       // wiping an already-zeroed buffer costs nothing, which is the right price for
       // not having to prove that the two agree on every future branch.
+      let fieldCount;
       try {
+        if (payloadFormat === 'structured') {
+          // The one place a model-composed object becomes a payload. `built` holds
+          // the validated schema — bounded labels, a closed type set, a bounded
+          // per-value size and a bounded canonical whole — and any generated field
+          // has had its value drawn *here*, so for the "give me a new password" case
+          // the requester never held the secret at all.
+          //
+          // The refusal carries a `reason` code and never the payload: the reason
+          // travels back to a caller whose results reach a model's context and from
+          // there durable session state, so quoting the offending label or value
+          // would put the secret in the one place this project exists to keep it out
+          // of. Nothing about it is logged for the same reason.
+          // Size before parse, and the reason distinguishes "not JSON" from "JSON of
+          // the wrong shape", because those are different things for a caller to fix
+          // and a caller has only the code to go on. `bytesToUtf8` answers `''` for
+          // bytes that are not UTF-8, which lands here as `not_json` — one refusal
+          // rather than two for what is one mistake.
+          if (plaintext.length > MAX_PAYLOAD_BYTES) {
+            return { ok: false, error: 'invalid_request', reason: 'payload_too_large' };
+          }
+          const text = bytesToUtf8(plaintext);
+          const parsed = text === '' ? null : parseJsonOrNull(text);
+          if (parsed === null) return { ok: false, error: 'invalid_request', reason: 'not_json' };
+
+          const built = buildOutboundPayload(parsed);
+          if (!built.ok) return { ok: false, error: 'invalid_request', reason: built.reason };
+          fieldCount = built.payload.fields.length;
+          // The bytes stored are the *schema's* canonical form, not the caller's
+          // encoding of it: key order, an omitted type and incidental whitespace all
+          // come back normalised, so what the page reads is a function of the schema
+          // rather than of whoever composed the request.
+          const canonical = new TextEncoder().encode(canonicalizeOutboundPayload(built.payload));
+          plaintext.fill(0);
+          plaintext = canonical;
+        }
+
         const ttlSeconds = request.ttl_seconds;
         // Type-checked, not coerced. Every other numeric field on this socket is
         // (`max_files`, `lease_ms`, `index`, `size`, `received_bytes`), the fixture
@@ -716,10 +830,33 @@ async function handleControlRequest(request, broker) {
           ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
         });
         if (!created.ok) return created;
-        return {
+        const answer = {
           ...created,
           protocol_version: PROTOCOL_VERSION,
           outbound_protocol: OUTBOUND_PROTOCOL,
+          // What the page will find inside, so a caller can render its own receipt
+          // without holding the payload. `field_count` is a number derived from the
+          // schema; there is deliberately no label list, because a label is a
+          // model-composed string and the caller's next move is to put this response
+          // on a platform that renders Markdown.
+          payload_format: payloadFormat,
+          ...(fieldCount === undefined ? {} : { field_count: fieldCount }),
+        };
+        if (!wantsOutboundNotice) return answer;
+        return {
+          ...answer,
+          // Rendered here rather than by the caller, for the same reason the inbound
+          // notice is: one round trip, and one implementation of the sentence that
+          // has to be right on every platform. See src/outbound-notice.js for why
+          // nothing model-supplied is in it.
+          notice: outboundNotice({
+            dropId: created.drop_id,
+            url: created.url,
+            code: created.code,
+            expiresAt: created.expires_at,
+            fieldCount,
+            platform: outboundPlatform,
+          }),
         };
       } finally {
         plaintext.fill(0);

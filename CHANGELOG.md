@@ -13,6 +13,50 @@ and reads none of them, and behaves exactly as it did before.
 
 ### Added
 
+- **Outbound drops, end to end: Hermes hands the user a secret.** The reveal page ships
+  in the browser bundle and the plugin registers a third tool, `send_private_output`.
+  Hermes posts one message into the conversation it was asked in — a link, a 3-digit
+  code and what "one reveal" means — the user types the code, the browser decrypts
+  locally with the key from the URL fragment, and the broker destroys the payload on
+  acknowledgement. `GET`/`HEAD` still consume nothing, so a link preview, a scanner or
+  an antivirus cannot spend a drop; three wrong codes destroy it. Nothing durable is
+  written for an outbound drop and no waiter is armed — there is no submission to wait
+  for and no later claim to authorise. Documented in
+  `docs/OUTBOUND_SECRET_DROP_MVP.md` and `SECURITY.md`.
+
+- **A revealed payload is structured, and the page renders however many fields it
+  holds.** Login, password, API key, URL, note — each with its own label and Copy
+  button, the sensitive ones masked behind a per-field Show/Hide, the rest displayed
+  normally. Copy copies the real value while it is still masked, so a password never
+  has to appear on screen to be pasted. A missing or unrecognised field type is treated
+  as sensitive.
+
+- **Bounded, atomic payload validation, in both languages.** `create_outbound_drop`
+  takes a `payload_format` (`opaque` — the default, unchanged for existing callers — or
+  `structured`) and validates a structured payload *before* minting anything: a closed
+  type set, safe labels and titles (no Unicode control or bidi-format characters, no
+  exotic whitespace, no duplicates), a bounded field count, per-value size and
+  canonical total, and `http`/`https`-only URL values. A refusal is atomic — no drop,
+  no link, no code — and carries a `reason` code from a closed set rather than prose
+  quoting the payload. The bounds are published in `contract/control-protocol.json` →
+  `outbound_payload` and mirrored by the plugin, which is held against the running
+  broker by a cross-language test in both directions.
+
+- **Broker-side value generation.** A field may carry
+  `generate: {kind, length}` instead of a value, and the broker draws it with a CSPRNG
+  inside the create call. For a freshly minted password or key the plaintext therefore
+  never enters a tool argument, a model turn or a durable transcript — which is the one
+  exposure the outbound direction could not otherwise close. See "The outbound tool's
+  *arguments* carry the secret" in `SECURITY.md` for what remains true of a *relayed*
+  value.
+
+- **An outbound chat notice, rendered by the broker.** `create_outbound_drop` accepts
+  the same `notice_platform` as `create` and answers with one ready-to-post message, so
+  posting a link and a code costs one round trip and one implementation of a sentence
+  that has to be right on every platform. It quotes **nothing** from the payload except
+  its field count: the message is Markdown going to a platform that renders links, and a
+  model-composed title could otherwise forge one.
+
 - **Lifecycle/FSM verification.** A dedicated state-sequence suite now pins the
   broker's `pending → submitted → claimed/destroyed` machine, including concurrent
   and duplicate operations, expiry from every state, malformed calls, lossless

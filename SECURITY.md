@@ -430,8 +430,76 @@ and a losing concurrent claimant all cost nothing.
 - Destruction removes the record from both indexes, so a destroyed outbound drop
   and one that never existed are the same thing to every seam.
 
+### The structured payload, and why it is validated twice
+
+An outbound payload is **composed by a model and rendered to a person**. That single
+sentence is where every rule below comes from: it is the only place in this project
+where a model-authored object crosses into a document a user is about to trust with a
+credential.
+
+The payload is JSON — `{"v":1,"title":…,"fields":[{"label":…,"type":…,"value":…}]}` —
+and the page renders however many fields it holds. It is validated by
+`src/outbound-payload.js` on the broker, **before anything is minted**, and again by
+the same module in the browser bundle before anything is rendered. The bounds are
+published in `contract/control-protocol.json` → `outbound_payload` and mirrored by
+`integrations/hermes-drop/drop/outbound_payload.py`, which is held against both the
+fixture *and* the running broker by `tests/test_outbound_payload.py` — payloads it
+accepts are sent to the real validator, and payloads it refuses are sent too, because
+the dangerous drift is a bound one side invented.
+
+| Rule | Why it is a security rule and not a schema preference |
+| --- | --- |
+| Closed set of field types (`text`, `secret`, `url`, `note`) | A type outside the set would leave the renderer deciding what to do with it. The decision is made here instead. |
+| **Sensitive by default** — a missing or unknown type masks | Showing a secret in the clear is the one mistake that cannot be taken back. A renderer that does not recognise a type must not display it. |
+| No Unicode control or format characters in labels, titles or values | `\p{Cf}` is where the bidi overrides live. A label that can reverse its own rendering can make `Note` read as `Password` beside a value the user is about to paste somewhere. The page renders text safely; it cannot render *honestly* if the text lies about its own direction. |
+| No whitespace but a plain `U+0020`, and none leading or trailing | A non-breaking space inside a credential makes two values that look identical authenticate differently, and the user cannot see which they were handed. |
+| **Values are refused, never repaired** | Trimming a padded password silently changes the credential and delivers one that does not work for a reason nobody can find. Labels and titles *are* normalised — they are display strings, not secrets. |
+| Bounded field count, per-value size **and canonical total** | Bounding only the parts is how a payload every field of which is legal gets minted and then cannot be sent, because the control request line is 4096 bytes and base64 is ×4/3. |
+| `url` values must parse as absolute `http`/`https` | Keeps a `javascript:` or `data:` URI out. It does **not** make the URL clickable — see below. |
+| Refusal is **atomic**, and its reason is a **code** | A drop that silently delivered four of five credentials would be worse than one that refused, because the user cannot tell. And the reason travels to a caller whose results reach a model's context and from there durable session state, so it names the rule and never quotes the payload. |
+
+Two rendering rules complete it, and they are stronger than the schema:
+
+- **The page writes text nodes only.** `src/client/reveal-view.js` builds every element
+  with `createElement` and assigns `textContent`; there is no `innerHTML`, no
+  `insertAdjacentHTML` and no template string that becomes an element. A value
+  containing `<img onerror=…>` renders as those characters. No payload string reaches
+  an `href`, a `src`, a `style` or an `on*` attribute, because a `url` field is
+  rendered as *text with a Copy button* rather than as a link — a validated scheme
+  keeps a `javascript:` URI out, but it cannot make a link to an attacker's host safe
+  to *offer*, and a clickable link inside a page the user was told is their secure
+  drop would lend that page's credibility to whatever it points at.
+- **The chat notice quotes nothing from the payload but its field count.**
+  `src/outbound-notice.js` emits Markdown to a platform that renders links, so a
+  model-composed title of `` x](https://evil.test) [click here `` would forge one —
+  and escaping it correctly for MarkdownV2 *and* for whatever the adapter's own
+  `format_message` then does to it is exactly the double-translation that review H1
+  was. So the label in the message is a constant. The payload's title and labels
+  render on the page, where they cannot be markup at all.
+
 ### What it does not guarantee
 
+- **The outbound tool's *arguments* carry the secret, and nothing in this plugin sits
+  earlier than that.** For a value Hermes is *relaying* — one the user gave it, one it
+  read from a file — the plaintext is in the `send_private_output` tool call, and core
+  persists a tool call to `state.db` before the handler runs. The inbound direction's
+  vault (`drop/vault.py`) cannot help: it operates on tool *results*, and there is no
+  core seam between "the model emitted this tool call" and "it is written down". So
+  this feature keeps a secret out of the **chat message**, the tool **result**, the
+  broker's **logs** and the **URL** — and for a relayed value it does not keep it out
+  of the model's own transcript, which is where it already was.
+
+  The mitigation, and it is a real one for the common case: **`generate`**. A field
+  that asks the broker to create the value carries no value at all, so for a freshly
+  minted password or key the plaintext exists only between the broker's `create` call
+  and the browser's reveal — never in a tool argument, a model turn or a transcript.
+  Prefer it; the tool description tells the model to.
+- **A failed post leaves a live secret to lapse.** If the drop is minted and the chat
+  post then fails, the plugin aborts rather than retrying or minting again — but there
+  is no destroy op on the control protocol, so a ciphertext nobody has the link to
+  sits in the broker until its TTL. Nothing can reach it (the capability and the key
+  were only ever in the message that failed to send), and it is destroyed on schedule.
+  Inventing a destroy op to close this is a larger change than the risk it removes.
 - **Three digits is a human-presence gate, not authentication.** The link and the
   code travel in the same conversation. A link-holder has ~3 chances in 1000 per
   drop, bounded only by the attempt budget, and anyone who can read the conversation
@@ -564,12 +632,11 @@ and a losing concurrent claimant all cost nothing.
   on `create_outbound_drop` matter — a drop that dies for a caller's mistake is
   indistinguishable to the user from a stolen secret, and nothing on either side
   would ever correct the impression.
-- **The shipped page cannot open an outbound link yet.** `src/client/reveal-client.js`
-  is not in the browser bundle and the page's fragment reader rejects an
-  `r.<capability>.<key>` fragment, so a minted outbound link answers `unavailable`
-  in a real browser. This fails safe — nothing is disclosed and nothing is consumed
-  — but a broker running this slice can mint links no browser can open. Do not put
-  the outbound op in front of users until the reveal UI ships.
+- **The outbound reveal page still requires live-browser verification.** The shipped
+  bundle accepts `r.<capability>.<key>` fragments and its reveal flow is covered by
+  browser-style integration tests, but clipboard permissions, Web Crypto under the
+  production HTTPS origin, and claim/ACK retry behavior under real network latency
+  remain deployment smoke-test obligations.
 - **Adapter `send` and `edit_message` are not covered by automated tests.** Both
   need live platform credentials. The formatting boundary either side of them is
   tested with real adapter code; the calls themselves are exercised only by manual

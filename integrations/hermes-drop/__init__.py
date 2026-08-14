@@ -101,6 +101,30 @@ def claim_private_input(args: Optional[Mapping[str, Any]] = None, **kwargs: Any)
     return _guarded("claim_private_input", args, _session_id(kwargs))
 
 
+def send_private_output(args: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> str:
+    """The outbound direction, through the same guard as the other two.
+
+    It goes through ``_guarded`` unchanged, and the two things that pass through
+    it are worth being explicit about because this handler is the one that runs
+    backwards:
+
+    * ``vault.redact_tool_result`` finds no ``private_input`` field here and returns
+      the receipt untouched — correctly, because an outbound result carries no value
+      to redact. The invariant it enforces ("no plugin tool result carries a secret
+      field") holds for this handler by construction rather than by substitution.
+    * ``safe_errors.sanitize_tool_result`` still matters as much as ever: a refusal
+      from this path can carry an adapter's own error string out of ``post_status``,
+      and that is a leak into durable context regardless of which way the secret was
+      travelling.
+
+    What ``_guarded`` cannot do anything about is the *arguments*: they carry the
+    plaintext, core persists a tool call before the handler runs, and no seam in this
+    plugin sits earlier than that. ``generate`` is the mitigation, not a fix — see
+    ``drop/tools.py::send_private_output`` and ``SECURITY.md``.
+    """
+    return _guarded("send_private_output", args, _session_id(kwargs))
+
+
 def _session_id(kwargs: Mapping[str, Any]) -> str:
     """The session a tool result belongs to, as core hands it to the handler.
 
@@ -243,6 +267,19 @@ def register(ctx: Any) -> None:
         description="Retrieve the private input for a drop reported as received.",
         emoji="🔐",
     )
+    # The outbound direction (docs/OUTBOUND_SECRET_DROP_MVP.md). A third *new* tool
+    # name, never an override of a built-in: `allow_tool_override` is deliberately
+    # absent from this plugin's config and must stay absent (plugin.yaml).
+    ctx.register_tool(
+        name=schemas.SEND_PRIVATE_OUTPUT["name"],
+        toolset=schemas.TOOLSET,
+        schema=schemas.SEND_PRIVATE_OUTPUT,
+        handler=send_private_output,
+        check_fn=drop_check_fn,
+        is_async=False,
+        description="Give the user a secret through a one-time encrypted link.",
+        emoji="🔐",
+    )
 
 
 __all__ = [
@@ -252,4 +289,5 @@ __all__ = [
     "drop_command",
     "register",
     "request_private_input",
+    "send_private_output",
 ]

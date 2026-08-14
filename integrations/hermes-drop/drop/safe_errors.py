@@ -97,6 +97,14 @@ SAFE_REASONS: Dict[str, str] = {
         "files were delivered; nothing was saved, it must not be tried again, and "
         "the operator needs the drop id to check what happened"
     ),
+    # The outbound direction (``drop/service.py::send_outbound``). Refused before
+    # anything was posted, so the model's move is to stop rather than to retry: a
+    # retry mints another drop against the same broker with the same gap.
+    "outbound_unsupported": (
+        "the private-input service cannot hand a secret out in the way this plugin "
+        "needs, so nothing was delivered and nothing was posted; the operator has to "
+        "upgrade the service before secrets can be sent this way"
+    ),
     "post_failed": "the link could not be posted into this conversation",
     "journal_failed": "the durable record could not be written, so the link was retired",
     "edit_failed": "the status message could not be updated",

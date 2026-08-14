@@ -40,6 +40,12 @@ a delivered secret into ``internal_error`` and nothing else.
 Authorisation is the journal's, not this module's: the routing tuple, never
 ``session_key`` (§8.5). And it never consults ``announced_at`` — a claim must
 work with no wake having landed at all.
+
+**send_outbound** — the other direction (docs/OUTBOUND_SECRET_DROP_MVP.md): Hermes
+already holds a secret and the *user* is the one who has to receive it. Build,
+mint, post — and then nothing, which is the part worth reading the method's own
+docstring for: it journals nothing and arms nothing, deliberately, because there is
+no submission to wait for and no later claim to authorise.
 """
 
 from __future__ import annotations
@@ -115,6 +121,26 @@ UNRECORDED_SPENT_FILE_CLAIM_NOTE = (
     "This drop was used up without delivering anything, and the local record of that "
     "could not be written. Do not call the file claim for this drop again: ask for the "
     "files through a new link."
+)
+
+#: The broker minted an outbound drop but does not advertise the lifecycle this
+#: plugin needs, or answered without the notice that carries the link and the code.
+#: Refused before the post, so nothing was delivered — which is the whole point of
+#: checking: a link posted against a broker whose one-shot and destroy-after-reveal
+#: guarantees are unknown is a secret with no stated lifetime.
+ERROR_OUTBOUND_UNSUPPORTED = "outbound_unsupported"
+
+#: Said in the outbound receipt. Three things the model has to know and cannot
+#: observe: that the credential is in the conversation and not in this result, that
+#: there is no second delivery, and that it must not repeat the values in chat — which
+#: is the failure mode this whole direction exists to prevent, and the one a model is
+#: most likely to fall into out of helpfulness.
+OUTBOUND_RECEIPT_NOTE = (
+    "Delivered. The link and its code are now in this conversation; the values are "
+    "not in this result and cannot be retrieved again from here. Do NOT repeat the "
+    "values in chat — that is exactly what the drop exists to avoid. Tell the user "
+    "the drop is waiting, that it opens once, and that it expires. If they say they "
+    "missed it or it expired, send a new drop rather than pasting anything."
 )
 
 #: Said in the receipt, because the model is the party that has to behave
@@ -425,6 +451,164 @@ class DropService:
             claimed["note"] = UNRECORDED_CLAIM_NOTE
         return claimed
 
+    # -- send, the other direction ------------------------------------------
+
+    async def send_outbound(
+        self,
+        origin: Any,
+        *,
+        fields: Any,
+        title: Any = None,
+        ttl_seconds: int,
+    ) -> Dict[str, Any]:
+        """Hand the *user* a secret Hermes holds, through a one-time drop.
+
+        The mirror of :meth:`create`, and the order is the same argument turned
+        around: **build, mint, post.** Nothing is journalled and nothing is armed,
+        and that absence is deliberate rather than unfinished —
+
+        * there is nothing to *wait* for. An inbound drop is armed because a
+          submission is an event the model has to be told about; an outbound reveal
+          is deliberately not attributable to a conversation (the broker holds
+          ciphertext it cannot read and a code verifier it cannot reverse), so there
+          is no event to announce and no second message to edit into place;
+        * there is nothing to *claim*. The payload goes to the browser, never back
+          through this socket, so no durable record is needed to authorise a later
+          retrieval — and a journal entry that recorded one would be a row implying a
+          recovery path that does not exist;
+        * so the whole lifecycle is one post, and a durable record of it would buy an
+          audit line at the cost of a failure mode (a journal write that raises after
+          a link is live) with nothing to recover. The chat message *is* the record,
+          and it carries ``drop:<id>`` for exactly that reason.
+
+        **Failure ordering.** The payload is validated here, before the broker is
+        touched, so the ordinary mistake costs no round trip and mints nothing. A
+        broker refusal mints nothing by construction. A failed *post* is the one
+        case with a cost: the drop is minted, its link and code were never
+        delivered, and there is no destroy op — so it lapses at its TTL, unseen and
+        unusable, which is the same argument §7.2 makes for the inbound direction.
+        It is worse here in one respect and it is worth saying plainly: what lapses
+        is a *secret Hermes was holding*, not an empty form. Thirty minutes of a
+        ciphertext nobody has the link to is the accepted cost of not inventing a
+        destroy op for this slice.
+
+        **What comes back.** A receipt with the labels and no values, no code and no
+        URL. The model needs to know what it sent and that it arrived; it does not
+        need the credential back, and the code and the link belong to the
+        conversation rather than to the model's context.
+        """
+        from . import control_client
+        from . import outbound_payload
+
+        # The platform gate first, and before the payload is even built: an
+        # unsupported platform must not mint a drop on its way to being refused, and
+        # `renderer_for` would otherwise fall through to `plain` on a platform whose
+        # rendering was never verified (the same review L3 argument as `create`).
+        if not render.is_supported(origin.platform_name):
+            return render.unsupported_error(origin.platform_name)
+
+        try:
+            payload_json, labels, generated = outbound_payload.build_outbound_payload(
+                fields, title=title
+            )
+        except outbound_payload.PayloadRefused as refusal:
+            # Named rule, named field, no content. Nothing was sent anywhere.
+            return {"error": "invalid_request", "detail": refusal.detail}
+
+        created = await self._control.create_outbound_drop(
+            payload_json=payload_json,
+            ttl_seconds=int(ttl_seconds),
+            notice_platform=render.renderer_for(origin.platform_name),
+            socket_path=self._socket_path,
+        )
+        if not created.get("ok"):
+            return self._outbound_refusal(created)
+
+        # Asked *after* the mint because there is no probe op and no cheaper place to
+        # ask it — but still before the post, so a broker that answered without the
+        # capability cannot have its link delivered. In practice a broker that speaks
+        # the op speaks the revision; this is the check that keeps that in practice
+        # from becoming an assumption.
+        if not control_client.supports_outbound_drop(created):
+            logger.error(
+                "hermes-drop: the broker minted an outbound drop but does not advertise "
+                "outbound_protocol %d, so this plugin cannot rely on the lifecycle it "
+                "was promised. Nothing was posted; the drop lapses at its TTL. Upgrade "
+                "the broker.",
+                control_client.OUTBOUND_PROTOCOL,
+            )
+            return {"error": ERROR_OUTBOUND_UNSUPPORTED}
+
+        notice = created.get("notice") or ""
+        if not notice:
+            # The link and the code live only in this string. Without it there is
+            # nothing to post, and composing a substitute here would put a second
+            # renderer of the same sentence in a second language.
+            logger.error(
+                "hermes-drop: the broker answered an outbound create with no notice, so "
+                "there is nothing to post. Nothing was delivered; the drop lapses at its TTL."
+            )
+            return {"error": ERROR_OUTBOUND_UNSUPPORTED}
+
+        posted = await self._messenger.post_status(origin, notice)
+        if "error" in posted:
+            # Aborted, not degraded, and *not* retried: a retry would post the same
+            # link twice or mint a second drop for the same secret, and neither is
+            # better than one that lapses unseen.
+            logger.warning(
+                "hermes-drop: aborting outbound drop %s, post failed",
+                created.get("drop_id") or "",
+            )
+            return posted
+
+        expires_at_ms = int(created.get("expires_at") or 0)
+        return {
+            "ok": True,
+            "drop_id": created.get("drop_id") or "",
+            "state": "delivered",
+            "platform": origin.platform_name,
+            # Labels only. The model composed these, so they are nothing it does not
+            # already have — and they are what lets it say "I sent you the login and
+            # the password" without holding either.
+            "labels": labels,
+            "generated_values": generated,
+            "expires_at_ms": expires_at_ms,
+            "expires_in_seconds": max(0, int(expires_at_ms / 1000.0 - self._clock())),
+            "note": OUTBOUND_RECEIPT_NOTE,
+        }
+
+    @staticmethod
+    def _outbound_refusal(created: Mapping[str, Any]) -> Dict[str, Any]:
+        """Turn a broker refusal into something the model can act on.
+
+        The interesting case is a ``reason``: this plugin validated the payload
+        against the same published bounds and the broker refused it anyway, which
+        means the two implementations of one schema have drifted. That is an operator
+        problem and a real defect, so it goes to ``agent.log`` in those words — and
+        the model still gets the rule, because the rule is the only thing it can act
+        on and it may well be able to send a shorter value.
+        """
+        error = created.get("error")
+        reason = created.get("reason")
+        if error == "invalid_request" and isinstance(reason, str):
+            logger.error(
+                "hermes-drop: the broker refused an outbound payload this plugin accepted "
+                "(reason=%s). The two halves of the payload schema have drifted — see "
+                "contract/control-protocol.json -> outbound_payload. Nothing was minted.",
+                reason,
+            )
+            from . import outbound_payload
+
+            help_text = outbound_payload.REASON_HELP.get(reason, "")
+            return {
+                "error": "invalid_request",
+                "detail": f"{reason}" + (f" — {help_text}" if help_text else ""),
+            }
+        return {
+            "error": ERROR_BROKER_UNAVAILABLE,
+            "detail": created.get("detail") or "the broker refused to mint an outbound drop",
+        }
+
     # -- claim, for a file drop ---------------------------------------------
 
     async def claim_files(self, origin: Any, drop_id: str, **overrides: Any) -> Dict[str, Any]:
@@ -508,11 +692,13 @@ class DropService:
 __all__ = [
     "CLI_RECOVERY",
     "ERROR_BROKER_TOO_OLD",
+    "ERROR_OUTBOUND_UNSUPPORTED",
     "ERROR_BROKER_UNAVAILABLE",
     "ERROR_JOURNAL_FAILED",
     "ERROR_POST_FAILED",
     "ERROR_RESPONSE_TOO_LARGE",
     "ERROR_UNAVAILABLE",
+    "OUTBOUND_RECEIPT_NOTE",
     "RECEIPT_NOTE",
     "SIZE_REMEDIATION",
     "UNRECORDED_CLAIM_NOTE",

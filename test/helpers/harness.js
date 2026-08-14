@@ -183,24 +183,38 @@ export async function sealFileEnvelope({ capability, metadata, files, text }) {
  *
  * `plaintext` goes in as a string because that is what the caller of the control op
  * has; from the broker's side it is bytes on a request line and nothing else.
+ *
+ * `payload` is the structured alternative (src/outbound-payload.js): pass an object
+ * and it is canonicalised, declared `structured`, and validated by the broker before
+ * anything is minted. Exactly one of the two, mirroring the op itself.
  */
-export async function createOutboundDrop(broker, { plaintext, ttlSeconds } = {}) {
+export async function createOutboundDrop(
+  broker,
+  { plaintext, payload, ttlSeconds, noticePlatform } = {},
+) {
   const request = {
     op: 'create_outbound_drop',
-    plaintext_b64: Buffer.from(plaintext, 'utf8').toString('base64'),
+    plaintext_b64: Buffer.from(
+      payload === undefined ? plaintext : JSON.stringify(payload),
+      'utf8',
+    ).toString('base64'),
   };
+  if (payload !== undefined) request.payload_format = 'structured';
   if (ttlSeconds !== undefined) request.ttl_seconds = ttlSeconds;
+  if (noticePlatform !== undefined) request.notice_platform = noticePlatform;
   const created = await broker.control(request);
   if (!created.ok) return { created, capability: null, key: null };
 
-  const fragment = parseOutboundFragment(splitHandoffUrl(created.url).capability);
-  const { capability, key } = fragment;
+  const rawFragment = splitHandoffUrl(created.url).capability;
+  const { capability, key } = parseOutboundFragment(rawFragment);
   const origin = broker.baseUrl;
   return {
     created,
     id: created.drop_id,
     capability,
     key,
+    /** The whole `r.<capability>.<key>` fragment, as the page receives it. */
+    fragment: rawFragment,
     code: created.code,
     expiresAt: created.expires_at,
     metadata: () => fetchOutboundMetadata({ capability, origin }),
