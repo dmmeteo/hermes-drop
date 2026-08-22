@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,8 +61,22 @@ def request(payload: dict) -> dict:
 def private_root() -> Path:
     base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
     root = base / f"claude-drop-{os.getuid()}"
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(root, 0o700)
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        pass
+    try:
+        info = root.lstat()
+    except OSError:
+        fail("unsafe_private_root")
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        # Never chmod here: a pre-created symlink would turn that into an
+        # attacker-selected chmod and a pre-created directory is not ours.
+        fail("unsafe_private_root")
     return root
 
 
@@ -70,12 +85,15 @@ def write_private(prefix: str, value: bytes) -> Path:
     path = Path(raw)
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        handle = os.fdopen(fd, "wb")
+        fd = -1  # ownership moved to handle
+        with handle:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
     except Exception:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         path.unlink(missing_ok=True)
         raise
     return path
@@ -106,7 +124,10 @@ def receipt(**items: object) -> None:
 
 
 def cmd_request(args: argparse.Namespace) -> None:
-    result = request({"op": "create", "notice_platform": "plain", "payload_kind": "universal"})
+    # Claude cannot safely ingest arbitrary private files without exposing their
+    # contents to model-visible tool calls. Keep this client on the text lane and
+    # fail closed rather than minting a universal form it cannot fully claim.
+    result = request({"op": "create", "notice_platform": "plain", "payload_kind": "text"})
     if not result.get("ok") or not isinstance(result.get("notice"), str):
         fail(str(result.get("error") or "create_failed"))
     delivered = deliver_notice(result["notice"])
@@ -132,7 +153,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
 
 def cmd_send_generated(args: argparse.Namespace) -> None:
     payload = {
-        "version": 1,
+        "v": 1,
         "title": args.title,
         "fields": [{
             "label": args.label,
@@ -174,7 +195,7 @@ def parser() -> argparse.ArgumentParser:
     outbound = sub.add_parser("send-generated", help="mint a broker-generated outbound value")
     outbound.add_argument("--title", default="Generated credential")
     outbound.add_argument("--label", default="Secret")
-    outbound.add_argument("--kind", choices=("password", "token", "hex"), default="password")
+    outbound.add_argument("--kind", choices=("password", "base64url", "hex"), default="password")
     outbound.add_argument("--length", type=int, default=32)
     outbound.set_defaults(func=cmd_send_generated)
     cleanup = sub.add_parser("cleanup", help="unlink a client-created private file")

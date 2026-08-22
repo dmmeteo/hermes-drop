@@ -6,12 +6,21 @@ is `0`, minor versions may carry breaking changes.
 
 ## [Unreleased]
 
-Plugin `0.5.0`, broker `0.5.0`. The control protocol moves to `version: 2` — an
+Plugin `0.6.0`, broker `0.5.0`. The control protocol moves to `version: 2` — an
 additive revision: one optional `claim` request field, one new error, and a
 `protocol_version` on the `create` response. A version 1 client sends none of them
 and reads none of them, and behaves exactly as it did before.
 
 ### Added
+
+- **One stock-Hermes `/drop [prompt]` command and a standalone Claude Code
+  command.** `/drop` is now a stock skill command that reaches the normal
+  authenticated agent/tool path; the plugin no longer registers a pre-agent slash
+  handler and the temporary Hermes core patch series is retired. The profile-scoped
+  installer installs both plugin and skill. A project-scoped Claude Code command
+  supports private inbound text and broker-generated outbound values through the
+  same broker without Hermes ACP; it refuses inbound files and relayed outbound
+  plaintext rather than putting either into model-visible tool arguments.
 
 - **Outbound drops, end to end: Hermes hands the user a secret.** The reveal page ships
   in the browser bundle and the plugin registers a third tool, `send_private_output`.

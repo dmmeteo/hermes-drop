@@ -8,8 +8,8 @@
 #                 compose.yml bind-mounts at /run/handoff (slice S2). Validates
 #                 and reports; creates nothing, chmods nothing, restarts nothing.
 #
-#   install       Link this repo's integrations/hermes-drop into
-#   --copy        $HERMES_HOME/plugins/hermes-drop and enable it in config.yaml
+#   install       Link this repo's plugin and Drop skill into the named profile
+#   --copy        (or copy both) and enable the plugin in config.yaml
 #   --uninstall   (slice S3). Idempotent. Restarts nothing.
 #
 # WHY IT REFUSES TO GUESS $HERMES_HOME. There is no fallback to ~/.hermes. A
@@ -22,7 +22,7 @@
 # WHAT IT NEVER DOES, at any point:
 #   - restart, reload or otherwise touch a running gateway or broker
 #   - `docker compose up` anything
-#   - delete or edit a skill
+#   - delete or edit a skill it did not install
 #   - write plugins.entries.hermes-drop.allow_tool_override (Drop registers new
 #     tool names and must never replace a built-in — hermes_cli/plugins.py:439-445)
 # Those are operator steps behind the S11 gate. The script prints them so the
@@ -33,6 +33,9 @@ SELF="$(basename "$0")"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN_SRC="$REPO_ROOT/integrations/hermes-drop"
 PLUGIN_ID="hermes-drop"
+SKILL_SRC="$REPO_ROOT/integrations/drop-skill"
+SKILL_ID="drop"
+SKILL_MARKER=".hermes-drop-managed"
 LEGACY_PLUGIN_ID="hermes-drop-command"
 BACKUP_PREFIX="config.yaml.hermes-drop-backup-"
 
@@ -45,8 +48,7 @@ usage() {
   cat >&2 <<EOF
 usage: $SELF (install | --copy | --uninstall | --preflight)
 
-  install       Symlink \$HERMES_HOME/plugins/${PLUGIN_ID} at
-                ${PLUGIN_SRC}
+  install       Symlink the plugin and stock /drop skill into \$HERMES_HOME
                 and add '${PLUGIN_ID}' to plugins.enabled in config.yaml,
                 removing '${LEGACY_PLUGIN_ID}' if present. Idempotent.
                 A symlink keeps this repo the single source of truth.
@@ -54,7 +56,7 @@ usage: $SELF (install | --copy | --uninstall | --preflight)
   --copy        Same, but pin a versioned copy instead of a symlink (for hosts
                 where \$HERMES_HOME must not depend on this checkout).
 
-  --uninstall   Remove \$HERMES_HOME/plugins/${PLUGIN_ID} (link or copy) and
+  --uninstall   Remove the managed plugin and /drop skill (link or copy) and
                 remove '${PLUGIN_ID}' from plugins.enabled — that one entry and
                 nothing else. No config.yaml backup is restored, so operator
                 changes made since install are kept.
@@ -156,13 +158,24 @@ config_edit() {
 # this function just took. Either both happened or neither did.
 do_install() {
   local mode="$1"   # link | copy
-  local home python target plugins_dir config backup plan
+  local home python target skill_target plugins_dir skills_dir config backup plan
 
   home="$(resolve_home)"
   python="$(resolve_python "$home")"
 
   [ -f "$PLUGIN_SRC/plugin.yaml" ] || fail "plugin source ${PLUGIN_SRC} has no plugin.yaml — wrong checkout?"
+  [ -f "$SKILL_SRC/SKILL.md" ] || fail "skill source ${SKILL_SRC} has no SKILL.md — wrong checkout?"
   [ -f "$CONFIG_EDITOR" ] || fail "config editor ${CONFIG_EDITOR} is missing — wrong checkout?"
+
+  # Refuse to replace an unrelated skill. The old installer never managed this
+  # path, so an existing directory without our marker belongs to the operator.
+  skill_target="$home/skills/$SKILL_ID"
+  if [ -L "$skill_target" ]; then
+    [ "$(readlink -f "$skill_target")" = "$(readlink -f "$SKILL_SRC")" ] \
+      || fail "${skill_target} is a symlink not owned by Hermes Drop; nothing was changed"
+  elif [ -e "$skill_target" ] && [ ! -f "$skill_target/$SKILL_MARKER" ]; then
+    fail "${skill_target} already exists and is not marked as a Hermes Drop install; nothing was changed"
+  fi
 
   config="$home/config.yaml"
 
@@ -244,14 +257,43 @@ do_install() {
     printf 'copied %s -> %s\n' "$PLUGIN_SRC" "$target"
   fi
 
+  # 4. Install the stock skill command. A plugin without this skill has tools but
+  # no /drop command, so both artifacts are one install operation.
+  skills_dir="$home/skills"
+  if ! mkdir -p "$skills_dir"; then
+    rm -rf "$target"
+    rollback_config
+    fail "could not create ${skills_dir}"
+  fi
+  if [ -L "$skill_target" ] || [ -e "$skill_target" ]; then
+    rm -rf "$skill_target"
+  fi
+  if [ "$mode" = "link" ]; then
+    if ! ln -s "$SKILL_SRC" "$skill_target"; then
+      rm -rf "$target"
+      rollback_config
+      fail "could not link ${skill_target}"
+    fi
+    printf 'linked %s -> %s\n' "$skill_target" "$SKILL_SRC"
+  else
+    if ! mkdir -p "$skill_target" \
+      || ! (cd "$SKILL_SRC" && tar --exclude=__pycache__ --exclude='*.pyc' -cf - .) \
+        | (cd "$skill_target" && tar -xf -) \
+      || ! printf 'managed by hermes-drop\n' > "$skill_target/$SKILL_MARKER"; then
+      rm -rf "$skill_target" "$target"
+      rollback_config
+      fail "could not copy ${SKILL_SRC} into ${skill_target}"
+    fi
+    printf 'copied %s -> %s\n' "$SKILL_SRC" "$skill_target"
+  fi
+
   cat <<EOF
 
 not done here, on purpose:
     - no gateway or broker was restarted or reloaded (plugin discovery runs at
       gateway start, so the tools appear only after an operator-approved restart)
     - no docker compose service was started or stopped
-    - no skill was deleted or edited (retiring ~/.hermes/skills/productivity/drop/
-      is a separate operator step)
+    - no unrelated skill was deleted or edited
     - plugins.entries.${PLUGIN_ID}.allow_tool_override was NOT written and must
       stay unset
     - no host control-socket directory was created (run --preflight, then create
@@ -281,10 +323,11 @@ EOF
 # backup is left on disk as an audit artefact rather than consumed as a time
 # machine.
 do_uninstall() {
-  local home python target config plan backup
+  local home python target skill_target config plan backup
   home="$(resolve_home)"
   python="$(resolve_python "$home")"
   target="$home/plugins/$PLUGIN_ID"
+  skill_target="$home/skills/$SKILL_ID"
   config="$home/config.yaml"
 
   [ -f "$CONFIG_EDITOR" ] || fail "config editor ${CONFIG_EDITOR} is missing — wrong checkout?"
@@ -294,6 +337,20 @@ do_uninstall() {
     printf 'removed %s\n' "$target"
   else
     printf 'nothing to remove at %s\n' "$target"
+  fi
+
+  if [ -L "$skill_target" ]; then
+    if [ "$(readlink -f "$skill_target")" = "$(readlink -f "$SKILL_SRC")" ]; then
+      rm -f "$skill_target"
+      printf 'removed %s\n' "$skill_target"
+    else
+      printf '%s: left unrelated skill symlink %s untouched\n' "$SELF" "$skill_target" >&2
+    fi
+  elif [ -d "$skill_target" ] && [ -f "$skill_target/$SKILL_MARKER" ]; then
+    rm -rf "$skill_target"
+    printf 'removed %s\n' "$skill_target"
+  elif [ -e "$skill_target" ]; then
+    printf '%s: left unrelated skill %s untouched\n' "$SELF" "$skill_target" >&2
   fi
 
   plan=""
@@ -329,7 +386,7 @@ not done here, on purpose:
     - nothing was restarted; a running gateway keeps the tools registered until
       it restarts
     - no docker compose service was touched
-    - no skill was restored
+    - no unrelated skill was changed or restored
 EOF
 }
 

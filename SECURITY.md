@@ -645,7 +645,8 @@ Two rendering rules complete it, and they are stronger than the schema:
   plugin. Argued harmless — URL fragments are never sent to a server, so an
   unfurler only ever sees the bare origin.
 - **Claude Code support is intentionally narrower.** Broker-generated outbound
-  values and inbound materialization to a private file are supported. Claude must
+  values and inbound text materialization to a private file are supported. Inbound
+  files and relayed outbound plaintext are refused. Claude must
   not read the plaintext file into model context; headless Herdr has no implicit
   chat-delivery fallback.
 

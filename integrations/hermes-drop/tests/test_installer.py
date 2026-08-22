@@ -94,6 +94,11 @@ def test_install_symlinks_the_repo_source(profile: Path) -> None:
     assert link.resolve() == PLUGIN_DIR.resolve()
     assert (link / "plugin.yaml").is_file()
 
+    skill = profile / "skills" / "drop"
+    assert skill.is_symlink(), "the stock /drop command must be installed with the plugin"
+    assert skill.resolve() == (REPO_ROOT / "integrations" / "drop-skill").resolve()
+    assert (skill / "SKILL.md").is_file()
+
 
 def test_install_enables_the_plugin_and_retires_the_legacy_command_plugin(profile: Path) -> None:
     run_installer("install", home=profile)
@@ -146,6 +151,10 @@ def test_copy_pins_a_real_directory_not_a_link(profile: Path) -> None:
     assert (target / "plugin.yaml").is_file()
     assert not (target / "tests").exists(), "tests are not part of an installed plugin"
 
+    skill = profile / "skills" / "drop"
+    assert skill.is_dir() and not skill.is_symlink()
+    assert (skill / "SKILL.md").is_file()
+
 
 def test_uninstall_removes_the_link_and_the_enabled_entry(profile: Path) -> None:
     """Review L6 changed what this test should assert.
@@ -160,6 +169,7 @@ def test_uninstall_removes_the_link_and_the_enabled_entry(profile: Path) -> None
     run_installer("--uninstall", home=profile)
 
     assert not (profile / "plugins" / "hermes-drop").exists()
+    assert not (profile / "skills" / "drop").exists()
     enabled = read_config(profile)["plugins"]["enabled"]
     assert "hermes-drop" not in enabled, "the enabled entry outlived the plugin directory"
     assert "spotify" in enabled, "an unrelated entry was disturbed"
@@ -195,6 +205,21 @@ def test_install_refuses_a_hermes_home_that_does_not_exist(tmp_path: Path) -> No
     result = run_installer("install", home=tmp_path / "absent", expect_ok=False)
     assert result.returncode != 0
     assert "does not exist" in result.stderr
+
+
+def test_install_refuses_to_replace_an_unrelated_drop_skill(profile: Path) -> None:
+    skill = profile / "skills" / "drop"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: drop\n---\nunrelated\n", encoding="utf-8")
+    before = (profile / "config.yaml").read_bytes()
+
+    result = run_installer("install", home=profile, expect_ok=False)
+
+    assert result.returncode != 0
+    assert "not marked as a Hermes Drop install" in result.stderr
+    assert (skill / "SKILL.md").read_text(encoding="utf-8").endswith("unrelated\n")
+    assert (profile / "config.yaml").read_bytes() == before
+    assert not (profile / "plugins" / "hermes-drop").exists()
 
 
 def test_install_states_the_operator_actions_it_does_not_take(profile: Path) -> None:
@@ -558,7 +583,7 @@ def test_the_config_edit_is_applied_by_rename_not_by_truncation(profile: Path) -
         p.name
         for p in profile.iterdir()
         if p.name != "config.yaml" and not p.name.startswith("config.yaml.hermes-drop-backup-")
-        and p.name != "plugins"
+        and p.name not in {"plugins", "skills"}
     ]
     assert strays == [], f"the atomic write left temporary files behind: {strays}"
 

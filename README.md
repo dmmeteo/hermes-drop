@@ -14,7 +14,7 @@ Two pieces, both self-hosted by you:
 - a **broker** — a small Node.js service behind your own HTTPS reverse proxy, which
   mints links, receives sealed envelopes and hands the plaintext to exactly one
   local claim; and
-- a **Hermes plugin** — which provides the `/drop` command, the
+- a **Hermes plugin plus stock skill command** — which provide `/drop`, the
   `request_private_input`, `claim_private_input` and `send_private_output` tools, and
   the durable bookkeeping that survives a restart.
 
@@ -439,17 +439,18 @@ The installer never guesses a profile. Every invocation names its target.
 HERMES_HOME="$HOME/.hermes" bin/install-hermes-drop.sh install
 ```
 
-That symlinks this checkout into `$HERMES_HOME/plugins/hermes-drop` and adds
-`hermes-drop` to `plugins.enabled` in that profile's `config.yaml`. The config edit
+That symlinks this checkout into `$HERMES_HOME/plugins/hermes-drop`, installs the
+stock command at `$HERMES_HOME/skills/drop`, and adds `hermes-drop` to
+`plugins.enabled` in that profile's `config.yaml`. The config edit
 is surgical — validated by a YAML parser, applied as whole-line changes, written by
 atomic rename — so your comments and formatting survive, and an ambiguous layout is
 **refused** with the file untouched rather than guessed at.
 
 | Flag | Use |
 |---|---|
-| `install` | Symlink the checkout. The repo stays the single source of truth. |
-| `--copy` | Pin a versioned copy instead, for hosts where the profile must not depend on this checkout. |
-| `--uninstall` | Remove the plugin directory and that one `plugins.enabled` entry. |
+| `install` | Symlink the plugin and skill. The repo stays the single source of truth. |
+| `--copy` | Pin versioned copies instead, for hosts where the profile must not depend on this checkout. |
+| `--uninstall` | Remove the managed plugin, skill, and that one `plugins.enabled` entry. |
 | `--preflight` | Validate the host control-socket directory. Read-only. |
 
 Then point the plugin at the broker's socket, in that profile's `config.yaml`:
@@ -479,12 +480,11 @@ HERMES_HOME=/srv/profiles/work    bin/install-hermes-drop.sh install
 HERMES_HOME=/srv/profiles/staging bin/install-hermes-drop.sh install
 ```
 
-Each profile gets its own `plugins.enabled` entry, its own `control_socket`
+Each profile gets its own plugin and skill links, `plugins.enabled` entry, and `control_socket`
 setting, and its own journal at `$HERMES_HOME/state/hermes-drop`. Profiles can
 share one broker — a drop is bound to its conversation, not to a profile — or you
-can run a broker per profile with a socket directory each. If a gateway serves
-several platforms at once, patch `0001` is what keeps each profile's drops from
-reading another's session identity.
+can run a broker per profile with a socket directory each. Stock Hermes binds the
+authenticated turn identity before the skill invokes an origin-bound tool.
 
 If PyYAML is not importable from the interpreter on your `PATH`, name one:
 
@@ -547,8 +547,31 @@ that would discard every unrelated change you made since installing. Any
 yourself. Nothing is restarted; a running gateway keeps the tools registered until
 it restarts.
 
-To revert the Hermes patches, `git switch` your Hermes checkout back to its base
-and restart the gateway.
+The installer leaves unrelated skills and config entries untouched.
+
+## Standalone Claude Code command
+
+This checkout includes a project-scoped native command at
+`.claude/commands/drop.md`; it works directly in Claude Code without Hermes ACP or
+MCP. The command calls `bin/claude-drop`, which talks to the same local broker
+socket. Do not copy it into a user-wide command directory unless you also provide
+a stable helper path intentionally—the shipped command fails closed outside this
+project.
+
+The Claude boundary is deliberately narrower than Hermes:
+
+- inbound **text** is materialized into a private `0600` file; Claude must pass the
+  path only to a non-logging consumer and then clean it up;
+- inbound files are unsupported, because the standalone client does not implement
+  the framed file claim and must not mint a form it cannot safely consume;
+- outbound broker-generated credentials are supported without plaintext entering
+  the transcript;
+- relaying existing outbound plaintext is unsupported because a Bash/tool argument
+  would persist it.
+
+On a desktop, the capability notice is copied to the clipboard. On headless Herdr,
+it is written to a private `0600` file and only that path reaches command output.
+There is no chat-delivery fallback.
 
 ## Configuration
 
