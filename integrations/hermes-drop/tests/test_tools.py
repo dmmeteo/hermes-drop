@@ -526,17 +526,6 @@ def test_sanitizing_never_touches_a_successful_result(plugin) -> None:
     assert sanitize(receipt) == receipt
 
 
-def test_the_two_entry_points_share_one_refusal_table(plugin) -> None:
-    """Two copies of this vocabulary would drift, and the drift would be silent."""
-    import importlib
-
-    # ``drop.command`` is imported lazily on the dispatch path, so it may not be an
-    # attribute of the package yet in a process that has only used the tools.
-    command = importlib.import_module(plugin.drop.__name__ + ".command")
-
-    assert command._SAFE_REASONS is plugin.drop.safe_errors.SAFE_REASONS
-    assert command._DEFAULT_REASON == plugin.drop.safe_errors.DEFAULT_REASON
-
 
 def test_a_broker_unavailable_detail_is_replaced_on_the_tool_path(
     plugin, tools, turn, gateway_loop, tmp_path: Path

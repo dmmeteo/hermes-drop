@@ -244,8 +244,9 @@ def install_plugin_for_real(
     """
     import sys
 
-    from hermes_cli.plugins import discover_plugins
+    from hermes_cli.plugins import discover_plugins, _reset_plugin_managers_for_tests
 
+    _reset_plugin_managers_for_tests()
     link = hermes_home / "plugins" / "hermes-drop"
     if not link.exists():
         link.symlink_to(plugin_dir, target_is_directory=True)

@@ -579,7 +579,6 @@ def test_the_plugin_registers_the_third_tool_and_still_no_send_message(plugin) -
 
     plugin.register(Ctx())
     assert sorted(registered) == [
-        "/drop",
         "claim_private_input",
         "request_private_input",
         "send_private_output",

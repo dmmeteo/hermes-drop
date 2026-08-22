@@ -502,7 +502,7 @@ def test_register_survives_a_core_without_middleware_support(plugin) -> None:
 
 
 def test_the_real_middleware_pass_reaches_the_provider_payload(
-    claimed, vault, temp_hermes_home, monkeypatch
+    temp_hermes_home, monkeypatch
 ) -> None:
     """Through the real ``PluginManager`` and the real
     ``apply_llm_request_middleware``, which is the function whose return value
@@ -512,8 +512,18 @@ def test_the_real_middleware_pass_reaches_the_provider_payload(
 
     from conftest import PLUGIN_DIR
 
-    install_plugin_for_real(monkeypatch, temp_hermes_home, PLUGIN_DIR)
-
+    installed = install_plugin_for_real(monkeypatch, temp_hermes_home, PLUGIN_DIR)
+    from hermes_cli.plugins import get_plugin_manager
+    assert get_plugin_manager()._middleware.get(installed.drop.vault.MIDDLEWARE_KIND), (
+        "plugin discovery did not register llm_request middleware"
+    )
+    installed.drop.vault.clear()
+    monkeypatch.setattr(
+        installed.drop.tools,
+        "claim_private_input",
+        lambda args, **_kw: {"ok": True, "drop_id": "H" * 22, "private_input": SECRET},
+    )
+    claimed = installed.claim_private_input({"drop_id": "H" * 22}, session_id=SESSION)
     token = json.loads(claimed)["private_input"]
     request = _chat_completions_request(token)
     result = apply_llm_request_middleware(request, session_id=SESSION)

@@ -46,7 +46,7 @@ a schedule, and please give a reasonable window before disclosing publicly.
 - The Hermes plugin: origin resolution and verification, the tool schemas, the
   journal, the reconciler, refusal-vocabulary leaks.
 - The installer and the `plugins.enabled` config editor.
-- The Hermes core patches in `patches/hermes-agent/`.
+- The stock Hermes skill-command and plugin-tool integration.
 
 **Out of scope** — these are documented design decisions, not defects:
 
@@ -644,8 +644,10 @@ Two rendering rules complete it, and they are stronger than the schema:
 - **Telegram link previews are not suppressed** and cannot be from within the
   plugin. Argued harmless — URL fragments are never sent to a server, so an
   unfurler only ever sees the bare origin.
-- **The Hermes core patches are unreleased upstream.** Running Hermes Drop means
-  running a patched gateway. See `patches/hermes-agent/README.md`.
+- **Claude Code support is intentionally narrower.** Broker-generated outbound
+  values and inbound materialization to a private file are supported. Claude must
+  not read the plaintext file into model context; headless Herdr has no implicit
+  chat-delivery fallback.
 
 ## Supported versions
 

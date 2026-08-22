@@ -14,19 +14,23 @@ and the test that enforces it.
 Implemented so far: S3 (discovery, config gate, control client), S4
 (``SourceRegistry`` and the origin hard gate), S5 (async messenger, sync
 bridge, render matrix), S6 (journal, reconciler), S7 (``DropWaiter``,
-``DropService``), S8 (entry points), S10 (deterministic ``/drop``).
+``DropService``), S8 (entry points), S10 (deterministic ``/drop``), S12
+(``/drop`` moved onto the stock skill-command seam; no core patch).
 
-**``/drop`` is deterministic, and this file is where that is visible.** The
-``pre_gateway_dispatch`` callback captures the real ``SessionSource`` and carries
-the reconciler's second trigger — nothing else. The registered async handler is
-the initiator: core dispatches it inside the session context Tier 2 binds
-(``_set_session_env_from_source`` at ``gateway/run.py:14721``, Hermes branch
-``drop/plugin-command-origin``) and it calls ``DropService`` directly. No model
-turn is involved, and no text the user did not type is ever produced.
+**``/drop`` is not registered here, and this file is where that is visible.**
+The command is a stock Hermes *skill* command — ``integrations/drop-skill``,
+scanned by ``agent/skill_commands.py`` and dispatched as an ordinary
+authenticated agent turn. This plugin contributes the three origin-bound tools
+that turn runs, the ``pre_gateway_dispatch`` capture callback, and the
+``llm_request`` middleware. It registers no slash command at all: plugin
+dispatch runs *before* skill dispatch in ``_handle_message``, so a plugin
+``drop`` command would shadow the skill and drag the operation back onto a
+pre-agent path with no authoritative session context of its own.
 
-Without Tier 2 the plugin still loads and still works: the handler finds a real
-source, has no bound context to verify it against, and refuses
-``origin_unverified`` rather than guessing a destination.
+That is also why no Hermes core patch is required any more. The tools resolve
+their origin on the agent path, where ``_set_session_env`` has already bound
+this turn's identity — core's own behaviour, not a seam Drop had to add.
+
 """
 
 from __future__ import annotations
@@ -56,11 +60,11 @@ def _as_tool_result(payload: Mapping[str, Any]) -> str:
 def _guarded(impl_name: str, args: Optional[Mapping[str, Any]], session_id: str = "") -> str:
     """Call a handler and turn anything that escapes into an error result.
 
-    Nothing may raise out of these. A raising slash-command handler is swallowed
-    with a ``logger.warning`` at ``gateway/run.py:14701-14702`` and execution
-    **falls through to skill-command resolution** at ``:14705+`` — so an exception
-    would silently become a ``/skill drop`` lookup, resurrecting the exact prose
-    path this design severs (plan §1, link 2).
+    Nothing may raise out of these. A tool handler that raises is reported to the
+    model as a tool failure and the raw exception text goes with it — an exception
+    message can carry a socket path, an internal hostname or an echoed request
+    body, and a tool result enters the model's context and from there durable
+    ``state.db``.
 
     ``vault.redact_tool_result`` runs **inside** this try, on the dict, before
     ``_as_tool_result`` makes it a string. That string is what core appends to
@@ -137,32 +141,6 @@ def _session_id(kwargs: Mapping[str, Any]) -> str:
     return str(kwargs.get("session_id") or "")
 
 
-async def drop_command(user_args: str = "", **kwargs: Any) -> None:
-    """The ``/drop`` handler. Async, so the gateway awaits it on the gateway loop
-    (``gateway/run.py:14726-14728``) and it reaches ``DropService`` directly.
-
-    Core calls this with one positional string and nothing else (``:14726``); the
-    origin comes from the captured real source verified against the session
-    context bound at ``:14721``, never from an argument.
-
-    Always returns ``None``: a returned string is posted as a second message
-    (``return str(result) if result else None``, ``:14729``) and the status
-    message is already the reply. It never raises either — an exception here is
-    swallowed at ``:14731-14732`` and execution *falls through to skill-command
-    resolution* at ``:14735+``, so a raise would silently become a ``/skill
-    drop`` lookup. ``drop.command.handle`` catches everything; this is the second
-    guard, and it exists because the cost of the first one being wrong is the
-    incident.
-    """
-    from .drop import command
-
-    try:
-        return await command.handle(user_args, **kwargs)
-    except Exception:  # noqa: BLE001 - deliberate catch-all, see the docstring
-        logger.warning("hermes-drop: /drop handler failed", exc_info=True)
-        return None
-
-
 def capture_turn_source(**kwargs: Any) -> None:
     """``pre_gateway_dispatch`` callback: capture the REAL ``SessionSource`` and
     carry the reconciler's second trigger. Two observations, no verdict.
@@ -225,19 +203,12 @@ def register(ctx: Any) -> None:
             "a placeholder. Nothing is written to durable state either way."
         )
 
-    # One registration reaches the Discord picker, the Telegram menu, the CLI and
-    # plain typed text on every platform (``hermes_cli/plugins.py:548-600``).
-    # ``args_hint`` is imported rather than repeated: a ``<``-prefixed hint would
-    # drop the command from Telegram's menu entirely
-    # (``_requires_argument``, ``hermes_cli/commands.py:533-535``).
-    from .drop import command as drop_command_module
-
-    ctx.register_command(
-        drop_command_module.COMMAND_NAME,
-        drop_command,
-        description=drop_command_module.DESCRIPTION,
-        args_hint=drop_command_module.ARGS_HINT,
-    )
+    # No ``ctx.register_command``, deliberately. ``/drop`` is a **skill** command
+    # now (``integrations/drop-skill/SKILL.md``), and plugin dispatch runs
+    # *before* skill dispatch in ``_handle_message`` — a plugin command named
+    # ``drop`` would shadow the skill on every turn and put Drop back on a
+    # pre-agent path with no authoritative session context of its own. Pinned by
+    # ``tests/test_skill_command.py``.
 
     # The startup trigger for the reconciler. It polls for a live runner and
     # gives up quietly if none appears, so a CLI process that merely discovers
@@ -286,7 +257,6 @@ __all__ = [
     "capture_turn_source",
     "claim_private_input",
     "drop_check_fn",
-    "drop_command",
     "register",
     "request_private_input",
     "send_private_output",

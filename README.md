@@ -39,33 +39,19 @@ and Hermes can hand the user one the same way.
 
 ---
 
-## Requires a patched Hermes
+## Stock Hermes integration
 
-**Stock Hermes cannot run Hermes Drop correctly.** Two fixes to Hermes' gateway are
-required, and no released Hermes version contains them yet. They are supplied as
-`git format-patch` artifacts in [`patches/hermes-agent/`](patches/hermes-agent/),
-based on Hermes commit `dd241cf0cd`:
-
-| Patch | What it fixes |
-|---|---|
-| `0001` | A plugin slash command cannot see which conversation invoked it, so it reads whichever session last mirrored its identity into `os.environ`. This is what `/drop`'s origin binding rests on. |
-| `0002` | A hyphenated plugin command invoked in its underscored form (`/hermes_drop` — the form Telegram's command menu sends) bypasses the slash-access policy entirely. |
-
-Both are general fixes to Hermes' plugin-command path with their own tests, not
-Drop-specific hooks. They are temporary: if equivalent support lands upstream, the
-patches directory goes away. See
-[`patches/hermes-agent/README.md`](patches/hermes-agent/README.md) for the base
-SHA, apply order and test commands.
-
-Without patch `0001`, the plugin still loads and refuses safely — `/drop` returns
-`origin_unverified` rather than guessing a destination — but it will not work.
+Hermes Drop runs on released, unmodified Hermes. `/drop [prompt]` is a stock skill
+command, so it enters the normal authenticated agent path before a Drop tool runs.
+The plugin registers only three origin-bound tools and an observation hook; it
+registers no slash command and requires no Hermes core patch.
 
 ## Features
 
-- **`/drop`** — a deterministic slash command. No model turn, no prose, no second
-  interpretation of what the user asked for.
-- **`request_private_input`** and **`claim_private_input`** — the same operation,
-  reached from a model turn instead.
+- **`/drop [prompt]`** — one semantic skill command. Empty means the user wants to
+  provide private input; a prompt lets the agent infer inbound or outbound intent.
+  There is no TTL, destination, underscore or hyphenated command variant.
+- **`request_private_input`** and **`claim_private_input`** — the inbound operation.
 - **`send_private_output`** — the other direction. Hermes hands the user a secret it
   holds through a one-time link and a 3-digit code instead of writing it in the chat.
   The values arrive as **labelled fields** — login, password, API key, URL, note — and
@@ -542,8 +528,7 @@ docker compose build && docker compose up -d      # broker: recreate, never rest
 A symlinked plugin needs no reinstall — restart the gateway to pick up the new
 code. A `--copy` install does: re-run `bin/install-hermes-drop.sh --copy`.
 
-Re-check `patches/hermes-agent/` after upgrading: if the base SHA has moved, the
-patches may need rebasing onto your Hermes checkout.
+Run the plugin suite against the exact upstream stable candidate before upgrading.
 
 Treat a `@hpke/core` bump as a change that must re-run `test/hpke-vectors.test.js`
 before it carries a real secret.
@@ -643,7 +628,8 @@ src/public/                     index.html, app.css (assets/app.js is generated)
 test/                           broker seams, HPKE vectors, page wiring, wake contract
 integrations/hermes-drop/       the Hermes plugin
 integrations/hermes-drop/tests/ the plugin's pytest suite
-patches/hermes-agent/           the two required Hermes core patches
+integrations/drop-skill/        the stock Hermes `/drop [prompt]` skill command
+integrations/claude-code/       standalone Claude Code command prompt
 ```
 
 Internal identifiers say `handoff` throughout — the CLI, ids, environment

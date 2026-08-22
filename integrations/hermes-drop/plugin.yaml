@@ -1,5 +1,5 @@
 name: hermes-drop
-version: 0.5.0
+version: 0.6.0
 description: >-
   Origin-bound private values, both directions. Asks the user for a secret
   through a one-shot encrypted web form, and hands one back through a one-time
@@ -11,15 +11,15 @@ kind: standalone
 
 # Only name/version/description/author/kind/requires_env/provides_tools/
 # provides_hooks are read by core's manifest parser (hermes_cli/plugins.py:1588+).
-# Nothing else here is invented: `provides_commands` is ignored by the parser and
-# kept purely so `hermes plugins list` output and a human reading this file agree
-# with what register() actually registers.
+#
+# There is deliberately no `provides_commands`. `/drop` is a stock Hermes SKILL
+# command (integrations/drop-skill/SKILL.md), not a plugin command: plugin
+# dispatch runs before skill dispatch, so registering one here would shadow the
+# skill on every turn. See integrations/hermes-drop/__init__.py::register.
 provides_tools:
   - request_private_input
   - claim_private_input
   - send_private_output
-provides_commands:
-  - drop
 provides_hooks:
   - pre_gateway_dispatch
 

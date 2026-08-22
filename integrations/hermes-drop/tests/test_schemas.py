@@ -146,10 +146,9 @@ def test_the_plugin_registers_exactly_three_tools_one_command_and_no_send_messag
     # exactly rather than by membership: a fourth registration fails here on the way
     # in rather than being discovered on a live surface.
     assert sorted(registered) == [
-        "/drop",
         "claim_private_input",
         "request_private_input",
         "send_private_output",
     ]
     assert not any("send_message" in name for name in registered)
-    assert registered.count("/drop") == 1, "one registration, or the last plugin loaded wins"
+    assert "/drop" not in registered, "the stock skill command must not be shadowed"

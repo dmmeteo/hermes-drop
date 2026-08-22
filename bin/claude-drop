@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Claude-side Drop client that never prints capabilities or plaintext.
+
+This is intentionally independent of Hermes and Claude Code ACP. Human-facing
+notices go to the desktop clipboard when available, otherwise to a private
+0600 file. Claimed plaintext always goes to a separate 0600 file; stdout only
+contains non-secret receipt metadata.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_SOCKET = "/run/handoff/control.sock"
+MAX_LINE = 1024 * 1024
+
+
+def fail(message: str, code: int = 1) -> "NoReturn":
+    print(json.dumps({"ok": False, "error": message}, separators=(",", ":")))
+    raise SystemExit(code)
+
+
+def request(payload: dict) -> dict:
+    path = os.environ.get("HERMES_DROP_CONTROL_SOCKET", DEFAULT_SOCKET)
+    encoded = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+    if len(encoded) > 4096:
+        fail("request_too_large")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(15)
+            client.connect(path)
+            client.sendall(encoded)
+            chunks = bytearray()
+            while b"\n" not in chunks:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+                if len(chunks) > MAX_LINE:
+                    fail("response_too_large")
+    except (OSError, TimeoutError):
+        fail("broker_unavailable")
+    try:
+        result = json.loads(bytes(chunks).split(b"\n", 1)[0])
+    except (ValueError, UnicodeDecodeError):
+        fail("invalid_broker_response")
+    if not isinstance(result, dict):
+        fail("invalid_broker_response")
+    return result
+
+
+def private_root() -> Path:
+    base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    root = base / f"claude-drop-{os.getuid()}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def write_private(prefix: str, value: bytes) -> Path:
+    fd, raw = tempfile.mkstemp(prefix=prefix, dir=private_root())
+    path = Path(raw)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def deliver_notice(notice: str) -> dict:
+    data = notice.encode()
+    commands: list[list[str]] = []
+    if shutil.which("pbcopy"):
+        commands.append(["pbcopy"])
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        commands.append(["wl-copy"])
+    if os.environ.get("DISPLAY") and shutil.which("xclip"):
+        commands.append(["xclip", "-selection", "clipboard"])
+    for command in commands:
+        try:
+            subprocess.run(command, input=data, check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5)
+            return {"delivery": "clipboard"}
+        except (OSError, subprocess.SubprocessError):
+            continue
+    path = write_private("notice-", data)
+    return {"delivery": "private_file", "path": str(path)}
+
+
+def receipt(**items: object) -> None:
+    print(json.dumps({"ok": True, **items}, separators=(",", ":"), sort_keys=True))
+
+
+def cmd_request(args: argparse.Namespace) -> None:
+    result = request({"op": "create", "notice_platform": "plain", "payload_kind": "universal"})
+    if not result.get("ok") or not isinstance(result.get("notice"), str):
+        fail(str(result.get("error") or "create_failed"))
+    delivered = deliver_notice(result["notice"])
+    receipt(action="request", drop_id=result.get("handoff_id"), **delivered)
+
+
+def cmd_claim(args: argparse.Namespace) -> None:
+    result = request({
+        "op": "claim",
+        "handoff_id": args.drop_id,
+        "wait_ms": args.wait_ms,
+        "max_response_bytes": MAX_LINE,
+    })
+    if not result.get("ok") or not isinstance(result.get("plaintext_b64"), str):
+        fail(str(result.get("error") or "claim_failed"), 3 if result.get("error") == "unavailable" else 1)
+    try:
+        plaintext = base64.b64decode(result["plaintext_b64"], validate=True)
+    except ValueError:
+        fail("invalid_broker_response")
+    path = write_private("secret-", plaintext)
+    receipt(action="claim", path=str(path), bytes=len(plaintext))
+
+
+def cmd_send_generated(args: argparse.Namespace) -> None:
+    payload = {
+        "version": 1,
+        "title": args.title,
+        "fields": [{
+            "label": args.label,
+            "type": "secret",
+            "generate": {"kind": args.kind, "length": args.length},
+        }],
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    result = request({
+        "op": "create_outbound_drop",
+        "plaintext_b64": base64.b64encode(payload_json.encode()).decode(),
+        "payload_format": "structured",
+        "notice_platform": "plain",
+    })
+    if not result.get("ok") or not isinstance(result.get("notice"), str):
+        fail(str(result.get("error") or result.get("reason") or "create_failed"))
+    delivered = deliver_notice(result["notice"])
+    receipt(action="send_generated", drop_id=result.get("drop_id"), **delivered)
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    root = private_root().resolve()
+    path = Path(args.path).resolve()
+    if path.parent != root or not path.name.startswith(("secret-", "notice-")):
+        fail("path_outside_private_root", 2)
+    path.unlink(missing_ok=True)
+    receipt(action="cleanup", path=str(path))
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Private Drop client for Claude Code")
+    sub = p.add_subparsers(dest="command", required=True)
+    inbound = sub.add_parser("request", help="mint an inbound Drop")
+    inbound.set_defaults(func=cmd_request)
+    claim = sub.add_parser("claim", help="materialize a submitted value into a 0600 file")
+    claim.add_argument("drop_id")
+    claim.add_argument("--wait-ms", type=int, default=0)
+    claim.set_defaults(func=cmd_claim)
+    outbound = sub.add_parser("send-generated", help="mint a broker-generated outbound value")
+    outbound.add_argument("--title", default="Generated credential")
+    outbound.add_argument("--label", default="Secret")
+    outbound.add_argument("--kind", choices=("password", "token", "hex"), default="password")
+    outbound.add_argument("--length", type=int, default=32)
+    outbound.set_defaults(func=cmd_send_generated)
+    cleanup = sub.add_parser("cleanup", help="unlink a client-created private file")
+    cleanup.add_argument("path")
+    cleanup.set_defaults(func=cmd_cleanup)
+    return p
+
+
+def main() -> None:
+    args = parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

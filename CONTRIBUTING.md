@@ -79,14 +79,11 @@ is standard library plus PyYAML, with type hints. Please do not add dependencies
 without a reason that survives the question "what breaks without it?", and please
 do not add GPL- or AGPL-licensed ones at all.
 
-## Changes to the Hermes patches
+## Hermes compatibility
 
-`patches/hermes-agent/` holds `git format-patch` output from a Hermes checkout, not
-hand-written diffs. Regenerate them from real commits against the base SHA recorded
-in that directory's README, and update the README's diffstat table and base SHA in
-the same change. Patches must carry their own tests and must be written as general
-Hermes fixes — not as Drop-specific hooks — because the goal is to delete that
-directory once upstream has equivalent support.
+Drop must remain compatible with released, unmodified Hermes. Use stock plugin,
+tool, hook, middleware and skill-command seams. Do not add or revive local Hermes
+core patches to make a Drop feature work.
 
 ## Pull requests
 
