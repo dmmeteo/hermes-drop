@@ -170,11 +170,11 @@ def test_telegram_waiting_notice_still_says_everything_it_has_to(notices) -> Non
     created, _ = notices["telegram"]
     shown = visible_text(telegram_adapter().format_message(created["notice"]))
 
-    assert "Private input" in shown
+    assert "🔒 Private input requested" in shown
     assert "open the secure form" in shown, "the link needs visible display text"
-    assert f"drop:{created['handoff_id']}" in shown, "the audit tag survives"
-    assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC", shown), (
-        f"an absolute UTC deadline, since Telegram re-renders nothing:\n{shown}"
+    assert f"drop:{created['handoff_id']}" not in shown
+    assert re.search(r"Expires in \d+ min", shown), (
+        f"a compact relative deadline snapshot for Telegram:\n{shown}"
     )
 
 
@@ -385,8 +385,7 @@ def test_the_outbound_notice_quotes_nothing_a_model_composed(outbound_notices) -
         targets = _MD_LINK.findall(formatted) if platform == "discord" else None
         if targets is not None:
             assert [target for _text, target in targets] == [created["url"]]
-        # What IS derived from the payload is a number.
-        assert "2 labelled values" in shown
+        assert "2 labelled values" not in shown
 
 
 def test_the_outbound_notice_says_what_it_has_to_and_shows_no_literal_markup(
@@ -395,14 +394,11 @@ def test_the_outbound_notice_says_what_it_has_to_and_shows_no_literal_markup(
     created, _fragment = outbound_notices["telegram"]
     shown = visible_text(telegram_adapter().format_message(created["notice"]))
 
-    assert "Private value from Hermes" in shown
-    assert "not posted here" in shown
-    assert "Open your one-time drop" in shown, "the link needs visible display text"
-    assert "reveal it once" in shown.lower(), "one reveal only"
-    assert "cannot be opened again" in shown, "and what that means afterwards"
-    assert f"drop:{created['drop_id']}" in shown, "the audit tag survives"
-    assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC", shown), (
-        f"an absolute UTC deadline, since Telegram re-renders nothing:\n{shown}"
+    assert "🔑 Private drop from Hermes" in shown
+    assert "Open private drop" in shown, "the link needs visible display text"
+    assert f"drop:{created['drop_id']}" not in shown
+    assert re.search(r"Expires in \d+ min", shown), (
+        f"a compact relative deadline snapshot for Telegram:\n{shown}"
     )
 
     for tag in ("<b>", "</b>", "<a ", "</a>", "<code>", "</code>", "href="):

@@ -179,11 +179,12 @@ try {
   const secondUrl = notice.match(/\]\((http:\/\/[^)]+)\)/)?.[1];
   const secondCapability = secondUrl?.split('#')[1];
   check(
-    'the waiting state is a masked link plus a Discord relative timestamp',
+    'the waiting state is friendly, masked, and uses a Discord relative timestamp',
     Boolean(secondUrl) &&
-      notice.includes(`drop:${secondId}`) &&
+      notice.includes('🔒 **Private input requested**') &&
+      !notice.includes(`drop:${secondId}`) &&
       new RegExp(`\\]\\(${secondUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`).test(notice) &&
-      /<t:\d{10}:R>/.test(notice) &&
+      /^Expires <t:\d{10}:R>\.$/m.test(notice) &&
       !/minute|hour/i.test(notice),
   );
 

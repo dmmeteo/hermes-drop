@@ -22,7 +22,7 @@ import { expiredNotice, receivedNotice, waitingNotice } from '../src/notice.js';
 const handoffId = 'abcdefghijklmnopqrstuv';
 const url = 'https://drop.example.test/#0123456789abcdefghij_-';
 const expiresAt = 1_800_000_000_000;
-const ABSOLUTE_UTC = '2027-01-15T08:00:00 UTC';
+
 
 describe('the notice renderer registry', () => {
   it('renders a `plain` waiting notice with no markup at all', () => {
@@ -43,15 +43,15 @@ describe('the notice renderer registry', () => {
     assert.equal(lines.filter((line) => line.includes(url)).length, 1, 'named exactly once');
   });
 
-  it('states the deadline absolutely, because no client re-renders a stamp for us', () => {
+  it('renders one compact relative expiry line outside Discord', () => {
     const notice = waitingNotice({ handoffId, url, expiresAt, platform: 'plain' });
-    assert.ok(notice.includes(ABSOLUTE_UTC), `absolute UTC expiry; got: ${notice}`);
+    assert.match(notice.split('\n').at(-1), /^Expires in \d+ min\.$/);
     assert.ok(!notice.includes('<t:'), 'no Discord relative stamp outside Discord');
   });
 
-  it('keeps the audit tag, unmarked', () => {
+  it('keeps transport metadata out of the notice', () => {
     const notice = waitingNotice({ handoffId, url, expiresAt, platform: 'plain' });
-    assert.ok(notice.includes(`drop:${handoffId}`), 'tagged for later lookup');
+    assert.ok(!notice.includes(`drop:${handoffId}`));
   });
 
   it('carries no capability-shaped token outside the link itself', () => {
@@ -85,24 +85,18 @@ describe('the notice renderer registry', () => {
       'a masked Markdown link, so the capability is a link target and not text',
     );
     assert.ok(!/[<>]/.test(telegram), 'no angle bracket can become a literal tag');
-    assert.ok(telegram.includes('**Private input**'), 'Markdown bold, which MarkdownV2 converts');
-    assert.ok(telegram.includes(`\`drop:${handoffId}\``), 'a backticked audit tag');
-    assert.ok(telegram.includes(ABSOLUTE_UTC), 'with an absolute expiry');
+    assert.ok(telegram.includes('🔒 **Private input requested**'),
+      'the lock and Markdown title survive until MarkdownV2 conversion');
+    assert.match(telegram.split('\n').at(-1), /^Expires in \d+ min\.$/);
     assert.ok(!telegram.includes('<t:'), 'and no Discord stamp, which would be literal here');
   });
 
-  // The URL is the one place the capability may appear, so the deadline must not
-  // be a second high-entropy-looking string next to it, and it must read as UTC.
-  it('renders a real, non-round expiry as an absolute UTC deadline', () => {
-    // Date.now()-derived expiries land on `.000` about one time in a thousand.
-    // The renderer used to strip the literal `.000Z`, so every other deadline
-    // read `2026-08-03T14:55:55.542Z` — sub-second precision and a bare `Z`.
+  it('keeps a non-round expiry compact too', () => {
     const ragged = Date.UTC(2027, 0, 15, 8, 0, 0, 542);
     for (const platform of ['telegram', 'plain']) {
       const notice = waitingNotice({ handoffId, url, expiresAt: ragged, platform });
-      assert.ok(notice.includes(ABSOLUTE_UTC), `${platform}: got ${notice}`);
+      assert.match(notice.split('\n').at(-1), /^Expires in \d+ min\.$/);
       assert.ok(!notice.includes('.542'), `${platform}: milliseconds are not a deadline`);
-      assert.ok(!/\dZ\b/.test(notice), `${platform}: says UTC rather than trailing Z`);
     }
   });
 

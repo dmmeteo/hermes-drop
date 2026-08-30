@@ -20,10 +20,9 @@
 // going to a platform that renders links: a "title" of
 // `x](https://evil.test) [click here` forges a link in the conversation, and escaping
 // it correctly for MarkdownV2 *and* for whatever the adapter's own `format_message`
-// then does to it is exactly the double-translation that review H1 was. So the label
-// is a constant, and the only thing derived from the payload is how many fields it
-// has — a number. The labels and the title render on the *page*, where they are
-// `textContent` and cannot be markup at all (src/client/reveal-view.js).
+// then does to it is exactly the double-translation that review H1 was. So nothing
+// from the payload reaches the notice. Labels and titles render on the *page*, where
+// they are `textContent` and cannot be markup at all (src/client/reveal-view.js).
 //
 // The code goes in the same message as the link, which the MVP approves and which its
 // own security note is honest about: the code is a human-presence and anti-preview
@@ -33,34 +32,19 @@
 // protected code span, is unambiguous about its leading zeros, and is tappable to
 // copy on both verified platforms.
 
-/** `2027-01-15T08:00:00 UTC` — the deadline form no client has to re-render. */
-function absoluteUtc(expiresAt) {
-  return new Date(expiresAt).toISOString().replace(/\.\d{3}Z$/, ' UTC');
-}
-
-/**
- * "Contains 5 values." — derived from the payload, never quoted from it.
- *
- * There so that two drops live in one conversation at once are distinguishable by
- * something more useful than their ids. Omitted for an opaque payload, where the
- * broker genuinely does not know.
- */
-function contents(fieldCount) {
-  if (typeof fieldCount !== 'number' || !Number.isInteger(fieldCount) || fieldCount < 1) return '';
-  return ` It holds ${fieldCount} labelled value${fieldCount === 1 ? '' : 's'}.`;
+/** "12 min" — a compact snapshot for clients without relative timestamps. */
+function relativeMinutes(expiresAt) {
+  return `${Math.max(1, Math.ceil((expiresAt - Date.now()) / 60_000))} min`;
 }
 
 const RENDERERS = Object.assign(Object.create(null), {
   discord({ dropId, url, code, expiresAt, fieldCount }) {
     return [
-      '🔐 **Private value from Hermes** — not posted here. ' +
-        `[Open your one-time drop](${url}) and enter this code on the page:`,
-      `\`${code}\``,
-      `You reveal it once: after that the drop cannot be opened again, by you or by ` +
-        `anyone else with the link.${contents(fieldCount)} Expires <t:${Math.floor(
-          expiresAt / 1000,
-        )}:R>.`,
-      `\`drop:${dropId}\``,
+      '🔑 **Private drop from Hermes**',
+      `[Open private drop](${url})`,
+      `**Access code:** \`${code}\``,
+      '',
+      `Expires <t:${Math.floor(expiresAt / 1000)}:R>.`,
     ].join('\n');
   },
 
@@ -68,12 +52,11 @@ const RENDERERS = Object.assign(Object.create(null), {
   // relative stamp, so a `<t:UNIX:R>` would show up literally.
   telegram({ dropId, url, code, expiresAt, fieldCount }) {
     return [
-      '🔐 **Private value from Hermes** — not posted here. ' +
-        `[Open your one-time drop](${url}) and enter this code on the page:`,
-      `\`${code}\``,
-      `You reveal it once: after that the drop cannot be opened again, by you or by ` +
-        `anyone else with the link.${contents(fieldCount)} Expires at ${absoluteUtc(expiresAt)}.`,
-      `\`drop:${dropId}\``,
+      '🔑 **Private drop from Hermes**',
+      `[Open private drop](${url})`,
+      `**Access code:** \`${code}\``,
+      '',
+      `Expires in ${relativeMinutes(expiresAt)}.`,
     ].join('\n');
   },
 
@@ -82,13 +65,12 @@ const RENDERERS = Object.assign(Object.create(null), {
   // relative one. A *deliberate* choice by the caller, never a default.
   plain({ dropId, url, code, expiresAt, fieldCount }) {
     return [
-      '🔐 Private value from Hermes — not posted here. Open the one-time drop below ' +
-        'and enter the code on the page:',
+      '🔑 Private drop from Hermes',
+      'Open private drop:',
       url,
-      `Code: ${code}`,
-      `You reveal it once: after that the drop cannot be opened again, by you or by ` +
-        `anyone else with the link.${contents(fieldCount)} Expires at ${absoluteUtc(expiresAt)}.`,
-      `drop:${dropId}`,
+      `Access code: ${code}`,
+      '',
+      `Expires in ${relativeMinutes(expiresAt)}.`,
     ].join('\n');
   },
 });

@@ -271,7 +271,7 @@ describe('structured outbound drops: the notice that carries the link and the co
     );
   });
 
-  it('says the four things a person has to be told, in the message itself', async () => {
+  it('keeps the action clear and the second part to one expiry line', async () => {
     for (const platform of ['discord', 'telegram', 'plain']) {
       const created = await broker.control({
         op: 'create_outbound_drop',
@@ -283,20 +283,20 @@ describe('structured outbound drops: the notice that carries the link and the co
 
       assert.ok(notice.includes(created.url), `${platform}: the link`);
       assert.ok(notice.includes(created.code), `${platform}: the code`);
-      assert.match(notice, /reveal it once/i, `${platform}: one reveal only`);
-      assert.match(notice, /cannot be opened again/i, `${platform}: and what that means`);
-      assert.match(notice, /not posted here/i, `${platform}: why it is not in the chat`);
-      assert.match(notice, /5 labelled values/, `${platform}: what is in it, derived not quoted`);
+      assert.match(notice, /🔑 (?:\*\*)?private drop from Hermes/i,
+        `${platform}: key means Hermes is giving private data`);
       // The deadline, in the form the platform can actually render.
       if (platform === 'discord') assert.match(notice, /<t:\d+:R>/);
-      else assert.match(notice, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC/);
-      assert.ok(!notice.includes('<') || platform === 'discord', `${platform}: no HTML`);
+      else assert.match(notice, /Expires in \d+ min\./);
+      assert.match(notice.split('\n').at(-1),
+        platform === 'discord' ? /^Expires <t:\d+:R>\.$/ : /^Expires in \d+ min\.$/,
+        `${platform}: the second part is only one compact expiry line`);
     }
   });
 
   it('never quotes a label, a title or a value into the chat message', async () => {
     // The one property that keeps a Markdown message safe from a model-composed
-    // string: nothing of the payload but its field *count* is in the text. A title
+    // string: nothing from the payload is in the text. A title
     // of `x](https://evil.test) [click` would otherwise forge a link.
     const created = await broker.control({
       op: 'create_outbound_drop',

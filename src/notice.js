@@ -53,8 +53,8 @@
 //
 // The received and expired states are deliberately bare: no URL, no capability,
 // no timestamp, not even the handoff id — by then there is nothing left to look
-// up, and a quiet line is the whole point. The `drop:<id>` tag on the waiting
-// state stays as an audit affordance and a fallback if the message id is lost.
+// up, and a quiet line is the whole point. Routing stays in the journal rather
+// than exposing transport metadata in the user-facing notice.
 
 /** Whichever the wake reports, this is the only content that replaces the link. */
 export function receivedNotice() {
@@ -66,17 +66,9 @@ export function expiredNotice() {
   return '✕ **Private input link expired**';
 }
 
-/** `2027-01-15T08:00:00 UTC` — the only deadline form no client has to re-render.
- *
- * The milliseconds are matched as a *pattern*, not as the literal `.000Z`: a real
- * `expires_at` is `Date.now() + ttl`, so it lands on `.000` roughly one time in a
- * thousand. Matching the literal left every other deadline reading
- * `2026-08-03T14:55:55.542Z` — sub-second precision nobody asked for, and a `Z`
- * where the word UTC was promised. Caught by the renderer × adapter seam test,
- * whose expiry comes from the broker rather than from a round fixture.
- */
-function absoluteUtc(expiresAt) {
-  return new Date(expiresAt).toISOString().replace(/\.\d{3}Z$/, ' UTC');
+/** "12 min" — a compact snapshot for clients without relative timestamps. */
+function relativeMinutes(expiresAt) {
+  return `${Math.max(1, Math.ceil((expiresAt - Date.now()) / 60_000))} min`;
 }
 
 // One renderer per platform, and a platform is supported exactly when it has an
@@ -86,38 +78,33 @@ function absoluteUtc(expiresAt) {
 const RENDERERS = Object.assign(Object.create(null), {
   discord({ handoffId, url, expiresAt }) {
     return [
-      `🔐 **Private input** — [open the secure form](${url}) and paste it there, ` +
+      `🔒 **Private input requested** — [open the secure form](${url}) and paste it there, ` +
         'not in this channel.',
-      `One send, and the link dies the moment it is used. Expires <t:${Math.floor(
-        expiresAt / 1000,
-      )}:R>.`,
-      `\`drop:${handoffId}\``,
+      `Expires <t:${Math.floor(expiresAt / 1000)}:R>.`,
     ].join('\n');
   },
 
   // Markdown, not HTML — see the header. The shape is Discord's, with one
-  // deliberate difference: an absolute UTC deadline, because Telegram has no
+  // deliberate difference: a relative snapshot, because Telegram has no
   // client-rendered relative stamp and a `<t:UNIX:R>` would show up literally.
   telegram({ handoffId, url, expiresAt }) {
     return [
-      `🔐 **Private input** — [open the secure form](${url}) and paste it there, ` +
+      `🔒 **Private input requested** — [open the secure form](${url}) and paste it there, ` +
         'not in this chat.',
-      `One send, and the link dies the moment it is used. Expires at ${absoluteUtc(expiresAt)}.`,
-      `\`drop:${handoffId}\``,
+      `Expires in ${relativeMinutes(expiresAt)}.`,
     ].join('\n');
   },
 
   // The fallback shape for every platform whose formatting is not verified end to
   // end: no markup of any kind, the URL alone on its own line so no client has to
-  // parse a link out of prose, and an absolute deadline because nothing here
-  // re-renders a relative one. `plain` is a *deliberate* choice by the caller, not
+  // parse a link out of prose, and a relative snapshot because nothing here
+  // re-renders a live one. `plain` is a *deliberate* choice by the caller, not
   // a default — an unknown platform still throws below.
   plain({ handoffId, url, expiresAt }) {
     return [
-      '🔐 Private input — open the secure form below and paste it there, not in this chat:',
+      '🔒 Private input requested — open the secure form below and paste it there, not in this chat:',
       url,
-      `One send, and the link dies the moment it is used. Expires at ${absoluteUtc(expiresAt)}.`,
-      `drop:${handoffId}`,
+      `Expires in ${relativeMinutes(expiresAt)}.`,
     ].join('\n');
   },
 });

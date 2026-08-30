@@ -120,7 +120,7 @@ describe('the Hermes integration contract', () => {
       const notice = waitingNotice({ handoffId, url, expiresAt });
       assert.match(notice, /\[[^\]]+\]\(https:\/\/drop\.example\.test\/#[^)]+\)/, 'masked link');
       assert.ok(notice.includes(url), 'and it is the real url inside it');
-      assert.ok(notice.includes(`drop:${handoffId}`), 'tagged, as an audit affordance');
+      assert.ok(!notice.includes(`drop:${handoffId}`), 'transport metadata stays out of the UI');
     });
 
     it('delegates the countdown to Discord with a relative timestamp', () => {
@@ -171,7 +171,7 @@ describe('the Hermes integration contract', () => {
       ]);
       assert.equal(result.code, 0);
       const handoffId = result.stderr.match(/handoff (\S+) expires/)[1];
-      assert.ok(result.stdout.includes(`drop:${handoffId}`), 'tagged for later lookup');
+      assert.ok(!result.stdout.includes(`drop:${handoffId}`), 'transport metadata stays hidden');
       assert.match(result.stdout, /\]\(https?:\/\/\S+#[A-Za-z0-9_-]{22}\)/, 'a masked link');
       assert.match(result.stdout, /<t:\d{10}:R>/, 'and a relative timestamp');
     });

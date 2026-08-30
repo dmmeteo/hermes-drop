@@ -478,15 +478,12 @@ describe('the control protocol contract', () => {
       );
       assert.equal(created.notice_received, receivedNotice());
       assert.equal(created.notice_expired, expiredNotice());
-      // Review H1: this used to assert `<a href=`. Both verified platforms emit
-      // Markdown now, because both adapters run `format_message` before posting
-      // and MarkdownV2 displays an HTML tag rather than honouring it. What still
-      // distinguishes telegram from discord is the deadline form, so that is what
-      // is pinned here.
+      // Telegram cannot render Discord's live timestamp, so it gets one compact
+      // relative snapshot instead of an explanatory block.
       assert.match(created.notice, /\]\(\S+#[A-Za-z0-9_-]{22}\)/, 'a masked Markdown link');
       assert.ok(!created.notice.includes('<'), 'no HTML tag, and nothing that could become one');
       assert.ok(!created.notice.includes('<t:'), 'no Discord stamp: telegram re-renders nothing');
-      assert.match(created.notice, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC/, 'absolute deadline');
+      assert.match(created.notice.split('\n').at(-1), /^Expires in \d+ min\.$/, 'compact expiry');
     });
 
     it('renders `plain` too, so an unverified platform is still served', async () => {
@@ -554,7 +551,7 @@ describe('the control protocol contract', () => {
       const plain = await runAdmin(broker.controlSocketPath, ['create', '--notice', '--platform', 'plain']);
       assert.equal(plain.code, 0, plain.stderr);
       const handoffId = plain.stderr.match(/handoff (\S+) expires/)[1];
-      assert.ok(plain.stdout.includes(`drop:${handoffId}`));
+      assert.ok(!plain.stdout.includes(`drop:${handoffId}`));
       assert.ok(!plain.stdout.includes('**'), 'plain carries no markdown');
       assert.ok(!/[<>]/.test(plain.stdout), 'and no HTML');
     });
