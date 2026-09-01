@@ -10,13 +10,13 @@ are welcome, and so is being told the threat model is wrong.
 The repository is two codebases that talk over one socket.
 
 ```bash
-# broker (Node.js >= 22)
+# whole repository (Node.js >= 22, Python 3.11+, and a Hermes checkout)
 npm ci
-npm run verify          # build the browser bundle, run every test, run the smoke test
+npm run verify          # broker build/tests/smoke + the complete plugin suite
 
-# plugin (Python 3.11+, needs a Hermes checkout importable for its stubs)
-cd integrations/hermes-drop/tests
-python -m pytest -q
+# focused targets remain available while iterating
+npm run verify:broker
+npm run verify:plugin
 ```
 
 You do not need a running Hermes gateway or a deployed broker to work on either
@@ -88,8 +88,7 @@ core patches to make a Drop feature work.
 ## Pull requests
 
 - One concern per pull request.
-- Say what you ran. `npm run verify` and the plugin suite, with their counts, is
-  the baseline.
+- Say what you ran. `npm run verify`, with both suite counts, is the baseline.
 - If it touches the security model, say which threat-model line moves and why.
 - Do not include real capabilities, tokens, chat ids, hostnames or journal
   contents in tests, fixtures or issue text.

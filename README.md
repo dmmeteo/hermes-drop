@@ -496,8 +496,7 @@ HERMES_HOME="$HERMES_HOME" bin/install-hermes-drop.sh install
 ## Verifying an install
 
 ```bash
-npm run verify                                    # broker: build, tests, runtime smoke
-cd integrations/hermes-drop/tests && python -m pytest -q    # plugin
+npm run verify          # broker build/tests/smoke + the complete plugin suite
 ```
 
 Then, against the live pair:

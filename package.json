@@ -30,7 +30,9 @@
     "build": "node scripts/build-client.mjs",
     "start": "npm run build && node src/main.js",
     "smoke": "npm run build && node scripts/smoke.mjs",
-    "verify": "npm run build && npm test && npm run smoke",
+    "verify:broker": "npm run build && npm test && npm run smoke",
+    "verify:plugin": "python -m pytest -q integrations/hermes-drop/tests",
+    "verify": "npm run verify:broker && npm run verify:plugin",
     "admin": "node bin/handoff-admin.mjs"
   },
   "dependencies": {

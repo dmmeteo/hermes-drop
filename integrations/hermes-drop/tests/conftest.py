@@ -437,6 +437,19 @@ def gateway_loop():
     try:
         yield loop
     finally:
+        async def cancel_pending_tasks() -> None:
+            current = asyncio.current_task()
+            pending = [task for task in asyncio.all_tasks() if task is not current]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        # A real gateway exits the process, which destroys its background tasks.
+        # This fixture keeps the process alive for hundreds of tests, so it must
+        # provide the equivalent lifecycle boundary before closing the loop.
+        cleanup = asyncio.run_coroutine_threadsafe(cancel_pending_tasks(), loop)
+        cleanup.result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
         loop.close()
