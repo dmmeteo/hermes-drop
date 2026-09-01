@@ -665,7 +665,7 @@ async def test_the_whole_outbound_path_against_the_real_broker(
     assert adapter.sent[0].chat_id == "tg-real"
     assert "xyzzy" not in notice
     assert "ops@example.test" not in notice
-    assert "reveal it once" in notice.lower()
+    assert "expires in 2 min." in notice.lower()
 
     url = next(part for part in notice.split() if "#r." in part).strip("()[]")
     code = json.loads(_reveal(url, _code_from(notice), real_public_broker.base_url))

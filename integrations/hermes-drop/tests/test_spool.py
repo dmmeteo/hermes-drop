@@ -303,7 +303,8 @@ def test_every_ancestor_this_call_creates_is_private_too(spool_mod, home: Path) 
 
 def test_a_group_writable_ancestor_is_refused_not_used(spool_mod, home: Path) -> None:
     loose = home / "state"
-    loose.mkdir(mode=0o775)
+    loose.mkdir()
+    loose.chmod(0o775)  # Deterministic despite the runner's umask.
 
     with pytest.raises(spool_mod.SpoolUnsafe) as refusal:
         spool_mod.Spool(root=home / "state" / "hermes-drop" / "spool").ensure_root()

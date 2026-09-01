@@ -586,8 +586,8 @@ def test_one_drop_posts_exactly_one_status_message_in_its_own_lane(
     if platform is Platform.TELEGRAM:
         assert "<" not in posted.content, "no HTML tag, and nothing that could become one"
         assert "<t:" not in posted.content, "a Discord relative stamp would be literal here"
-        assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC", posted.content), (
-            f"telegram gets an absolute deadline: {posted.content}"
+        assert re.search(r"Expires in \d+ min\.", posted.content), (
+            f"telegram gets a compact relative expiry snapshot: {posted.content}"
         )
     else:
         assert re.search(r"<t:\d{10}:R>", posted.content), (
